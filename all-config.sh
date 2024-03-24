@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# 删除旧的配置文件
+if [ -f "/etc/V2bX/config.json" ]; then
+    echo "删除旧的配置文件 /etc/V2bX/config.json..."
+    rm /etc/V2bX/config.json
+fi
+
 # 提示用户输入国家代码
 echo "请输入要下载配置的国家代码："
 echo "1. 澳大利亚（输入 au）"
