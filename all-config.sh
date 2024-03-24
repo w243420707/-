@@ -43,3 +43,11 @@ wget -O /etc/V2bX/$config_file $download_link
 chmod +x /etc/V2bX/$config_file
 
 echo "配置文件 $config_file 下载完成并已授予执行权限。"
+
+# 重启 V2bX
+echo "正在重启 V2bX..."
+V2bX restart
+
+# 查看日志
+echo "正在查看 V2bX 日志..."
+V2bX log
