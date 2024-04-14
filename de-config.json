@@ -1,0 +1,278 @@
+{
+    "Log": {
+        "Level": "error",
+        "Output": ""
+    },
+    "Cores": [
+    {
+        "Type": "hysteria2",
+        "Log": {
+            "Level": "error"
+        }
+    }],
+    "Nodes": [{
+            "Core": "hysteria2",
+            "ApiHost": "https://rep8ph3ny150.syyn.xyz",
+            "ApiKey": "yE4ZvHiqQQHdYPdv",
+            "NodeID": 33,
+            "NodeType": "hysteria2",
+            "Timeout": 30,
+            "ListenIP": "",
+            "SendIP": "0.0.0.0",
+            "DeviceOnlineMinTraffic": 100,
+            "CertConfig": {
+                "CertMode": "http",
+                "RejectUnknownSni": false,
+                "CertDomain": "hy-de-l4ehusajhz18.fly64jfgwhale.xyz",
+                "CertFile": "/etc/V2bX/fullchain.cer",
+                "KeyFile": "/etc/V2bX/cert.key",
+                "Email": "v2bx@github.com",
+                "Provider": "cloudflare",
+                "DNSEnv": {
+                    "EnvName": "env1"
+                }
+            }
+        },{
+            "Core": "hysteria2",
+            "ApiHost": "https://rep8ph3ny150.syyn.xyz",
+            "ApiKey": "yE4ZvHiqQQHdYPdv",
+            "NodeID": 34,
+            "NodeType": "hysteria2",
+            "Timeout": 30,
+            "ListenIP": "",
+            "SendIP": "0.0.0.0",
+            "DeviceOnlineMinTraffic": 100,
+            "CertConfig": {
+                "CertMode": "http",
+                "RejectUnknownSni": false,
+                "CertDomain": "hy-de-l4ehusajhz18.fly64jfgwhale.xyz",
+                "CertFile": "/etc/V2bX/fullchain.cer",
+                "KeyFile": "/etc/V2bX/cert.key",
+                "Email": "v2bx@github.com",
+                "Provider": "cloudflare",
+                "DNSEnv": {
+                    "EnvName": "env1"
+                }
+            }
+        }, {
+            "Core": "hysteria2",
+            "ApiHost": "https://rep8ph3ny150.syyn.xyz",
+            "ApiKey": "yE4ZvHiqQQHdYPdv",
+            "NodeID": 35,
+            "NodeType": "hysteria2",
+            "Timeout": 30,
+            "ListenIP": "",
+            "SendIP": "0.0.0.0",
+            "DeviceOnlineMinTraffic": 100,
+            "CertConfig": {
+                "CertMode": "http",
+                "RejectUnknownSni": false,
+                "CertDomain": "hy-de-l4ehusajhz18.fly64jfgwhale.xyz",
+                "CertFile": "/etc/V2bX/fullchain.cer",
+                "KeyFile": "/etc/V2bX/cert.key",
+                "Email": "v2bx@github.com",
+                "Provider": "cloudflare",
+                "DNSEnv": {
+                    "EnvName": "env1"
+                }
+            }
+        }, {
+            "Core": "hysteria2",
+            "ApiHost": "https://rep8ph3ny150.syyn.xyz",
+            "ApiKey": "yE4ZvHiqQQHdYPdv",
+            "NodeID": 36,
+            "NodeType": "hysteria2",
+            "Timeout": 30,
+            "ListenIP": "",
+            "SendIP": "0.0.0.0",
+            "DeviceOnlineMinTraffic": 100,
+            "CertConfig": {
+                "CertMode": "http",
+                "RejectUnknownSni": false,
+                "CertDomain": "hy-de-l4ehusajhz18.fly64jfgwhale.xyz",
+                "CertFile": "/etc/V2bX/fullchain.cer",
+                "KeyFile": "/etc/V2bX/cert.key",
+                "Email": "v2bx@github.com",
+                "Provider": "cloudflare",
+                "DNSEnv": {
+                    "EnvName": "env1"
+                }
+            }
+        }, {
+            "Core": "hysteria2",
+            "ApiHost": "https://rep8ph3ny150.syyn.xyz",
+            "ApiKey": "yE4ZvHiqQQHdYPdv",
+            "NodeID": 37,
+            "NodeType": "hysteria2",
+            "Timeout": 30,
+            "ListenIP": "",
+            "SendIP": "0.0.0.0",
+            "DeviceOnlineMinTraffic": 100,
+            "CertConfig": {
+                "CertMode": "http",
+                "RejectUnknownSni": false,
+                "CertDomain": "hy-de-l4ehusajhz18.fly64jfgwhale.xyz",
+                "CertFile": "/etc/V2bX/fullchain.cer",
+                "KeyFile": "/etc/V2bX/cert.key",
+                "Email": "v2bx@github.com",
+                "Provider": "cloudflare",
+                "DNSEnv": {
+                    "EnvName": "env1"
+                }
+            }
+        }, {
+            "Core": "hysteria2",
+            "ApiHost": "https://rep8ph3ny150.syyn.xyz",
+            "ApiKey": "yE4ZvHiqQQHdYPdv",
+            "NodeID": 38,
+            "NodeType": "hysteria2",
+            "Timeout": 30,
+            "ListenIP": "",
+            "SendIP": "0.0.0.0",
+            "DeviceOnlineMinTraffic": 100,
+            "CertConfig": {
+                "CertMode": "http",
+                "RejectUnknownSni": false,
+                "CertDomain": "hy-de-l4ehusajhz18.fly64jfgwhale.xyz",
+                "CertFile": "/etc/V2bX/fullchain.cer",
+                "KeyFile": "/etc/V2bX/cert.key",
+                "Email": "v2bx@github.com",
+                "Provider": "cloudflare",
+                "DNSEnv": {
+                    "EnvName": "env1"
+                }
+            }
+        },{
+    "Core": "hysteria2",
+    "ApiHost": "https://new.flywhaler.com",
+    "ApiKey": "yE4ZvHiqQQHdYPdv",
+    "NodeID": 33,
+    "NodeType": "hysteria2",
+    "Timeout": 30,
+    "ListenIP": "",
+    "SendIP": "0.0.0.0",
+    "DeviceOnlineMinTraffic": 100,
+    "CertConfig": {
+        "CertMode": "http",
+        "RejectUnknownSni": false,
+        "CertDomain": "hy-de-l4ehusajhz18.fly64jfgwhale.xyz",
+        "CertFile": "/etc/V2bX/fullchain.cer",
+        "KeyFile": "/etc/V2bX/cert.key",
+        "Email": "v2bx@github.com",
+        "Provider": "cloudflare",
+        "DNSEnv": {
+            "EnvName": "env1"
+        }
+    }
+},{
+    "Core": "hysteria2",
+    "ApiHost": "https://new.flywhaler.com",
+    "ApiKey": "yE4ZvHiqQQHdYPdv",
+    "NodeID": 34,
+    "NodeType": "hysteria2",
+    "Timeout": 30,
+    "ListenIP": "",
+    "SendIP": "0.0.0.0",
+    "DeviceOnlineMinTraffic": 100,
+    "CertConfig": {
+        "CertMode": "http",
+        "RejectUnknownSni": false,
+        "CertDomain": "hy-de-l4ehusajhz18.fly64jfgwhale.xyz",
+        "CertFile": "/etc/V2bX/fullchain.cer",
+        "KeyFile": "/etc/V2bX/cert.key",
+        "Email": "v2bx@github.com",
+        "Provider": "cloudflare",
+        "DNSEnv": {
+            "EnvName": "env1"
+        }
+    }
+}, {
+    "Core": "hysteria2",
+    "ApiHost": "https://new.flywhaler.com",
+    "ApiKey": "yE4ZvHiqQQHdYPdv",
+    "NodeID": 35,
+    "NodeType": "hysteria2",
+    "Timeout": 30,
+    "ListenIP": "",
+    "SendIP": "0.0.0.0",
+    "DeviceOnlineMinTraffic": 100,
+    "CertConfig": {
+        "CertMode": "http",
+        "RejectUnknownSni": false,
+        "CertDomain": "hy-de-l4ehusajhz18.fly64jfgwhale.xyz",
+        "CertFile": "/etc/V2bX/fullchain.cer",
+        "KeyFile": "/etc/V2bX/cert.key",
+        "Email": "v2bx@github.com",
+        "Provider": "cloudflare",
+        "DNSEnv": {
+            "EnvName": "env1"
+        }
+    }
+}, {
+    "Core": "hysteria2",
+    "ApiHost": "https://new.flywhaler.com",
+    "ApiKey": "yE4ZvHiqQQHdYPdv",
+    "NodeID": 36,
+    "NodeType": "hysteria2",
+    "Timeout": 30,
+    "ListenIP": "",
+    "SendIP": "0.0.0.0",
+    "DeviceOnlineMinTraffic": 100,
+    "CertConfig": {
+        "CertMode": "http",
+        "RejectUnknownSni": false,
+        "CertDomain": "hy-de-l4ehusajhz18.fly64jfgwhale.xyz",
+        "CertFile": "/etc/V2bX/fullchain.cer",
+        "KeyFile": "/etc/V2bX/cert.key",
+        "Email": "v2bx@github.com",
+        "Provider": "cloudflare",
+        "DNSEnv": {
+            "EnvName": "env1"
+        }
+    }
+}, {
+    "Core": "hysteria2",
+    "ApiHost": "https://new.flywhaler.com",
+    "ApiKey": "yE4ZvHiqQQHdYPdv",
+    "NodeID": 37,
+    "NodeType": "hysteria2",
+    "Timeout": 30,
+    "ListenIP": "",
+    "SendIP": "0.0.0.0",
+    "DeviceOnlineMinTraffic": 100,
+    "CertConfig": {
+        "CertMode": "http",
+        "RejectUnknownSni": false,
+        "CertDomain": "hy-de-l4ehusajhz18.fly64jfgwhale.xyz",
+        "CertFile": "/etc/V2bX/fullchain.cer",
+        "KeyFile": "/etc/V2bX/cert.key",
+        "Email": "v2bx@github.com",
+        "Provider": "cloudflare",
+        "DNSEnv": {
+            "EnvName": "env1"
+        }
+    }
+}, {
+    "Core": "hysteria2",
+    "ApiHost": "https://new.flywhaler.com",
+    "ApiKey": "yE4ZvHiqQQHdYPdv",
+    "NodeID": 38,
+    "NodeType": "hysteria2",
+    "Timeout": 30,
+    "ListenIP": "",
+    "SendIP": "0.0.0.0",
+    "DeviceOnlineMinTraffic": 100,
+    "CertConfig": {
+        "CertMode": "http",
+        "RejectUnknownSni": false,
+        "CertDomain": "hy-de-l4ehusajhz18.fly64jfgwhale.xyz",
+        "CertFile": "/etc/V2bX/fullchain.cer",
+        "KeyFile": "/etc/V2bX/cert.key",
+        "Email": "v2bx@github.com",
+        "Provider": "cloudflare",
+        "DNSEnv": {
+            "EnvName": "env1"
+        }
+    }
+}]
+}
