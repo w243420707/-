@@ -13,6 +13,7 @@ echo "2. 香港（输入 hk）"
 echo "3. 日本（输入 jp）"
 echo "4. 台湾（输入 tw）"
 echo "5. 英国（输入 uk）"
+echo "6. 印度（输入 in）"
 read country
 
 # 根据用户输入选择对应的配置文件和下载链接，并设置重命名的文件名为 config.json
@@ -37,6 +38,10 @@ case $country in
         config_file="config.json"
         download_link="https://github.com/w243420707/-/raw/main/uk-config.json"
         ;;
+    "in")
+        config_file="config.json"
+        download_link="https://github.com/w243420707/-/raw/main/in-config.json"
+        ;;        
     *)
         echo "无效的输入！"
         exit 1
