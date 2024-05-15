@@ -90,6 +90,89 @@ chmod +x /etc/V2bX/$config_file
 
 echo "配置文件 $config_file 下载完成并已授予执行权限。"
 
+# 如果选择了 "sj"，执行额外的命令
+if [ "$country" = "sj" ]; then
+    echo "执行额外的安装命令..."
+    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
+    chmod +x nezha.sh
+    sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 i7Myi8HZdIHjPiwpLS
+fi
+# 如果选择了 "us"，执行额外的命令
+if [ "$country" = "us" ]; then
+    echo "执行额外的安装命令..."
+    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
+    chmod +x nezha.sh
+    sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 0bEVM4CWCKlSI4OLxn
+fi
+# 如果选择了 "au"，执行额外的命令
+if [ "$country" = "au" ]; then
+    echo "执行额外的安装命令..."
+    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
+    chmod +x nezha.sh
+    sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 rYchIL1LTRzjZbDyVw
+fi
+
+# 如果选择了 "jp"，执行额外的命令
+if [ "$country" = "jp" ]; then
+    echo "执行额外的安装命令..."
+    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
+    chmod +x nezha.sh
+    sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 IThZ0uUDc377ErvXhF
+fi
+# 如果选择了 "uk"，执行额外的命令
+if [ "$country" = "uk" ]; then
+    echo "执行额外的安装命令..."
+    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
+    chmod +x nezha.sh
+    sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 FALwm9kQyWL7u4k21F
+fi
+
+# 如果选择了 "in"，执行额外的命令
+if [ "$country" = "in" ]; then
+    echo "执行额外的安装命令..."
+    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
+    chmod +x nezha.sh
+    sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 lA6WODakEauns1eiEv
+fi
+
+# 如果选择了 "nl"，执行额外的命令
+if [ "$country" = "nl" ]; then
+    echo "执行额外的安装命令..."
+    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
+    chmod +x nezha.sh
+    sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 F9ASScSS4CXhrFMjUQ
+fi
+# 如果选择了 "sg"，执行额外的命令
+if [ "$country" = "sg" ]; then
+    echo "执行额外的安装命令..."
+    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
+    chmod +x nezha.sh
+    sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 geKH2HPwo8NCviE6zJ
+fi
+
+
+# 如果选择了 "de"，执行额外的命令
+if [ "$country" = "de" ]; then
+    echo "执行额外的安装命令..."
+    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
+    chmod +x nezha.sh
+    sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 Um5y77VNADb9d5Krc1
+fi
+
+# 如果选择了 "ca"，执行额外的命令
+if [ "$country" = "ca" ]; then
+    echo "执行额外的安装命令..."
+    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
+    chmod +x nezha.sh
+    sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 ItTR1fQMAfgTTnPVCa
+fi
+# 如果选择了 "ru"，执行额外的命令
+if [ "$country" = "ru" ]; then
+    echo "执行额外的安装命令..."
+    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
+    chmod +x nezha.sh
+    sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 9qtL6bglk0nw9KKcrk
+fi
 # 重启 V2bX
 echo "正在重启 V2bX..."
 V2bX restart
