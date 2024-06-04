@@ -217,6 +217,4 @@ if [ "$country" = "ru" ]; then
     chmod +x /root/hy-ru-l4ehusajhz18.sh
     sudo ./hy-ru-l4ehusajhz18.sh
 fi
-# 重启 V2bX
-echo "正在重启 V2bX..."
-V2bX restart
+reboot
