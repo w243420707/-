@@ -98,7 +98,7 @@ if [ "$country" = "sj" ]; then
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 i7Myi8HZdIHjPiwpLS
     echo "DDNS修改IP..."
     curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-sj-l4ehusajhz18.sh -o hy-sj-l4ehusajhz18.sh
-    chmod +x hy-sj-l4ehusajhz18.sh
+    chmod +x /root/hy-sj-l4ehusajhz18.sh
     sudo ./hy-sj-l4ehusajhz18.sh
 fi
 # 如果选择了 "us"，执行额外的命令
@@ -109,7 +109,7 @@ if [ "$country" = "us" ]; then
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 0bEVM4CWCKlSI4OLxn
     echo "DDNS修改IP..."
     curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-us-l4ehusajhz18.sh -o hy-us-l4ehusajhz18.sh
-    chmod +x hy-us-l4ehusajhz18.sh
+    chmod +x /root/hy-us-l4ehusajhz18.sh
     sudo ./hy-us-l4ehusajhz18.sh
 fi
 # 如果选择了 "au"，执行额外的命令
@@ -120,7 +120,7 @@ if [ "$country" = "au" ]; then
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 rYchIL1LTRzjZbDyVw
     echo "DDNS修改IP..."
     curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-au-l4ehusajhz18.sh -o hy-au-l4ehusajhz18.sh
-    chmod +x hy-au-l4ehusajhz18.sh
+    chmod +x /root/hy-au-l4ehusajhz18.sh
     sudo ./hy-au-l4ehusajhz18.sh
 fi
 
@@ -132,7 +132,7 @@ if [ "$country" = "jp" ]; then
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 IThZ0uUDc377ErvXhF
     echo "DDNS修改IP..."
     curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-jp-l4ehusajhz18.sh -o hy-jp-l4ehusajhz18.sh
-    chmod +x hy-jp-l4ehusajhz18.sh
+    chmod +x /root/hy-jp-l4ehusajhz18.sh
     sudo ./hy-jp-l4ehusajhz18.sh
 fi
 # 如果选择了 "uk"，执行额外的命令
@@ -143,7 +143,7 @@ if [ "$country" = "uk" ]; then
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 FALwm9kQyWL7u4k21F
     echo "DDNS修改IP..."
     curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-uk-l4ehusajhz18.sh -o hy-uk-l4ehusajhz18.sh
-    chmod +x hy-uk-l4ehusajhz18.sh
+    chmod +x /root/hy-uk-l4ehusajhz18.sh
     sudo ./hy-uk-l4ehusajhz18.sh
 fi
 
@@ -155,7 +155,7 @@ if [ "$country" = "in" ]; then
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 lA6WODakEauns1eiEv
     echo "DDNS修改IP..."
     curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-in-l4ehusajhz18.sh -o hy-in-l4ehusajhz18.sh
-    chmod +x hy-in-l4ehusajhz18.sh
+    chmod +x /root/hy-in-l4ehusajhz18.sh
     sudo ./hy-in-l4ehusajhz18.sh
 fi
 
@@ -167,7 +167,7 @@ if [ "$country" = "nl" ]; then
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 F9ASScSS4CXhrFMjUQ
     echo "DDNS修改IP..."
     curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-nl-l4ehusajhz18.sh -o hy-nl-l4ehusajhz18.sh
-    chmod +x hy-nl-l4ehusajhz18.sh
+    chmod +x /root/hy-nl-l4ehusajhz18.sh
     sudo ./hy-nl-l4ehusajhz18.sh
 fi
 # 如果选择了 "sg"，执行额外的命令
@@ -178,7 +178,7 @@ if [ "$country" = "sg" ]; then
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 geKH2HPwo8NCviE6zJ
     echo "DDNS修改IP..."
     curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-sg-l4ehusajhz18.sh -o hy-sg-l4ehusajhz18.sh
-    chmod +x hy-sg-l4ehusajhz18.sh
+    chmod +x /root/hy-sg-l4ehusajhz18.sh
     sudo ./hy-sg-l4ehusajhz18.sh
 fi
 
@@ -191,7 +191,7 @@ if [ "$country" = "de" ]; then
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 Um5y77VNADb9d5Krc1
     echo "DDNS修改IP..."
     curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-de-l4ehusajhz18.sh -o hy-de-l4ehusajhz18.sh
-    chmod +x hy-de-l4ehusajhz18.sh
+    chmod +x /root/hy-de-l4ehusajhz18.sh
     sudo ./hy-de-l4ehusajhz18.sh
 fi
 
@@ -203,7 +203,7 @@ if [ "$country" = "ca" ]; then
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 ItTR1fQMAfgTTnPVCa
     echo "DDNS修改IP..."
     curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-ca-l4ehusajhz18.sh -o hy-ca-l4ehusajhz18.sh
-    chmod +x hy-ca-l4ehusajhz18.sh
+    chmod +x /root/hy-ca-l4ehusajhz18.sh
     sudo ./hy-ca-l4ehusajhz18.sh
 fi
 # 如果选择了 "ru"，执行额外的命令
@@ -214,7 +214,7 @@ if [ "$country" = "ru" ]; then
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 9qtL6bglk0nw9KKcrk
     echo "DDNS修改IP..."
     curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-ru-l4ehusajhz18.sh -o hy-ru-l4ehusajhz18.sh
-    chmod +x hy-ru-l4ehusajhz18.sh
+    chmod +x /root/hy-ru-l4ehusajhz18.sh
     sudo ./hy-ru-l4ehusajhz18.sh
 fi
 # 重启 V2bX
