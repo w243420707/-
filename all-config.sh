@@ -92,91 +92,131 @@ echo "配置文件 $config_file 下载完成并已授予执行权限。"
 
 # 如果选择了 "sj"，执行额外的命令
 if [ "$country" = "sj" ]; then
-    echo "执行额外的安装命令..."
+    echo "安装哪吒探针..."
     curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
     chmod +x nezha.sh
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 i7Myi8HZdIHjPiwpLS
+    echo "DDNS修改IP..."
+    curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-sj-l4ehusajhz18.sh -o hy-sj-l4ehusajhz18.sh
+    chmod +x hy-sj-l4ehusajhz18.sh
+    sudo ./hy-sj-l4ehusajhz18.sh
 fi
 # 如果选择了 "us"，执行额外的命令
 if [ "$country" = "us" ]; then
-    echo "执行额外的安装命令..."
+    echo "安装哪吒探针..."
     curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
     chmod +x nezha.sh
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 0bEVM4CWCKlSI4OLxn
+    echo "DDNS修改IP..."
+    curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-us-l4ehusajhz18.sh -o hy-us-l4ehusajhz18.sh
+    chmod +x hy-us-l4ehusajhz18.sh
+    sudo ./hy-us-l4ehusajhz18.sh
 fi
 # 如果选择了 "au"，执行额外的命令
 if [ "$country" = "au" ]; then
-    echo "执行额外的安装命令..."
+    echo "安装哪吒探针..."
     curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
     chmod +x nezha.sh
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 rYchIL1LTRzjZbDyVw
+    echo "DDNS修改IP..."
+    curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-au-l4ehusajhz18.sh -o hy-au-l4ehusajhz18.sh
+    chmod +x hy-au-l4ehusajhz18.sh
+    sudo ./hy-au-l4ehusajhz18.sh
 fi
 
 # 如果选择了 "jp"，执行额外的命令
 if [ "$country" = "jp" ]; then
-    echo "执行额外的安装命令..."
+    echo "安装哪吒探针..."
     curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
     chmod +x nezha.sh
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 IThZ0uUDc377ErvXhF
+    echo "DDNS修改IP..."
+    curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-jp-l4ehusajhz18.sh -o hy-jp-l4ehusajhz18.sh
+    chmod +x hy-jp-l4ehusajhz18.sh
+    sudo ./hy-jp-l4ehusajhz18.sh
 fi
 # 如果选择了 "uk"，执行额外的命令
 if [ "$country" = "uk" ]; then
-    echo "执行额外的安装命令..."
+    echo "安装哪吒探针..."
     curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
     chmod +x nezha.sh
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 FALwm9kQyWL7u4k21F
+    echo "DDNS修改IP..."
+    curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-uk-l4ehusajhz18.sh -o hy-uk-l4ehusajhz18.sh
+    chmod +x hy-uk-l4ehusajhz18.sh
+    sudo ./hy-uk-l4ehusajhz18.sh
 fi
 
 # 如果选择了 "in"，执行额外的命令
 if [ "$country" = "in" ]; then
-    echo "执行额外的安装命令..."
+    echo "安装哪吒探针..."
     curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
     chmod +x nezha.sh
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 lA6WODakEauns1eiEv
+    echo "DDNS修改IP..."
+    curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-in-l4ehusajhz18.sh -o hy-in-l4ehusajhz18.sh
+    chmod +x hy-in-l4ehusajhz18.sh
+    sudo ./hy-in-l4ehusajhz18.sh
 fi
 
 # 如果选择了 "nl"，执行额外的命令
 if [ "$country" = "nl" ]; then
-    echo "执行额外的安装命令..."
+    echo "安装哪吒探针..."
     curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
     chmod +x nezha.sh
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 F9ASScSS4CXhrFMjUQ
+    echo "DDNS修改IP..."
+    curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-nl-l4ehusajhz18.sh -o hy-nl-l4ehusajhz18.sh
+    chmod +x hy-nl-l4ehusajhz18.sh
+    sudo ./hy-nl-l4ehusajhz18.sh
 fi
 # 如果选择了 "sg"，执行额外的命令
 if [ "$country" = "sg" ]; then
-    echo "执行额外的安装命令..."
+    echo "安装哪吒探针..."
     curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
     chmod +x nezha.sh
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 geKH2HPwo8NCviE6zJ
+    echo "DDNS修改IP..."
+    curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-sg-l4ehusajhz18.sh -o hy-sg-l4ehusajhz18.sh
+    chmod +x hy-sg-l4ehusajhz18.sh
+    sudo ./hy-sg-l4ehusajhz18.sh
 fi
 
 
 # 如果选择了 "de"，执行额外的命令
 if [ "$country" = "de" ]; then
-    echo "执行额外的安装命令..."
+    echo "安装哪吒探针..."
     curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
     chmod +x nezha.sh
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 Um5y77VNADb9d5Krc1
+    echo "DDNS修改IP..."
+    curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-de-l4ehusajhz18.sh -o hy-de-l4ehusajhz18.sh
+    chmod +x hy-de-l4ehusajhz18.sh
+    sudo ./hy-de-l4ehusajhz18.sh
 fi
 
 # 如果选择了 "ca"，执行额外的命令
 if [ "$country" = "ca" ]; then
-    echo "执行额外的安装命令..."
+    echo "安装哪吒探针..."
     curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
     chmod +x nezha.sh
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 ItTR1fQMAfgTTnPVCa
+    echo "DDNS修改IP..."
+    curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-ca-l4ehusajhz18.sh -o hy-ca-l4ehusajhz18.sh
+    chmod +x hy-ca-l4ehusajhz18.sh
+    sudo ./hy-ca-l4ehusajhz18.sh
 fi
 # 如果选择了 "ru"，执行额外的命令
 if [ "$country" = "ru" ]; then
-    echo "执行额外的安装命令..."
+    echo "安装哪吒探针..."
     curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
     chmod +x nezha.sh
     sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 9qtL6bglk0nw9KKcrk
+    echo "DDNS修改IP..."
+    curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-ru-l4ehusajhz18.sh -o hy-ru-l4ehusajhz18.sh
+    chmod +x hy-ru-l4ehusajhz18.sh
+    sudo ./hy-ru-l4ehusajhz18.sh
 fi
 # 重启 V2bX
 echo "正在重启 V2bX..."
 V2bX restart
-
-# 查看日志
-echo "正在查看 V2bX 日志..."
-V2bX log
