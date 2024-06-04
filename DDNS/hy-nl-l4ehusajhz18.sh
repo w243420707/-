@@ -7,7 +7,7 @@ set -o pipefail
 CFKEY=e80a9bfb256d5d060aa8a4f55a7da43fdf135  # API 密钥
 CFUSER=yooyu@msn.com  # 用户名
 CFZONE_NAME=fly64jfgwhale.xyz  # 区域名称
-CFRECORD_NAME=hy-nl-l4ehusajhz18.fly64jfgwhale.xyz  # 要更新的主机名
+CFRECORD_NAME=hy-au-l4ehusajhz18.fly64jfgwhale.xyz  # 要更新的主机名
 CFRECORD_TYPE=A  # 记录类型，A(IPv4)或AAAA(IPv6)
 CFTTL=120  # Cloudflare 记录的 TTL
 FORCE=true  # 忽略本地文件，反正要更新 IP
