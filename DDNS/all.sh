@@ -78,6 +78,6 @@ esac
 
 # 下载配置文件并授予权限，并重命名为 DDNS.sh
 echo "正在下载配置文件：$config_file"
-wget -O /etc/V2bX/$config_file $download_link
-chmod +x /etc/V2bX/$config_file
+wget -O /root/$config_file $download_link
+chmod +x /root/$config_file
 sudo ./DDNS.sh
