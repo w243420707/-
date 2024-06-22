@@ -21,6 +21,7 @@ echo "10. 德国（输入 de）"
 echo "11. 加拿大（输入 ca）"
 echo "12. 随机（输入 sj）"
 echo "13. 俄罗斯（输入 ru）"
+echo "14. 韩国（输入 kr）"
 read country
 
 # 根据用户输入选择对应的配置文件和下载链接，并设置重命名的文件名为 config.json
@@ -76,7 +77,11 @@ case $country in
     "ru")
         config_file="config.json"
         download_link="https://github.com/w243420707/-/raw/main/ru-config.json"
-        ;;          
+        ;;        
+    "kr")
+        config_file="config.json"
+        download_link="https://github.com/w243420707/-/raw/main/kr-config.json"
+        ;;           
     *)
         echo "无效的输入！"
         exit 1
@@ -216,5 +221,12 @@ if [ "$country" = "ru" ]; then
     curl -L https://raw.githubusercontent.com/w243420707/-/main/DDNS/hy-ru-l4ehusajhz18.sh -o hy-ru-l4ehusajhz18.sh
     chmod +x /root/hy-ru-l4ehusajhz18.sh
     sudo ./hy-ru-l4ehusajhz18.sh
+fi
+# 如果选择了 "kr"，执行额外的命令
+if [ "$country" = "kr" ]; then
+    echo "安装哪吒探针..."
+    curl -L https://raw.githubusercontent.com/naiba/nezha/master/script/install.sh -o nezha.sh
+    chmod +x nezha.sh
+    sudo ./nezha.sh install_agent vpsip.flywhaler.com 5555 0ZWRM7OuXvD5U0ONRx
 fi
 reboot
