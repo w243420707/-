@@ -21,36 +21,59 @@ function install_bc() {
 # 运行安装函数
 install_bc
 
-# 获取自开机以来的时间（单位：秒）
-function get_uptime_seconds() {
-    local uptime_seconds=$(awk '{print $1}' /proc/uptime)
-    echo "$uptime_seconds"
+# 获取当前月份的第一天
+function get_month_start_date() {
+    date -d "$(date +%Y-%m-01)" "+%s"
 }
 
-# 计算自开机以来每30天的流量，分为两行，格式保持与总流量一致
-function calculate_monthly_traffic() {
-    local total_rx_bytes=$1
-    local total_tx_bytes=$2
-    local uptime_seconds=$(get_uptime_seconds)
+# 获取当前日期的秒数
+function get_current_date_seconds() {
+    date "+%s"
+}
 
-    # 将秒数转换为天数
-    local uptime_days=$(echo "scale=2; $uptime_seconds / 86400" | bc)
-
-    # 计算每30天的流量
-    if (( $(echo "$uptime_days >= 30" | bc -l) )); then
-        local traffic_factor=$(echo "scale=2; 30 / $uptime_days" | bc)
-        rx_monthly=$(echo "scale=2; $total_rx_bytes * $traffic_factor / 1024 / 1024 / 1024" | bc)
-        tx_monthly=$(echo "scale=2; $total_tx_bytes * $traffic_factor / 1024 / 1024 / 1024" | bc)
-        rx_monthly_tb=$(echo "scale=2; $total_rx_bytes * $traffic_factor / 1024 / 1024 / 1024 / 1024" | bc)
-        tx_monthly_tb=$(echo "scale=2; $total_tx_bytes * $traffic_factor / 1024 / 1024 / 1024 / 1024" | bc)
+# 获取系统首次通电时间
+function get_boot_time() {
+    local boot_time_file="/var/log/first_boot_time.log"
+    
+    if [ -f "$boot_time_file" ]; then
+        # 如果标记文件存在，则读取第一次通电的时间
+        local boot_time=$(cat "$boot_time_file")
     else
-        rx_monthly=$(echo "scale=2; $total_rx_bytes / 1024 / 1024 / 1024" | bc)
-        tx_monthly=$(echo "scale=2; $total_tx_bytes / 1024 / 1024 / 1024" | bc)
-        rx_monthly_tb=$(echo "scale=2; $total_rx_bytes / 1024 / 1024 / 1024 / 1024" | bc)
-        tx_monthly_tb=$(echo "scale=2; $total_tx_bytes / 1024 / 1024 / 1024 / 1024" | bc)
+        # 如果标记文件不存在，则创建并记录当前时间
+        local boot_time=$(date "+%Y-%m-%d %H:%M:%S")
+        echo "$boot_time" > "$boot_time_file"
     fi
 
-    echo -e "最近30天入站流量: $rx_monthly GB   换算： $rx_monthly_tb TB\n最近30天出站流量: $tx_monthly GB   换算： $tx_monthly_tb TB\n"
+    echo "$boot_time"
+}
+
+# 计算设备运行天数
+function calculate_uptime_days() {
+    local boot_time=$(get_boot_time)
+    local boot_seconds=$(date -d "$boot_time" "+%s")
+    local current_seconds=$(get_current_date_seconds)
+    local uptime_seconds=$((current_seconds - boot_seconds))
+    local uptime_days=$(echo "scale=0; $uptime_seconds / 86400" | bc)
+    
+    echo "$uptime_days"
+}
+
+# 计算当月已用流量
+function calculate_current_month_traffic() {
+    local total_rx_bytes=$1
+    local total_tx_bytes=$2
+    local month_start_seconds=$(get_month_start_date)
+    local current_seconds=$(get_current_date_seconds)
+    
+    # 计算当月的流量
+    local days_this_month=$(echo "scale=2; ($current_seconds - $month_start_seconds) / 86400" | bc)
+    
+    rx_current_month=$(echo "scale=2; $total_rx_bytes / 1024 / 1024 / 1024" | bc)
+    tx_current_month=$(echo "scale=2; $total_tx_bytes / 1024 / 1024 / 1024" | bc)
+    rx_current_month_tb=$(echo "scale=2; $total_rx_bytes / 1024 / 1024 / 1024 / 1024" | bc)
+    tx_current_month_tb=$(echo "scale=2; $total_tx_bytes / 1024 / 1024 / 1024 / 1024" | bc)
+
+    echo -e "从 $(date -d @$month_start_seconds +'%Y-%m-%d') 到 $(date +'%Y-%m-%d')\n本月已用入站流量 : $rx_current_month GB   换算： $rx_current_month_tb TB\n本月已用出站流量 : $tx_current_month GB   换算： $tx_current_month_tb TB\n"
 }
 
 # 获取指定接口的流量统计
@@ -71,10 +94,16 @@ function get_traffic() {
     rx_tb=$(echo "scale=2; $rx_bytes / 1024 / 1024 / 1024 / 1024" | bc)
     tx_tb=$(echo "scale=2; $tx_bytes / 1024 / 1024 / 1024 / 1024" | bc)
 
-    echo -e "开机起总入站流量: $rx_gb GB   换算： $rx_tb TB\n开机起总出站流量: $tx_gb GB   换算： $tx_tb TB\n------------------------------------"
+    # 获取系统首次通电时间
+    boot_time=$(get_boot_time)
+
+    # 计算设备运行天数
+    uptime_days=$(calculate_uptime_days)
+
+    echo -e "开机时间: $boot_time\n设备运行天数: $uptime_days 天\n开机起总入站流量: $rx_gb GB   换算： $rx_tb TB\n开机起总出站流量: $tx_gb GB   换算： $tx_tb TB\n------------------------------------"
     
-    # 计算最近30天的流量
-    calculate_monthly_traffic "$rx_bytes" "$tx_bytes"
+    # 计算当月已用流量
+    calculate_current_month_traffic "$rx_bytes" "$tx_bytes"
 }
 
 # 获取当前 IP 地址和运营商信息
@@ -185,9 +214,3 @@ message="$ip_info%0A------------------------------------%0A$traffic_data%0A-----
 
 # 将结果发送到 Telegram
 send_to_telegram "$message"
-
-# 设置 cron 任务
-setup_cron
-
-# 重启 cron 服务
-restart_cron
