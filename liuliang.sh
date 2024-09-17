@@ -29,7 +29,7 @@ function get_ip() {
 # 获取 IP 厂商信息
 function get_ip_vendor() {
     ip_addr=$(hostname -I | awk '{print $1}')
-    vendor=$(curl -s "https://ipinfo.io/$ip_addr/org?token=e8b55ad2275583")
+    vendor=$(curl -s "https://ipinfo.io/$ip_addr/org?token=YOUR_IPINFO_TOKEN")
     echo "IP 厂商: $vendor"
 }
 
