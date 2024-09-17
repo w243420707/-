@@ -1,4 +1,24 @@
 #!/bin/bash
+# 检查并安装 bc 工具
+function install_bc() {
+    if ! command -v bc &> /dev/null; then
+        echo "bc 未安装，正在安装..."
+        if [ -f /etc/debian_version ]; then
+            sudo apt update
+            sudo apt install -y bc
+        elif [ -f /etc/redhat-release ]; then
+            sudo yum install -y bc
+        elif [ -f /etc/arch-release ]; then
+            sudo pacman -S --noconfirm bc
+        else
+            echo "未知的Linux发行版，请手动安装 bc。"
+            exit 1
+        fi
+    fi
+}
+
+# 运行安装函数
+install_bc
 
 # 获取当前系统所有网络接口的流量统计
 function get_max_traffic_interface() {
