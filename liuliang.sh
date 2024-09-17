@@ -1,4 +1,5 @@
 #!/bin/bash
+
 # 检查并安装 bc 工具
 function install_bc() {
     if ! command -v bc &> /dev/null; then
@@ -20,26 +21,36 @@ function install_bc() {
 # 运行安装函数
 install_bc
 
-# 获取当前系统所有网络接口的流量统计
-function get_max_traffic_interface() {
-    local max_rx_bytes=0
-    local max_tx_bytes=0
-    local max_interface=""
+# 获取自开机以来的时间（单位：秒）
+function get_uptime_seconds() {
+    local uptime_seconds=$(awk '{print $1}' /proc/uptime)
+    echo "$uptime_seconds"
+}
 
-    for interface in $(ls /sys/class/net/); do
-        if [ -e /sys/class/net/$interface/statistics/rx_bytes ] && [ -e /sys/class/net/$interface/statistics/tx_bytes ]; then
-            rx_bytes=$(cat /sys/class/net/$interface/statistics/rx_bytes)
-            tx_bytes=$(cat /sys/class/net/$interface/statistics/tx_bytes)
+# 计算自开机以来每30天的流量，分为两行，格式保持与总流量一致
+function calculate_monthly_traffic() {
+    local total_rx_bytes=$1
+    local total_tx_bytes=$2
+    local uptime_seconds=$(get_uptime_seconds)
 
-            if [ "$rx_bytes" -gt "$max_rx_bytes" ] || [ "$tx_bytes" -gt "$max_tx_bytes" ]; then
-                max_rx_bytes=$rx_bytes
-                max_tx_bytes=$tx_bytes
-                max_interface=$interface
-            fi
-        fi
-    done
+    # 将秒数转换为天数
+    local uptime_days=$(echo "scale=2; $uptime_seconds / 86400" | bc)
 
-    echo "$max_interface"
+    # 计算每30天的流量
+    if (( $(echo "$uptime_days >= 30" | bc -l) )); then
+        local traffic_factor=$(echo "scale=2; 30 / $uptime_days" | bc)
+        rx_monthly=$(echo "scale=2; $total_rx_bytes * $traffic_factor / 1024 / 1024 / 1024" | bc)
+        tx_monthly=$(echo "scale=2; $total_tx_bytes * $traffic_factor / 1024 / 1024 / 1024" | bc)
+        rx_monthly_tb=$(echo "scale=2; $total_rx_bytes * $traffic_factor / 1024 / 1024 / 1024 / 1024" | bc)
+        tx_monthly_tb=$(echo "scale=2; $total_tx_bytes * $traffic_factor / 1024 / 1024 / 1024 / 1024" | bc)
+    else
+        rx_monthly=$(echo "scale=2; $total_rx_bytes / 1024 / 1024 / 1024" | bc)
+        tx_monthly=$(echo "scale=2; $total_tx_bytes / 1024 / 1024 / 1024" | bc)
+        rx_monthly_tb=$(echo "scale=2; $total_rx_bytes / 1024 / 1024 / 1024 / 1024" | bc)
+        tx_monthly_tb=$(echo "scale=2; $total_tx_bytes / 1024 / 1024 / 1024 / 1024" | bc)
+    fi
+
+    echo -e "最近30天入站流量: $rx_monthly GB   换算： $rx_monthly_tb TB\n最近30天出站流量: $tx_monthly GB   换算： $tx_monthly_tb TB\n"
 }
 
 # 获取指定接口的流量统计
@@ -60,7 +71,10 @@ function get_traffic() {
     rx_tb=$(echo "scale=2; $rx_bytes / 1024 / 1024 / 1024 / 1024" | bc)
     tx_tb=$(echo "scale=2; $tx_bytes / 1024 / 1024 / 1024 / 1024" | bc)
 
-    echo -e "入站流量: $rx_gb GB / $rx_tb TB\n出站流量: $tx_gb GB / $tx_tb TB"
+    echo -e "开机起总入站流量: $rx_gb GB   换算： $rx_tb TB\n开机起总出站流量: $tx_gb GB   换算： $tx_tb TB\n"
+    
+    # 计算最近30天的流量
+    calculate_monthly_traffic "$rx_bytes" "$tx_bytes"
 }
 
 # 获取当前 IP 地址和运营商信息
@@ -155,7 +169,7 @@ function restart_cron() {
 }
 
 # 找到流量用量最大的网络接口
-max_interface=$(get_max_traffic_interface)
+max_interface=$(ls /sys/class/net | grep -E 'eth0|enp' | head -n 1)
 
 # 获取流量数据
 traffic_data=$(get_traffic "$max_interface")
@@ -166,8 +180,8 @@ ip_info=$(get_ip_info)
 # 获取当前时间戳
 timestamp=$(date "+%Y-%m-%d %H:%M:%S")
 
-# 添加时间戳和 IP 信息到消息中
-message="$ip_info%0A$traffic_data%0A时间: $timestamp"
+# 组合消息，将 IP 信息放在第一行，时间信息放在最后一行
+message="$ip_info%0A%0A$traffic_data%0A%0A时间: $timestamp"
 
 # 将结果发送到 Telegram
 send_to_telegram "$message"
