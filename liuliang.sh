@@ -71,7 +71,7 @@ function get_traffic() {
     rx_tb=$(echo "scale=2; $rx_bytes / 1024 / 1024 / 1024 / 1024" | bc)
     tx_tb=$(echo "scale=2; $tx_bytes / 1024 / 1024 / 1024 / 1024" | bc)
 
-    echo -e "开机起总入站流量: $rx_gb GB   换算： $rx_tb TB\n开机起总出站流量: $tx_gb GB   换算： $tx_tb TB\n"
+    echo -e "开机起总入站流量: $rx_gb GB   换算： $rx_tb TB\n开机起总出站流量: $tx_gb GB   换算： $tx_tb TB\n------------------------------------"
     
     # 计算最近30天的流量
     calculate_monthly_traffic "$rx_bytes" "$tx_bytes"
@@ -181,7 +181,7 @@ ip_info=$(get_ip_info)
 timestamp=$(date "+%Y-%m-%d %H:%M:%S")
 
 # 组合消息，将 IP 信息放在第一行，时间信息放在最后一行
-message="$ip_info%0A%0A$traffic_data%0A%0A时间: $timestamp"
+message="$ip_info%0A------------------------------------%0A$traffic_data%0A------------------------------------%0A时间: $timestamp"
 
 # 将结果发送到 Telegram
 send_to_telegram "$message"
