@@ -100,7 +100,7 @@ function get_traffic() {
     # 计算设备运行天数
     uptime_days=$(calculate_uptime_days)
 
-    echo -e "开机时间: $boot_time\n设备运行天数: $uptime_days 天\n开机起总入站流量: $rx_gb GB   换算： $rx_tb TB\n开机起总出站流量: $tx_gb GB   换算： $tx_tb TB\n------------------------------------"
+    echo -e "开机时间: $boot_time\n设备运行 $uptime_days 天\n开机起总入站流量: $rx_gb GB   换算： $rx_tb TB\n开机起总出站流量: $tx_gb GB   换算： $tx_tb TB\n------------------------------------"
     
     # 计算当月已用流量
     calculate_current_month_traffic "$rx_bytes" "$tx_bytes"
