@@ -37,7 +37,14 @@ sudo systemctl restart v2raya.service
 echo "设置v2raya服务开机自启..."
 sudo systemctl enable v2raya.service
 
-# 第八步：输出指定信息
-echo "IP:2017"
+# 第八步：获取外网IP并以链接形式输出
+echo "获取外网IP地址..."
+IP=$(curl -s ifconfig.me)
+if [[ -z "$IP" ]]; then
+    echo "无法获取外网IP地址，请检查网络连接。"
+    exit 1
+fi
+echo "IP地址获取成功：$IP"
+echo "访问链接：http://$IP:2017"
 
 echo "脚本执行完成！"
