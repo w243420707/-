@@ -5,8 +5,8 @@ log()  { echo -e "[INFO] $*"; }
 warn() { echo -e "[WARN] $*" >&2; }
 err()  { echo -e "[ERROR] $*" >&2; }
 
-# 可调参数：网络等待最多尝试次数（默认 60 次，每次 2 秒 => 最长 ~120 秒）
-WAIT_MAX_TRIES="${WAIT_MAX_TRIES:-60}"
+# 可调参数
+WAIT_MAX_TRIES="${WAIT_MAX_TRIES:-60}"  # 网络等待最多尝试次数，每次 2s
 
 # 0) 必须 root
 if [[ $EUID -ne 0 ]]; then
@@ -22,8 +22,6 @@ swap_total_mib=$(awk '/SwapTotal/ {printf("%d", $2/1024)}' /proc/meminfo || echo
 disk_avail_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
 
 reserve_mem=512   # 为宿主预留（MiB）
-
-# 每容器内存上限：至少 2GiB；若物理更高再提升
 mem_phys_each=$(( (mem_total_mib - reserve_mem) / 3 ))
 mem_limit_each=$mem_phys_each
 if (( mem_limit_each < 2048 )); then mem_limit_each=2048; fi
@@ -124,6 +122,7 @@ config: {}
 networks:
 - config:
     ipv4.address: auto
+    ipv4.nat: "true"
     ipv6.address: none
   description: "Auto NAT bridge"
   name: lxdbr0
@@ -169,11 +168,24 @@ if ! ${CLI_BIN} remote list 2>/dev/null | grep -qE '(^|\s)images(\s|$)'; then
   ${CLI_BIN} remote add images https://images.linuxcontainers.org --protocol simplestreams || true
 fi
 
-# 自愈：确保 lxdbr0 存在且启用 NAT
+# 自愈：确保 lxdbr0 存在且启用 NAT + DHCP + 受管 DNS，并指定上游
 if ! ${CLI_BIN} network show lxdbr0 >/dev/null 2>&1; then
   log "创建 lxdbr0（NAT）..."
   ${CLI_BIN} network create lxdbr0 ipv4.address=auto ipv4.nat=true ipv6.address=none
 fi
+${CLI_BIN} network set lxdbr0 ipv4.nat true || true
+${CLI_BIN} network set lxdbr0 ipv4.dhcp true || true
+${CLI_BIN} network set lxdbr0 dns.mode managed 2>/dev/null || true
+${CLI_BIN} network set lxdbr0 dns.nameservers "1.1.1.1 8.8.8.8" 2>/dev/null || true
+${CLI_BIN} network restart lxdbr0 || true
+
+# 打开宿主内核转发（瞬时 + 持久）
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv4.conf.all.forwarding=1
+grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
+grep -q '^net.ipv4.conf.all.forwarding=1' /etc/sysctl.conf || echo 'net.ipv4.conf.all.forwarding=1' >> /etc/sysctl.conf
+
+# 如启用 UFW/Firewalld，请确保允许转发与 MASQUERADE（此处不强改你的防火墙）
 
 # 自愈：default profile 具备网卡 & （如可用）root size
 if ! ${CLI_BIN} profile show default | grep -q 'eth0:'; then
@@ -263,6 +275,7 @@ for n in "${names[@]}"; do
   done
   ips+=("${ip:-N/A}")
 done
+
 # 8) 容器内 swap（小盘自适应，避免挤爆 2GiB 根盘）
 log "为容器创建自适应 swap（根据根盘大小）..."
 container_swap_mib=1024
