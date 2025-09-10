@@ -72,6 +72,7 @@ ln -s /var/lib/snapd/snap /snap 2>/dev/null || true
 export PATH="/snap/bin:$PATH"; hash -r || true
 
 CLI_BIN=""; INIT_CMD=""; PRESEED_FILE="/root/lxd-preseed.yaml"
+
 install_lxd_snap() {
   log "尝试通过 snap 安装 LXD..."
   snap install core || true
@@ -85,6 +86,7 @@ install_lxd_snap() {
   fi
   return 1
 }
+
 install_incus_apt() {
   log "LXD 不可用，切换安装 Incus（APT）..."
   . /etc/os-release
@@ -99,6 +101,7 @@ install_incus_apt() {
   fi
   return 1
 }
+
 if ! install_lxd_snap; then
   if ! install_incus_apt; then
     err "LXD/Incus 均不可用，请检查 snap/apt 环境。"
@@ -106,9 +109,10 @@ if ! install_lxd_snap; then
   fi
 fi
 
-# 3) lxd/incus 初始化（优先 btrfs，失败回退 dir）
+# 3) lxd/incus 初始化（优先 btrfs，失败回退 dir），已初始化则忽略错误
 STORAGE_DRIVER="btrfs"
 HAS_DISK_QUOTA=1 # dir 不支持 size
+
 write_preseed() {
   cat >"${PRESEED_FILE}" <<EOF
 config: {}
@@ -141,6 +145,7 @@ $(if (( HAS_DISK_QUOTA==1 )); then echo "      size: ${disk_each}GB"; fi)
 cluster: null
 EOF
 }
+
 log "初始化 ${CLI_BIN^^}..."
 write_preseed
 set +e
@@ -148,14 +153,18 @@ bash -lc "${INIT_CMD} < ${PRESEED_FILE}"
 rc_init=$?
 set -e
 if (( rc_init != 0 )); then
-  warn "btrfs 初始化失败，回退 dir 驱动（无法硬性限制磁盘配额）。"
-  STORAGE_DRIVER="dir"; HAS_DISK_QUOTA=0
-  write_preseed
-  bash -lc "${INIT_CMD} < ${PRESEED_FILE}"
+  warn "btrfs 初始化失败或已初始化，尝试回退 dir（若已初始化则跳过回退）"
+  if grep -q "not supported" <<<"$( (bash -lc "${INIT_CMD} < ${PRESEED_FILE}" ) 2>&1 || true)"; then
+    STORAGE_DRIVER="dir"; HAS_DISK_QUOTA=0
+    write_preseed
+    set +e
+    bash -lc "${INIT_CMD} < ${PRESEED_FILE}"
+    set -e
+  fi
 fi
 
-# 确保 images 远端存在
-if ! ${CLI_BIN} remote list 2>/dev/null | grep -qE '(^|\s)images(\s|$)'; then
+# 确保 images 远端存在（存在则不再添加，避免提示）
+if ! ${CLI_BIN} remote list 2>/dev/null | awk '{print $1}' | grep -qx images; then
   log "添加 images 远端..."
   ${CLI_BIN} remote add images https://images.linuxcontainers.org --protocol simplestreams || true
 fi
@@ -187,28 +196,26 @@ else
   warn "当前存储驱动为 dir，不支持硬性磁盘配额。"
 fi
 
-# 5) 创建容器 + 配额
+# 5) 创建并启动容器（幂等） + 配额
 cpu_base=$(( cores / 3 )); cpu_rem=$(( cores % 3 ))
-declare -a cpu; for i in {0..2}; do extra=0; (( i < cpu_rem )) && extra=1; cpu[$i]=$(( cpu_base + extra )); (( cpu[$i] < 1 )) && cpu[$i]=1; done
+declare -a cpu
+for i in 0 1 2; do
+  extra=0; (( i < cpu_rem )) && extra=1
+  cpu[$i]=$(( cpu_base + extra ))
+  (( cpu[$i] < 1 )) && cpu[$i]=1
+done
 
-log "创建并启动容器..."
-for i in {0..2}; do
-  n=${NAMES[$i]}
-  log "启动 ${n} ..."
-  if ! ${CLI_BIN} launch "$IMAGE" "$n"; then sleep 2; ${CLI_BIN} launch "$IMAGE" "$n"; fi
-  ${CLI_BIN} config set "$n" limits.cpu "${cpu[$i]}"
-  ${CLI_BIN} config set "$n" limits.memory "${mem_limit_each}MiB"
-  ${CLI_BIN} config set "$n" limits.memory.swap true
-endone 2>/dev/null || true
-for i in {0..2}; do
+log "创建并启动容器（幂等）..."
+for i in 0 1 2; do
   n=${NAMES[$i]}
   if ! ${CLI_BIN} info "$n" >/dev/null 2>&1; then
-    # 如果上面的循环意外中断，再确保容器启动
-    ${CLI_BIN} launch "$IMAGE" "$n" >/dev/null 2>&1 || true
-    ${CLI_BIN} config set "$n" limits.cpu "${cpu[$i]}" || true
-    ${CLI_BIN} config set "$n" limits.memory "${mem_limit_each}MiB" || true
-    ${CLI_BIN} config set "$n" limits.memory.swap true || true
+    ${CLI_BIN} launch "$IMAGE" "$n"
+  else
+    ${CLI_BIN} start "$n" >/dev/null 2>&1 || true
   fi
+  ${CLI_BIN} config set "$n" limits.cpu "${cpu[$i]}" || true
+  ${CLI_BIN} config set "$n" limits.memory "${mem_limit_each}MiB" || true
+  ${CLI_BIN} config set "$n" limits.memory.swap true || true
 done
 
 # 6) 等待容器网络（尽量判断，失败不阻断）
@@ -236,11 +243,11 @@ for n in "${NAMES[@]}"; do
   set -e
   (( rc_apt != 0 )) && warn "$n apt 安装失败，可能无法访问外网；稍后可手动：apt-get update && apt-get install -y openssh-server"
 
-  # 为 root 生成随机密码并启用 root 密码登录
+  # 为 root 生成随机密码并启用 root + 密码登录
   pass="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 12 || echo TempRoot123)"
   ${CLI_BIN} exec "$n" -- bash -lc "echo 'root:${pass}' | chpasswd" || warn "$n 设置 root 密码失败"
 
-  # 写入 drop-in 配置启用 root + 密码登录（Debian 12 默认会读取 sshd_config.d）
+  # 写入 drop-in 配置启用 root + 密码登录（Debian 12 默认读取 sshd_config.d）
   ${CLI_BIN} exec "$n" -- bash -lc "mkdir -p /etc/ssh/sshd_config.d && cat >/etc/ssh/sshd_config.d/00-enable-root.conf <<'CONF'
 PermitRootLogin yes
 PasswordAuthentication yes
@@ -253,7 +260,7 @@ CONF"
 
   # 获取 IPv4
   ip=""
-  for t in {1..30}; do
+  for t in $(seq 1 30); do
     ip=$(${CLI_BIN} list "$n" -c 4 --format csv | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1 || true)
     [[ -n "$ip" ]] && break
     sleep 1
@@ -298,7 +305,7 @@ done
 
 # 8) 端口映射（范围 + SSH 独立端口）
 log "配置端口映射..."
-for i in {0..2}; do
+for i in 0 1 2; do
   n=${NAMES[$i]}
   s=${RANGE_STARTS[$i]}
   e=${RANGE_ENDS[$i]}
@@ -312,17 +319,17 @@ for i in {0..2}; do
   ${CLI_BIN} config device remove "$n" udp-range2 >/dev/null 2>&1 || true
   ${CLI_BIN} config device remove "$n" ssh        >/dev/null 2>&1 || true
 
-  # 前半段
+  # 前半段范围（避开 SSH 端口）
   if (( s <= pre )); then
     ${CLI_BIN} config device add "$n" tcp-range1 proxy listen=tcp:0.0.0.0:${s}-${pre}   connect=tcp:127.0.0.1:${s}-${pre}   || true
     ${CLI_BIN} config device add "$n" udp-range1 proxy listen=udp:0.0.0.0:${s}-${pre}   connect=udp:127.0.0.1:${s}-${pre}   || true
   fi
-  # 后半段
+  # 后半段范围
   if (( post <= e )); then
     ${CLI_BIN} config device add "$n" tcp-range2 proxy listen=tcp:0.0.0.0:${post}-${e}  connect=tcp:127.0.0.1:${post}-${e}  || true
     ${CLI_BIN} config device add "$n" udp-range2 proxy listen=udp:0.0.0.0:${post}-${e}  connect=udp:127.0.0.1:${post}-${e}  || true
   fi
-  # 独立 SSH
+  # SSH 独立端口
   ${CLI_BIN} config device add "$n" ssh proxy listen=tcp:0.0.0.0:${sp} connect=tcp:127.0.0.1:22 || true
 done
 
@@ -335,7 +342,7 @@ echo "宿主机IP: ${host_ip:-你的宿主机IP}" | tee -a "$outfile"
 echo "" | tee -a "$outfile"
 
 ranges_desc=("10000-19999（避开 10022）" "20000-29999（避开 20022）" "30000-39999（避开 30022）")
-for i in {0..2}; do
+for i in 0 1 2; do
   n=${NAMES[$i]}
   ip=${IPS[$i]}
   sp=${SSH_PORTS[$i]}
