@@ -5,52 +5,50 @@ log()  { echo -e "[INFO] $*"; }
 warn() { echo -e "[WARN] $*" >&2; }
 err()  { echo -e "[ERROR] $*" >&2; }
 
-# 可调参数
-WAIT_MAX_TRIES="${WAIT_MAX_TRIES:-60}"  # 网络等待最多尝试次数，每次 2s
+# 使 snap (LXD) 在 PATH 中
+export PATH="/snap/bin:$PATH"; hash -r || true
+
+# 全局可调
+WAIT_MAX_TRIES="${WAIT_MAX_TRIES:-60}"  # 等待网络最多尝试次数，每次 2s
+IMAGE="images:debian/12"
+NAMES=(vps1 vps2 vps3)
+SSH_PORTS=(10022 20022 30022)
+RANGE_STARTS=(10000 20000 30000)
+RANGE_ENDS=(19999 29999 39999)
 
 # 0) 必须 root
 if [[ $EUID -ne 0 ]]; then
-  err "请用 root 运行：sudo -i 然后再执行本脚本"
+  err "请用 root 运行：sudo -i 后再执行本脚本"
   exit 1
 fi
 
-# 1) 检测资源（低内存也继续，用 swap 兜底）
+# 1) 主机资源评估与 swap 兜底
 log "检测主机资源..."
 cores=$(nproc)
 mem_total_mib=$(awk '/MemTotal/ {printf("%d", $2/1024)}' /proc/meminfo)
 swap_total_mib=$(awk '/SwapTotal/ {printf("%d", $2/1024)}' /proc/meminfo || echo 0)
 disk_avail_gb=$(df -BG --output=avail / | tail -1 | tr -dc '0-9')
+reserve_mem=512
+mem_limit_each=$(( (mem_total_mib - reserve_mem) / 3 ))
+(( mem_limit_each < 2048 )) && mem_limit_each=2048
 
-reserve_mem=512   # 为宿主预留（MiB）
-mem_phys_each=$(( (mem_total_mib - reserve_mem) / 3 ))
-mem_limit_each=$mem_phys_each
-if (( mem_limit_each < 2048 )); then mem_limit_each=2048; fi
-
-# 兜底 swap：保证 3 台 * 2GiB + 宿主预留
 target_total_need_mib=$(( 3*2048 + reserve_mem ))
 have_now_mib=$(( mem_total_mib + swap_total_mib ))
 need_swap_mib=0
-if (( have_now_mib < target_total_need_mib )); then
-  need_swap_mib=$(( target_total_need_mib - have_now_mib ))
-fi
+(( have_now_mib < target_total_need_mib )) && need_swap_mib=$(( target_total_need_mib - have_now_mib ))
 
-# 存储池使用 / 可用空间的 70%
 pool_size_gb=$(( disk_avail_gb * 70 / 100 ))
-if (( pool_size_gb < 7 )); then
-  warn "/ 可用 ${disk_avail_gb}GiB，池预计 ${pool_size_gb}GiB，可能紧张。尝试继续。"
-fi
-disk_each=$(( pool_size_gb / 3 ))
-if (( disk_each < 2 )); then disk_each=2; fi
+(( pool_size_gb < 7 )) && warn "/ 可用 ${disk_avail_gb}GiB，池预计 ${pool_size_gb}GiB，可能紧张。尝试继续。"
+disk_each=$(( pool_size_gb / 3 )); (( disk_each < 2 )) && disk_each=2
 
 echo "========== 资源预估 =========="
 echo "CPU: ${cores} 核"
-echo "物理内存: ${mem_total_mib}MiB  (现有 swap: ${swap_total_mib}MiB)"
+echo "物理内存: ${mem_total_mib}MiB (swap: ${swap_total_mib}MiB)"
 echo "容器内存上限: ${mem_limit_each}MiB/台（不足由宿主 swap 兜底）"
-echo "/ 可用磁盘: ${disk_avail_gb}GiB -> 池: ${pool_size_gb}GiB -> 每台: ${disk_each}GiB (目标硬限≥2GiB)"
+echo "/ 可用磁盘: ${disk_avail_gb}GiB -> 池: ${pool_size_gb}GiB -> 每台: ${disk_each}GiB"
 echo "================================"
 
-# 2) 准备宿主 swap 兜底
-log "准备宿主 swap（确保至少满足 3x2GiB + 预留 ${reserve_mem}MiB）..."
+log "准备宿主 swap 兜底..."
 if (( need_swap_mib > 0 )); then
   log "新增 swap: ${need_swap_mib}MiB"
   fallocate -l ${need_swap_mib}M /swapfile-lxd || dd if=/dev/zero of=/swapfile-lxd bs=1M count=${need_swap_mib}
@@ -61,61 +59,56 @@ if (( need_swap_mib > 0 )); then
 else
   log "内存+swap 已满足最低需求，无需新增。"
 fi
-# 调整 swappiness（更愿意使用 swap，降低 OOM 风险）
 sysctl -w vm.swappiness=60 >/dev/null
 sed -i '/^vm.swappiness/d' /etc/sysctl.conf; echo 'vm.swappiness=60' >> /etc/sysctl.conf
 
-# 3) 安装基础依赖 & snapd
+# 2) 安装依赖与 LXD/Incus
 log "安装基础依赖..."
 apt-get update -y
 DEBIAN_FRONTEND=noninteractive apt-get install -y snapd curl gpg ca-certificates util-linux
 systemctl enable --now snapd || true
 sleep 3
 ln -s /var/lib/snapd/snap /snap 2>/dev/null || true
-export PATH=/snap/bin:$PATH
+export PATH="/snap/bin:$PATH"; hash -r || true
 
-# 4) 安装 LXD（snap）或回退到 Incus（APT）
 CLI_BIN=""; INIT_CMD=""; PRESEED_FILE="/root/lxd-preseed.yaml"
 install_lxd_snap() {
   log "尝试通过 snap 安装 LXD..."
   snap install core || true
   snap install lxd --channel=latest/stable || true
   snap wait system seed.loaded || true
-  export PATH=/snap/bin:$PATH
+  export PATH="/snap/bin:$PATH"; hash -r || true
   if command -v lxd >/dev/null 2>&1; then
-    CLI_BIN="lxc"
-    INIT_CMD="lxd init --preseed"
-    log "LXD 安装成功。"
+    CLI_BIN="lxc"; INIT_CMD="lxd init --preseed"
+    log "LXD 安装/就绪。"
     return 0
   fi
   return 1
 }
 install_incus_apt() {
-  log "LXD 不可用，切换安装 Incus（APT 仓库）..."
+  log "LXD 不可用，切换安装 Incus（APT）..."
   . /etc/os-release
   curl -fsSL https://repo.zabbly.com/key.asc | gpg --dearmor -o /usr/share/keyrings/zabbly.gpg
   echo "deb [signed-by=/usr/share/keyrings/zabbly.gpg] https://repo.zabbly.com/incus/stable/${ID}/ ${VERSION_CODENAME} main" > /etc/apt/sources.list.d/zabbly-incus.list
   apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y incus
   if command -v incus >/dev/null 2>&1; then
-    CLI_BIN="incus"
-    INIT_CMD="incus admin init --preseed"
-    log "Incus 安装成功。"
+    CLI_BIN="incus"; INIT_CMD="incus admin init --preseed"
+    log "Incus 安装/就绪。"
     return 0
   fi
   return 1
 }
 if ! install_lxd_snap; then
   if ! install_incus_apt; then
-    err "LXD/Incus 都不可用，请检查系统是否支持 snap 或 Incus 仓库添加是否成功。"
+    err "LXD/Incus 均不可用，请检查 snap/apt 环境。"
     exit 1
   fi
 fi
 
-# 5) 生成并应用 preseed（优先 btrfs，失败回退 dir）
+# 3) lxd/incus 初始化（优先 btrfs，失败回退 dir）
 STORAGE_DRIVER="btrfs"
-HAS_DISK_QUOTA=1 # btrfs/zfs/lvm 才支持 size 配额；dir 不支持
-
+HAS_DISK_QUOTA=1 # dir 不支持 size
 write_preseed() {
   cat >"${PRESEED_FILE}" <<EOF
 config: {}
@@ -148,46 +141,42 @@ $(if (( HAS_DISK_QUOTA==1 )); then echo "      size: ${disk_each}GB"; fi)
 cluster: null
 EOF
 }
-
-log "初始化 ${CLI_BIN^^}（优先 btrfs 循环池）..."
+log "初始化 ${CLI_BIN^^}..."
 write_preseed
 set +e
 bash -lc "${INIT_CMD} < ${PRESEED_FILE}"
 rc_init=$?
 set -e
 if (( rc_init != 0 )); then
-  warn "btrfs 初始化失败，回退为 dir 驱动（将无法硬性限制磁盘配额）。"
+  warn "btrfs 初始化失败，回退 dir 驱动（无法硬性限制磁盘配额）。"
   STORAGE_DRIVER="dir"; HAS_DISK_QUOTA=0
   write_preseed
   bash -lc "${INIT_CMD} < ${PRESEED_FILE}"
 fi
 
-# 自愈：确保 images 远端存在（Incus 某些环境默认没有）
+# 确保 images 远端存在
 if ! ${CLI_BIN} remote list 2>/dev/null | grep -qE '(^|\s)images(\s|$)'; then
   log "添加 images 远端..."
   ${CLI_BIN} remote add images https://images.linuxcontainers.org --protocol simplestreams || true
 fi
 
-# 自愈：确保 lxdbr0 存在且启用 NAT + DHCP + 受管 DNS，并指定上游
+# 4) 确保 lxdbr0 NAT/DHCP/DNS（不使用 restart）
 if ! ${CLI_BIN} network show lxdbr0 >/dev/null 2>&1; then
   log "创建 lxdbr0（NAT）..."
-  ${CLI_BIN} network create lxdbr0 ipv4.address=auto ipv4.nat=true ipv6.address=none
+  ${CLI_BIN} network create lxdbr0 ipv4.address=auto ipv4.nat=true ipv6.address=none || true
 fi
 ${CLI_BIN} network set lxdbr0 ipv4.nat true || true
 ${CLI_BIN} network set lxdbr0 ipv4.dhcp true || true
 ${CLI_BIN} network set lxdbr0 dns.mode managed 2>/dev/null || true
 ${CLI_BIN} network set lxdbr0 dns.nameservers "1.1.1.1 8.8.8.8" 2>/dev/null || true
-${CLI_BIN} network restart lxdbr0 || true
 
 # 打开宿主内核转发（瞬时 + 持久）
-sysctl -w net.ipv4.ip_forward=1
-sysctl -w net.ipv4.conf.all.forwarding=1
+sysctl -w net.ipv4.ip_forward=1 >/dev/null
+sysctl -w net.ipv4.conf.all.forwarding=1 >/dev/null
 grep -q '^net.ipv4.ip_forward=1' /etc/sysctl.conf || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf
 grep -q '^net.ipv4.conf.all.forwarding=1' /etc/sysctl.conf || echo 'net.ipv4.conf.all.forwarding=1' >> /etc/sysctl.conf
 
-# 如启用 UFW/Firewalld，请确保允许转发与 MASQUERADE（此处不强改你的防火墙）
-
-# 自愈：default profile 具备网卡 & （如可用）root size
+# default profile 自愈
 if ! ${CLI_BIN} profile show default | grep -q 'eth0:'; then
   ${CLI_BIN} profile device add default eth0 nic network=lxdbr0 name=eth0 \
     || ${CLI_BIN} profile device add default eth0 nic nictype=bridged parent=lxdbr0 name=eth0
@@ -195,97 +184,90 @@ fi
 if (( HAS_DISK_QUOTA==1 )); then
   ${CLI_BIN} profile device set default root size ${disk_each}GB || true
 else
-  warn "当前存储驱动不支持硬性配额（dir），无法对容器根盘设置硬限。"
+  warn "当前存储驱动为 dir，不支持硬性磁盘配额。"
 fi
 
-# 6) 创建容器并设置配额
-names=(vps1 vps2 vps3)
-image="images:debian/12"
+# 5) 创建容器 + 配额
+cpu_base=$(( cores / 3 )); cpu_rem=$(( cores % 3 ))
+declare -a cpu; for i in {0..2}; do extra=0; (( i < cpu_rem )) && extra=1; cpu[$i]=$(( cpu_base + extra )); (( cpu[$i] < 1 )) && cpu[$i]=1; done
 
-# 均分 CPU（至少 1）
-cpu_base=$(( cores / 3 ))
-cpu_rem=$(( cores % 3 ))
-declare -a cpu
+log "创建并启动容器..."
 for i in {0..2}; do
-  extra=0
-  if (( i < cpu_rem )); then extra=1; fi
-  cpu[$i]=$(( cpu_base + extra ))
-  if (( cpu[$i] < 1 )); then cpu[$i]=1; fi
-done
-
-log "创建三台容器并设置配额..."
-for i in {0..2}; do
-  n=${names[$i]}
+  n=${NAMES[$i]}
   log "启动 ${n} ..."
-  if ! ${CLI_BIN} launch "$image" "$n"; then
-    sleep 2
-    ${CLI_BIN} launch "$image" "$n"
-  fi
+  if ! ${CLI_BIN} launch "$IMAGE" "$n"; then sleep 2; ${CLI_BIN} launch "$IMAGE" "$n"; fi
   ${CLI_BIN} config set "$n" limits.cpu "${cpu[$i]}"
   ${CLI_BIN} config set "$n" limits.memory "${mem_limit_each}MiB"
   ${CLI_BIN} config set "$n" limits.memory.swap true
+endone 2>/dev/null || true
+for i in {0..2}; do
+  n=${NAMES[$i]}
+  if ! ${CLI_BIN} info "$n" >/dev/null 2>&1; then
+    # 如果上面的循环意外中断，再确保容器启动
+    ${CLI_BIN} launch "$IMAGE" "$n" >/dev/null 2>&1 || true
+    ${CLI_BIN} config set "$n" limits.cpu "${cpu[$i]}" || true
+    ${CLI_BIN} config set "$n" limits.memory "${mem_limit_each}MiB" || true
+    ${CLI_BIN} config set "$n" limits.memory.swap true || true
+  fi
 done
 
-# 7) 等待容器网络就绪（改进且有超时）并初始化：SSH + 用户 + 获取 IP
+# 6) 等待容器网络（尽量判断，失败不阻断）
 net_ready() {
-  local name="$1"
-  local tries="${2:-$WAIT_MAX_TRIES}"
+  local name="$1" tries="${2:-$WAIT_MAX_TRIES}"
   for t in $(seq 1 "$tries"); do
-    # 条件1：容器已有 IPv4 和默认路由
-    if ${CLI_BIN} exec "$name" -- bash -lc 'ip -4 -o addr show dev eth0 | grep -qE "inet [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+" && ip -4 r | grep -q "^default "' 2>/dev/null; then
-      # 条件2：ICMP 或 TCP 53 任一可用即视为可用
-      if ${CLI_BIN} exec "$name" -- bash -lc 'ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W1 8.8.8.8 >/dev/null 2>&1 || (timeout 2 bash -lc "</dev/tcp/1.1.1.1/53" >/dev/null 2>&1) || (timeout 2 bash -lc "</dev/tcp/8.8.8.8/53" >/dev/null 2>&1)'; then
-        return 0
-      fi
+    if ${CLI_BIN} exec "$name" -- bash -lc 'ip -4 -o addr show dev eth0 | grep -q "inet " && ip -4 r | grep -q "^default "' 2>/dev/null; then
+      ${CLI_BIN} exec "$name" -- bash -lc 'ping -c1 -W1 1.1.1.1 >/dev/null 2>&1 || ping -c1 -W1 8.8.8.8 >/dev/null 2>&1 || (timeout 2 bash -lc "</dev/tcp/1.1.1.1/53" >/dev/null 2>&1) || (timeout 2 bash -lc "</dev/tcp/8.8.8.8/53" >/dev/null 2>&1)' && return 0
     fi
     sleep 2
   done
   return 1
 }
 
-log "容器内初始化与 SSH 配置..."
-declare -a passw ips
-for n in "${names[@]}"; do
+log "容器内初始化（SSH + root 登录）..."
+declare -a ROOT_PASS IPS
+for n in "${NAMES[@]}"; do
   if ! net_ready "$n" "$WAIT_MAX_TRIES"; then
-    warn "容器 $n 网络连通性检测未通过（可能屏蔽 ICMP 或外网受限），继续执行后续步骤。"
+    warn "容器 $n 网络连通性未通过（可能屏蔽 ICMP 或外网受限），继续执行。"
   fi
 
-  # 初始化 SSH 和 admin 用户
   set +e
-  ${CLI_BIN} exec "$n" -- bash -lc 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server sudo e2fsprogs'
+  ${CLI_BIN} exec "$n" -- bash -lc 'apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server e2fsprogs'
   rc_apt=$?
   set -e
-  if (( rc_apt != 0 )); then
-    warn "$n apt 安装失败，可能无法访问外网。稍后可进入容器手动执行：apt-get update && apt-get install -y openssh-server sudo"
-  fi
+  (( rc_apt != 0 )) && warn "$n apt 安装失败，可能无法访问外网；稍后可手动：apt-get update && apt-get install -y openssh-server"
 
-  user="admin"
-  pass="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 12)"
-  ${CLI_BIN} exec "$n" -- bash -lc "id -u $user >/dev/null 2>&1 || useradd -m -s /bin/bash $user"
-  ${CLI_BIN} exec "$n" -- bash -lc "echo '$user:$pass' | chpasswd && usermod -aG sudo $user" || warn "$n 设置用户密码失败"
+  # 为 root 生成随机密码并启用 root 密码登录
+  pass="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 12 || echo TempRoot123)"
+  ${CLI_BIN} exec "$n" -- bash -lc "echo 'root:${pass}' | chpasswd" || warn "$n 设置 root 密码失败"
+
+  # 写入 drop-in 配置启用 root + 密码登录（Debian 12 默认会读取 sshd_config.d）
+  ${CLI_BIN} exec "$n" -- bash -lc "mkdir -p /etc/ssh/sshd_config.d && cat >/etc/ssh/sshd_config.d/00-enable-root.conf <<'CONF'
+PermitRootLogin yes
+PasswordAuthentication yes
+UsePAM yes
+CONF"
   ${CLI_BIN} exec "$n" -- systemctl enable --now ssh || warn "$n 启用 SSH 失败"
-  passw+=("$pass")
+  ${CLI_BIN} exec "$n" -- systemctl reload ssh >/dev/null 2>&1 || ${CLI_BIN} exec "$n" -- systemctl restart ssh || true
 
-  # 获取容器 IPv4
+  ROOT_PASS+=("$pass")
+
+  # 获取 IPv4
   ip=""
   for t in {1..30}; do
     ip=$(${CLI_BIN} list "$n" -c 4 --format csv | grep -Eo '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -n1 || true)
     [[ -n "$ip" ]] && break
     sleep 1
   done
-  ips+=("${ip:-N/A}")
+  IPS+=("${ip:-N/A}")
 done
 
-# 8) 容器内 swap（小盘自适应，避免挤爆 2GiB 根盘）
-log "为容器创建自适应 swap（根据根盘大小）..."
+# 7) 容器内 swap（按根盘大小）
+log "为容器创建自适应 swap..."
 container_swap_mib=1024
-if (( disk_each <= 2 )); then
-  container_swap_mib=256
-elif (( disk_each <= 3 )); then
-  container_swap_mib=512
-fi
+(( disk_each <= 2 )) && container_swap_mib=256
+(( disk_each > 2 && disk_each <= 3 )) && container_swap_mib=512
 
-for n in "${names[@]}"; do
+for n in "${NAMES[@]}"; do
   ${CLI_BIN} exec "$n" -- bash -lc "
     set -e
     mkdir -p /swap
@@ -314,60 +296,61 @@ for n in "${names[@]}"; do
   " || warn "$n 容器内 swap 创建失败（可忽略）"
 done
 
-# 9) 端口映射（整段 TCP/UDP，避开 SSH 专用端口）
-log "配置端口映射（范围较大，确保宿主性能充足）..."
-starts=(10000 20000 30000)
-ends=(19999 29999 39999)
-ssh_ports=(10022 20022 30022)
-
+# 8) 端口映射（范围 + SSH 独立端口）
+log "配置端口映射..."
 for i in {0..2}; do
-  n=${names[$i]}
-  s=${starts[$i]}
-  e=${ends[$i]}
-  sp=${ssh_ports[$i]}
-  pre=$((sp-1))
-  post=$((sp+1))
+  n=${NAMES[$i]}
+  s=${RANGE_STARTS[$i]}
+  e=${RANGE_ENDS[$i]}
+  sp=${SSH_PORTS[$i]}
+  pre=$((sp-1)); post=$((sp+1))
 
-  # 映射前半段 [start, ssh-1]
+  # 清理残留设备
+  ${CLI_BIN} config device remove "$n" tcp-range1 >/dev/null 2>&1 || true
+  ${CLI_BIN} config device remove "$n" tcp-range2 >/dev/null 2>&1 || true
+  ${CLI_BIN} config device remove "$n" udp-range1 >/dev/null 2>&1 || true
+  ${CLI_BIN} config device remove "$n" udp-range2 >/dev/null 2>&1 || true
+  ${CLI_BIN} config device remove "$n" ssh        >/dev/null 2>&1 || true
+
+  # 前半段
   if (( s <= pre )); then
     ${CLI_BIN} config device add "$n" tcp-range1 proxy listen=tcp:0.0.0.0:${s}-${pre}   connect=tcp:127.0.0.1:${s}-${pre}   || true
     ${CLI_BIN} config device add "$n" udp-range1 proxy listen=udp:0.0.0.0:${s}-${pre}   connect=udp:127.0.0.1:${s}-${pre}   || true
   fi
-  # 映射后半段 [ssh+1, end]
+  # 后半段
   if (( post <= e )); then
     ${CLI_BIN} config device add "$n" tcp-range2 proxy listen=tcp:0.0.0.0:${post}-${e}  connect=tcp:127.0.0.1:${post}-${e}  || true
     ${CLI_BIN} config device add "$n" udp-range2 proxy listen=udp:0.0.0.0:${post}-${e}  connect=udp:127.0.0.1:${post}-${e}  || true
   fi
-  # 独立 SSH（宿主 sp -> 容器 22）
+  # 独立 SSH
   ${CLI_BIN} config device add "$n" ssh proxy listen=tcp:0.0.0.0:${sp} connect=tcp:127.0.0.1:22 || true
 done
 
-# 10) 输出连接信息（屏幕显示 + 写入文件，包含密码）
-log "输出连接信息..."
+# 9) 输出连接信息（屏幕 + 文件）
+log "生成连接信息..."
 host_ip=$(hostname -I | awk '{print $1}')
 outfile="/root/three-vps-info.txt"
 : > "$outfile"
-
-echo "宿主机IP: ${host_ip:-你的宿主IP}" | tee -a "$outfile"
+echo "宿主机IP: ${host_ip:-你的宿主机IP}" | tee -a "$outfile"
 echo "" | tee -a "$outfile"
 
 ranges_desc=("10000-19999（避开 10022）" "20000-29999（避开 20022）" "30000-39999（避开 30022）")
 for i in {0..2}; do
-  n=${names[$i]}
-  ip=${ips[$i]}
-  sp=${ssh_ports[$i]}
+  n=${NAMES[$i]}
+  ip=${IPS[$i]}
+  sp=${SSH_PORTS[$i]}
   r=${ranges_desc[$i]}
-  pw=${passw[$i]}
+  pw=${ROOT_PASS[$i]}
   {
     echo "- ${n}:"
     echo "  容器IP: ${ip}"
     echo "  SSH: ${host_ip:-你的宿主机IP}:${sp}"
-    echo "  用户: admin"
+    echo "  用户: root"
     echo "  密码: ${pw}"
     echo "  可用端口范围: ${r}（TCP/UDP，通过宿主同端口访问）"
     echo ""
   } | tee -a "$outfile"
 done
 
-log "完成！详细信息已写入：$outfile"
-echo "示例登录：ssh -p 10022 admin@${host_ip:-宿主机IP}"
+log "完成！信息写入：$outfile"
+echo "示例登录：ssh -p 10022 root@${host_ip:-宿主机IP}"
