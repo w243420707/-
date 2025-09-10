@@ -108,7 +108,6 @@ if ! install_lxd_snap; then
     exit 1
   fi
 fi
-
 # 3) lxd/incus 初始化（优先 btrfs，失败回退 dir），已初始化则忽略错误
 STORAGE_DRIVER="btrfs"
 HAS_DISK_QUOTA=1 # dir 不支持 size
@@ -307,10 +306,11 @@ done
 log "配置端口映射..."
 for i in 0 1 2; do
   n=${NAMES[$i]}
-  s=${RANGE_STARTS[$i]}
-  e=${RANGE_ENDS[$i]}
-  sp=${SSH_PORTS[$i]}
-  pre=$((sp-1)); post=$((sp+1))
+  s=${RANGE_STARTS[$i]}  # 起始端口
+  e=${RANGE_ENDS[$i]}    # 结束端口
+  sp=${SSH_PORTS[$i]}    # SSH 端口
+  pre=$((sp - 1))         # SSH 端口前一个
+  post=$((sp + 1))        # SSH 端口后一个
 
   # 清理残留设备
   ${CLI_BIN} config device remove "$n" tcp-range1 >/dev/null 2>&1 || true
@@ -321,14 +321,20 @@ for i in 0 1 2; do
 
   # 前半段范围（避开 SSH 端口）
   if (( s <= pre )); then
-    ${CLI_BIN} config device add "$n" tcp-range1 proxy listen=tcp:0.0.0.0:${s}-${pre}   connect=tcp:127.0.0.1:${s}-${pre}   || true
-    ${CLI_BIN} config device add "$n" udp-range1 proxy listen=udp:0.0.0.0:${s}-${pre}   connect=udp:127.0.0.1:${s}-${pre}   || true
+    # TCP
+    ${CLI_BIN} config device add "$n" tcp-range1 proxy listen=tcp:0.0.0.0:${s}-${pre} connect=tcp:127.0.0.1:${s}-${pre} || true
+    # UDP
+    ${CLI_BIN} config device add "$n" udp-range1 proxy listen=udp:0.0.0.0:${s}-${pre} connect=udp:127.0.0.1:${s}-${pre} || true
   fi
+
   # 后半段范围
   if (( post <= e )); then
-    ${CLI_BIN} config device add "$n" tcp-range2 proxy listen=tcp:0.0.0.0:${post}-${e}  connect=tcp:127.0.0.1:${post}-${e}  || true
-    ${CLI_BIN} config device add "$n" udp-range2 proxy listen=udp:0.0.0.0:${post}-${e}  connect=udp:127.0.0.1:${post}-${e}  || true
+    # TCP
+    ${CLI_BIN} config device add "$n" tcp-range2 proxy listen=tcp:0.0.0.0:${post}-${e} connect=tcp:127.0.0.1:${post}-${e} || true
+    # UDP
+    ${CLI_BIN} config device add "$n" udp-range2 proxy listen=udp:0.0.0.0:${post}-${e} connect=udp:127.0.0.1:${post}-${e} || true
   fi
+
   # SSH 独立端口
   ${CLI_BIN} config device add "$n" ssh proxy listen=tcp:0.0.0.0:${sp} connect=tcp:127.0.0.1:22 || true
 done
