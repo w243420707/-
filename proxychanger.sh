@@ -31,7 +31,6 @@ check_sys() {
         echo -e "${RED}系统不支持${PLAIN}" && exit 1
     fi
     
-    # 安装 crontab
     if [[ ${release} == "centos" ]]; then
         yum install -y crontabs
         systemctl start crond && systemctl enable crond
@@ -74,7 +73,7 @@ get_public_ip() {
 
 process_address() {
     local addr=$1
-    # 移除可能存在的不可见字符或首尾空格
+    # 移除首尾空格
     addr=$(echo "$addr" | sed 's/^[ \t]*//;s/[ \t]*$//')
     
     local regex_ip="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
@@ -152,10 +151,8 @@ configure_proxy() {
 
     echo -e "${SKYBLUE}步骤 1: 设置接入IP/域名${PLAIN}"
     echo -e "本机IP: ${GREEN}[ ${current_ip} ]${PLAIN}"
-    # 使用 -e 参数修复粘贴问题
     read -e -p "请输入 (留空回车使用本机IP): " input_domain
     
-    # 清理输入
     input_domain=$(echo "$input_domain" | sed 's/^[ \t]*//;s/[ \t]*$//')
 
     if [[ -z "${input_domain}" ]]; then
@@ -172,10 +169,8 @@ configure_proxy() {
     domain=$(process_address "$input_domain")
 
     echo -e "\n${SKYBLUE}步骤 2: 设置源站地址${PLAIN}"
-    # 使用 -e 参数修复粘贴问题
     read -e -p "请输入源站 (如 8.8.8.8): " input_target
     
-    # 清理输入
     input_target=$(echo "$input_target" | sed 's/^[ \t]*//;s/[ \t]*$//')
     
     [[ -z "${input_target}" ]] && echo -e "${RED}错误：不能为空${PLAIN}" && exit 1
@@ -217,10 +212,12 @@ main() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}请用 root 运行${PLAIN}" && exit 1
     check_sys
     
-    echo -e "1. 配置反代"
+    echo -e "1. 配置反代 (默认)"
     echo -e "2. 卸载 Caddy"
-    # 使用 -e 参数
-    read -e -p "选择: " choice
+    read -e -p "选择 [默认1]: " choice
+    
+    # 逻辑修改：如果输入为空，则默认赋值为 1
+    [[ -z "${choice}" ]] && choice="1"
 
     case $choice in
         1)
@@ -234,7 +231,11 @@ main() {
             rm -rf /etc/caddy
             echo -e "${GREEN}已卸载${PLAIN}"
             ;;
-        *) exit 1 ;;
+        *) 
+            echo -e "${RED}无效输入，默认执行配置反代...${PLAIN}"
+            install_caddy
+            configure_proxy
+            ;;
     esac
 }
 
