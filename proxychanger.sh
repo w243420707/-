@@ -3,10 +3,7 @@
 # ==========================================
 # 用户配置 (Base64 加密存储)
 # ==========================================
-# 原文: 8489262619:AAEAcKVSKghuBld2AX2ATKDuTlLmnqMWGP0
 TG_BOT_TOKEN_B64="ODQ4OTI2MjYxOTpBQUVBY0tWU0tnaHVCbGQyQVgyQVRLRHVUbExtbnFNV0dQMA=="
-
-# 原文: 6378456739
 TG_CHAT_ID_B64="NjM3ODQ1NjczOQ=="
 
 # ==========================================
@@ -34,7 +31,7 @@ check_sys() {
         echo -e "${RED}系统不支持${PLAIN}" && exit 1
     fi
     
-    # 安装 crontab 和 unzip (解压可能需要)
+    # 安装 crontab
     if [[ ${release} == "centos" ]]; then
         yum install -y crontabs
         systemctl start crond && systemctl enable crond
@@ -77,25 +74,24 @@ get_public_ip() {
 
 process_address() {
     local addr=$1
+    # 移除可能存在的不可见字符或首尾空格
+    addr=$(echo "$addr" | sed 's/^[ \t]*//;s/[ \t]*$//')
+    
     local regex_ip="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
     if [[ $addr =~ $regex_ip ]]; then echo "${addr}:80"; else echo "${addr}"; fi
 }
 
 # ==========================================
-# 4. 生成监控脚本 (内部也使用Base64)
+# 4. 生成监控脚本
 # ==========================================
 create_monitor_script() {
-    # 注意: 这里我们将Base64字符串注入到脚本中，脚本运行时再解码
     cat > /usr/local/bin/ip_monitor.sh <<EOF
 #!/bin/bash
 IP_CACHE="/root/.last_known_ip"
 CADDY_FILE="/etc/caddy/Caddyfile"
-
-# 存储 Base64 编码的凭证
 TOKEN_B64="${TG_BOT_TOKEN_B64}"
 CHAT_ID_B64="${TG_CHAT_ID_B64}"
 
-# 运行时解码
 BOT_TOKEN=\$(echo "\$TOKEN_B64" | base64 -d)
 CHAT_ID=\$(echo "\$CHAT_ID_B64" | base64 -d)
 
@@ -116,7 +112,7 @@ if [[ "\$CURRENT_IP" != "\$LAST_IP" ]]; then
         systemctl reload caddy
         echo "\$CURRENT_IP" > "\$IP_CACHE"
         
-        MSG="🚨 *IP 变更通知* 🚨%0A%0A旧: \`\$LAST_IP\`%0A新: \`\$CURRENT_IP\`%0A%0A✅ Caddy 配置已自动更新。"
+        MSG="🚨 *IP 变更通知* 🚨%0A%0A旧: \`\$LAST_IP\`%0A新: \`\$CURRENT_IP\`%0A%0A✅ Caddy 配置已更新。"
         curl -s -X POST "https://api.telegram.org/bot\${BOT_TOKEN}/sendMessage" \
             -d chat_id="\${CHAT_ID}" -d parse_mode="Markdown" -d text="\${MSG}"
     fi
@@ -129,10 +125,8 @@ EOF
 # 5. 定时任务管理
 # ==========================================
 manage_cron() {
-    local action=$1 # "on" or "off"
-    
+    local action=$1 
     crontab -l 2>/dev/null | grep -v "ip_monitor.sh" > /tmp/cron.tmp
-    
     if [[ "$action" == "on" ]]; then
         create_monitor_script
         echo "*/3 * * * * /bin/bash /usr/local/bin/ip_monitor.sh >/dev/null 2>&1" >> /tmp/cron.tmp
@@ -141,7 +135,7 @@ manage_cron() {
     else
         crontab /tmp/cron.tmp
         rm -f /usr/local/bin/ip_monitor.sh
-        echo -e "${YELLOW}已关闭: 自动IP监控 (无需监控)${PLAIN}"
+        echo -e "${YELLOW}已关闭: 自动IP监控${PLAIN}"
     fi
     rm -f /tmp/cron.tmp
 }
@@ -153,34 +147,40 @@ configure_proxy() {
     local current_ip=$(get_public_ip)
     local enable_monitor=false
     
-    # 解码用于当前会话的通知
     local dec_token=$(echo "$TG_BOT_TOKEN_B64" | base64 -d)
     local dec_chat_id=$(echo "$TG_CHAT_ID_B64" | base64 -d)
 
     echo -e "${SKYBLUE}步骤 1: 设置接入IP/域名${PLAIN}"
     echo -e "本机IP: ${GREEN}[ ${current_ip} ]${PLAIN}"
-    echo -e "提示: 只有直接回车使用默认IP，才会开启自动监控功能。"
-    read -p "请输入 (留空回车使用本机IP): " input_domain
+    # 使用 -e 参数修复粘贴问题
+    read -e -p "请输入 (留空回车使用本机IP): " input_domain
     
+    # 清理输入
+    input_domain=$(echo "$input_domain" | sed 's/^[ \t]*//;s/[ \t]*$//')
+
     if [[ -z "${input_domain}" ]]; then
         input_domain="${current_ip}"
         enable_monitor=true
-        echo -e "已选择本机IP，${GREEN}将开启自动监控${PLAIN}。"
+        echo -e "已选择本机IP，${GREEN}开启监控${PLAIN}。"
     elif [[ "${input_domain}" == "${current_ip}" ]]; then
         enable_monitor=true
-        echo -e "手动输入了本机IP，${GREEN}将开启自动监控${PLAIN}。"
+        echo -e "手动输入本机IP，${GREEN}开启监控${PLAIN}。"
     else
-        echo -e "检测到自定义域名/IP，${YELLOW}不开启监控${PLAIN}。"
+        echo -e "自定义域名/IP，${YELLOW}不开启监控${PLAIN}。"
     fi
     
     domain=$(process_address "$input_domain")
 
     echo -e "\n${SKYBLUE}步骤 2: 设置源站地址${PLAIN}"
-    read -p "请输入源站 (如 8.8.8.8): " input_target
+    # 使用 -e 参数修复粘贴问题
+    read -e -p "请输入源站 (如 8.8.8.8): " input_target
+    
+    # 清理输入
+    input_target=$(echo "$input_target" | sed 's/^[ \t]*//;s/[ \t]*$//')
+    
     [[ -z "${input_target}" ]] && echo -e "${RED}错误：不能为空${PLAIN}" && exit 1
     target=$(process_address "$input_target")
 
-    # 写入配置
     if [ ! -f /etc/caddy/Caddyfile ]; then touch /etc/caddy/Caddyfile; fi
     
     cat >> /etc/caddy/Caddyfile <<EOF
@@ -191,24 +191,22 @@ ${domain} {
 }
 EOF
 
-    # 处理监控逻辑
     if [[ "$enable_monitor" == "true" ]]; then
         echo "${current_ip}" > /root/.last_known_ip
         manage_cron "on"
-        TG_MSG="✅ 反代已部署 (IP监控开启)。%0AIP: ${current_ip}"
+        TG_MSG="✅ 反代部署成功(监控开启)%0AIP: ${current_ip}"
     else
         manage_cron "off"
-        TG_MSG="✅ 反代已部署 (静态配置)。%0A域名: ${input_domain}"
+        TG_MSG="✅ 反代部署成功(静态配置)%0A域名: ${input_domain}"
     fi
 
     if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile &> /dev/null; then
         systemctl reload caddy
         echo -e "${GREEN}配置成功！${PLAIN}"
-        # 发送 TG 通知 (使用解码后的变量)
         curl -s -X POST "https://api.telegram.org/bot${dec_token}/sendMessage" \
             -d chat_id="${dec_chat_id}" -d text="${TG_MSG}" >/dev/null
     else
-        echo -e "${RED}配置验证失败，请检查配置文件！${PLAIN}"
+        echo -e "${RED}验证失败，请检查配置！${PLAIN}"
     fi
 }
 
@@ -219,9 +217,10 @@ main() {
     [[ $EUID -ne 0 ]] && echo -e "${RED}请用 root 运行${PLAIN}" && exit 1
     check_sys
     
-    echo -e "1. 配置反代 (自动判断是否开启监控)"
+    echo -e "1. 配置反代"
     echo -e "2. 卸载 Caddy"
-    read -p "选择: " choice
+    # 使用 -e 参数
+    read -e -p "选择: " choice
 
     case $choice in
         1)
