@@ -63,25 +63,36 @@ install_caddy() {
 }
 
 # ==========================================
-# 3. 工具函数
+# 3. 工具函数 (修复了IP获取逻辑)
 # ==========================================
 get_public_ip() {
-    local ip=$(curl -s4m8 https://ip.sb)
-    [[ -z "$ip" ]] && ip=$(curl -s4m8 https://api.ipify.org)
-    echo "$ip"
+    # 尝试多个接口，增加稳定性
+    local ip=$(curl -s4m5 https://api.ipify.org)
+    
+    # 如果第一个失败或者返回的不是纯IP，尝试第二个
+    if [[ -z "$ip" ]] || [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ip=$(curl -s4m5 https://icanhazip.com)
+    fi
+    
+    if [[ -z "$ip" ]] || [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ip=$(curl -s4m5 https://ifconfig.me)
+    fi
+
+    # 清理一下可能的换行符
+    echo "$ip" | tr -d '\n'
 }
 
 process_address() {
     local addr=$1
-    # 移除首尾空格
     addr=$(echo "$addr" | sed 's/^[ \t]*//;s/[ \t]*$//')
     
+    # 更严格的IP判断
     local regex_ip="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
     if [[ $addr =~ $regex_ip ]]; then echo "${addr}:80"; else echo "${addr}"; fi
 }
 
 # ==========================================
-# 4. 生成监控脚本
+# 4. 生成监控脚本 (同步更新了IP获取逻辑)
 # ==========================================
 create_monitor_script() {
     cat > /usr/local/bin/ip_monitor.sh <<EOF
@@ -94,8 +105,20 @@ CHAT_ID_B64="${TG_CHAT_ID_B64}"
 BOT_TOKEN=\$(echo "\$TOKEN_B64" | base64 -d)
 CHAT_ID=\$(echo "\$CHAT_ID_B64" | base64 -d)
 
-CURRENT_IP=\$(curl -s4m10 https://ip.sb)
-[[ -z "\$CURRENT_IP" ]] && CURRENT_IP=\$(curl -s4m10 https://api.ipify.org)
+# 增强的获取IP逻辑
+get_ip() {
+    local ip=\$(curl -s4m5 https://api.ipify.org)
+    if [[ ! "\$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ip=\$(curl -s4m5 https://icanhazip.com)
+    fi
+    if [[ ! "\$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        ip=\$(curl -s4m5 https://ifconfig.me)
+    fi
+    echo "\$ip" | tr -d '\n'
+}
+
+CURRENT_IP=\$(get_ip)
+# 如果三次都失败，直接退出
 [[ -z "\$CURRENT_IP" ]] && exit 0
 
 if [[ -f "\$IP_CACHE" ]]; then
@@ -148,14 +171,27 @@ configure_proxy() {
     
     local dec_token=$(echo "$TG_BOT_TOKEN_B64" | base64 -d)
     local dec_chat_id=$(echo "$TG_CHAT_ID_B64" | base64 -d)
-
-    echo -e "${SKYBLUE}步骤 1: 设置接入IP/域名${PLAIN}"
-    echo -e "本机IP: ${GREEN}[ ${current_ip} ]${PLAIN}"
-    read -e -p "请输入 (留空回车使用本机IP): " input_domain
     
+    # 增加一层检查，如果获取到的IP不对，必须强制手动输入
+    local regex_check="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
+    
+    echo -e "${SKYBLUE}步骤 1: 设置接入IP/域名${PLAIN}"
+    
+    if [[ "$current_ip" =~ $regex_check ]]; then
+        echo -e "本机IP: ${GREEN}[ ${current_ip} ]${PLAIN}"
+    else
+        echo -e "${RED}警告: 自动获取IP失败，请手动输入！${PLAIN}"
+        current_ip=""
+    fi
+
+    read -e -p "请输入 (留空回车使用本机IP): " input_domain
     input_domain=$(echo "$input_domain" | sed 's/^[ \t]*//;s/[ \t]*$//')
 
     if [[ -z "${input_domain}" ]]; then
+        if [[ -z "${current_ip}" ]]; then
+             echo -e "${RED}无法获取本机IP，且输入为空，退出！${PLAIN}"
+             exit 1
+        fi
         input_domain="${current_ip}"
         enable_monitor=true
         echo -e "已选择本机IP，${GREEN}开启监控${PLAIN}。"
@@ -170,7 +206,6 @@ configure_proxy() {
 
     echo -e "\n${SKYBLUE}步骤 2: 设置源站地址${PLAIN}"
     read -e -p "请输入源站 (如 8.8.8.8): " input_target
-    
     input_target=$(echo "$input_target" | sed 's/^[ \t]*//;s/[ \t]*$//')
     
     [[ -z "${input_target}" ]] && echo -e "${RED}错误：不能为空${PLAIN}" && exit 1
@@ -202,6 +237,9 @@ EOF
             -d chat_id="${dec_chat_id}" -d text="${TG_MSG}" >/dev/null
     else
         echo -e "${RED}验证失败，请检查配置！${PLAIN}"
+        echo -e "写入的配置可能包含无效字符，正在回滚..."
+        # 简单回滚：删除最后4行
+        head -n -4 /etc/caddy/Caddyfile > /tmp/caddyfile_tmp && mv /tmp/caddyfile_tmp /etc/caddy/Caddyfile
     fi
 }
 
@@ -215,8 +253,6 @@ main() {
     echo -e "1. 配置反代 (默认)"
     echo -e "2. 卸载 Caddy"
     read -e -p "选择 [默认1]: " choice
-    
-    # 逻辑修改：如果输入为空，则默认赋值为 1
     [[ -z "${choice}" ]] && choice="1"
 
     case $choice in
@@ -232,7 +268,6 @@ main() {
             echo -e "${GREEN}已卸载${PLAIN}"
             ;;
         *) 
-            echo -e "${RED}无效输入，默认执行配置反代...${PLAIN}"
             install_caddy
             configure_proxy
             ;;
