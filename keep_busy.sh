@@ -1,152 +1,194 @@
 #!/bin/bash
 
 # =========================================================
-# VPS Resource Keeper (Hardware Aware Edition)
-# 功能：自动识别 CPU/内存配置，动态维持 20%-25% 占用
-# 特性：自动硬件识别、自动安装依赖、开机自启、静默运行
+# VPS Resource Keeper (Pro Edition)
+# 专治大内存(10GB+)和多核环境，平滑曲线，拒绝尖刺
 # =========================================================
 
 SERVICE_NAME="vps-resource-keeper"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 SCRIPT_PATH=$(readlink -f "$0")
 
-# 目标占用范围 (%)
-TARGET_MIN=20
-TARGET_MAX=25
-INTERVAL=5
+# =========================================================
+# 1. 核心 Python 引擎 (嵌入式)
+# =========================================================
+# 我们将生成一个功能强大的 Python 脚本来接管控制
+# 它使用多线程同时处理 CPU 和 内存，比 Shell 更精准
+# =========================================================
 
-# =========================================================
-# 1. 核心 Worker (后台服务运行逻辑)
-# =========================================================
 run_worker() {
-    # --- 硬件识别 ---
-    NUM_CORES=$(nproc)
-    TOTAL_MEM=$(free -m | awk '/^Mem:/{print $2}')
+    # 再次检查依赖
+    if ! command -v python3 &> /dev/null; then exit 1; fi
+
+    PYTHON_WORKER="/tmp/vps_keeper_pro.py"
     
-    echo "LOG: Detected Hardware -> CPU Cores: ${NUM_CORES}, Total RAM: ${TOTAL_MEM}MB"
-    echo "LOG: Target Usage -> ${TARGET_MIN}% - ${TARGET_MAX}%"
+    cat << 'EOF' > $PYTHON_WORKER
+import time
+import sys
+import os
+import threading
+import math
 
-    # --- 依赖工具检查 ---
-    if ! command -v bc &> /dev/null || ! command -v python3 &> /dev/null; then
-        echo "Error: Dependencies missing in worker thread."
-        exit 1
-    fi
+# 配置
+TARGET_MIN = 20.0
+TARGET_MAX = 25.0
+CHECK_INTERVAL = 3  # 检查周期
 
-    # --- 内存控制脚本 (Python) ---
-    MEM_SCRIPT="/tmp/vps_keeper_mem_worker.py"
-    cat << 'EOF' > $MEM_SCRIPT
-import time, sys, os
-def allocate_memory(target_mb):
+# 全局变量
+memory_blocks = []
+cpu_duty_cycle = 0.0 # CPU 占空比 (0.0 - 1.0)
+cpu_threads = []
+running = True
+
+# --- 基础工具函数 ---
+
+def get_cpu_usage():
     try:
-        # 申请内存并写入数据确保物理内存被占用
-        return bytearray(int(target_mb * 1024 * 1024))
+        # 读取 /proc/stat 计算 CPU
+        with open('/proc/stat', 'r') as f:
+            line = f.readline()
+        parts = line.split()
+        # user+nice+system+irq+softirq+steal
+        active = sum(int(parts[i]) for i in [1, 2, 3, 6, 7, 8])
+        idle = int(parts[4]) + int(parts[5]) # idle + iowait
+        return active, active + idle
     except:
-        return None
-if __name__ == "__main__":
-    if len(sys.argv) < 2: sys.exit(1)
-    target_mb = float(sys.argv[1])
-    ppid = os.getppid()
-    if allocate_memory(target_mb):
-        while True:
+        return 0, 0
+
+def get_mem_usage_percent():
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            mem_total = 0
+            mem_available = 0
+            for line in f:
+                if 'MemTotal' in line:
+                    mem_total = int(line.split()[1])
+                elif 'MemAvailable' in line:
+                    mem_available = int(line.split()[1])
+                if mem_total and mem_available:
+                    break
+        used = mem_total - mem_available
+        return (used / mem_total) * 100.0, mem_total # 返回百分比和总内存(KB)
+    except:
+        return 0, 0
+
+# --- CPU 消耗线程 ---
+# 模拟 PWM：在 0.1s 的周期内，忙碌 duty_cycle 的时间
+def cpu_burner_thread(core_id):
+    global cpu_duty_cycle, running
+    
+    # 获取本机核心数
+    try:
+        num_cores = os.cpu_count()
+    except:
+        num_cores = 1
+        
+    while running:
+        # 我们的目标是让 系统总CPU 达到 20%
+        # 如果是双核，总占用 20% 意味着我们需要消耗 0.4 个核心的算力 (2 * 0.2)
+        # 所以这里的 sleep 逻辑需要根据 duty_cycle 动态调整
+        
+        current_duty = cpu_duty_cycle
+        
+        if current_duty <= 0:
+            time.sleep(0.5)
+            continue
+            
+        start_time = time.time()
+        # 忙碌阶段 (做数学运算)
+        while (time.time() - start_time) < (0.1 * current_duty):
+            _ = 3.14159 * 2.71828 # 简单的浮点运算
+            
+        # 休息阶段
+        sleep_time = 0.1 * (1 - current_duty)
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+# --- 主控制循环 ---
+def main():
+    global memory_blocks, cpu_duty_cycle, running
+    
+    # 启动与 CPU 核心数相同数量的线程，以便能占满所有核心
+    num_cores = os.cpu_count() or 1
+    print(f"LOG: Detected {num_cores} CPU Cores")
+    
+    for i in range(num_cores):
+        t = threading.Thread(target=cpu_burner_thread, args=(i,))
+        t.daemon = True
+        t.start()
+        cpu_threads.append(t)
+
+    print(f"LOG: Worker started. Target range: {TARGET_MIN}% - {TARGET_MAX}%")
+    
+    last_active, last_total = get_cpu_usage()
+    
+    while True:
+        time.sleep(CHECK_INTERVAL)
+        
+        # 1. 获取当前状态
+        curr_active, curr_total = get_cpu_usage()
+        delta_total = curr_total - last_total
+        delta_active = curr_active - last_active
+        
+        current_cpu_percent = 0
+        if delta_total > 0:
+            current_cpu_percent = (delta_active / delta_total) * 100.0
+            
+        last_active, last_total = curr_active, curr_total
+        
+        current_mem_percent, total_mem_kb = get_mem_usage_percent()
+        
+        # --- 2. 内存 动态调整 (堆叠法) ---
+        # 每次只调整一小块 (100MB)，避免大起大落
+        CHUNK_SIZE_MB = 100
+        CHUNK_SIZE_BYTES = CHUNK_SIZE_MB * 1024 * 1024
+        
+        if current_mem_percent < TARGET_MIN:
+            # 内存不够，分配一块
             try:
-                os.kill(ppid, 0) # 监听父进程，父进程死则自杀
-                time.sleep(2)
-            except: break
+                # 使用 bytearray 并填充数据，防止被系统压缩或忽略
+                block = bytearray(CHUNK_SIZE_BYTES)
+                # 简单填充，确保产生实际物理内存占用
+                memory_blocks.append(block) 
+                # print(f"Added 100MB. Blocks: {len(memory_blocks)}")
+            except:
+                pass # 内存满了分配失败，忽略
+                
+        elif current_mem_percent > TARGET_MAX:
+            # 内存超了，如果是因为我们占用的，就释放一块
+            # 智能避让：如果 current_mem 很高但 blocks 为空，说明是其他程序占的，我们不管
+            if len(memory_blocks) > 0:
+                memory_blocks.pop()
+                # print(f"Removed 100MB. Blocks: {len(memory_blocks)}")
+            # 如果 memory_blocks 已经空了还是高，说明是业务占用，我们保持 0 占用即可
+
+        # --- 3. CPU 动态调整 (PID 简化版) ---
+        # 如果当前 CPU < 20%，增加占空比
+        # 如果当前 CPU > 25%，减少占空比
+        
+        step = 0.05 # 每次调整 5% 的力度
+        
+        if current_cpu_percent < TARGET_MIN:
+            cpu_duty_cycle = min(1.0, cpu_duty_cycle + step)
+        elif current_cpu_percent > TARGET_MAX:
+            cpu_duty_cycle = max(0.0, cpu_duty_cycle - step * 2) # 下降快一点
+            
+        # 调试日志 (可选)
+        # print(f"CPU: {current_cpu_percent:.1f}% (Duty: {cpu_duty_cycle:.2f}), RAM: {current_mem_percent:.1f}% (Blocks: {len(memory_blocks)})")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        running = False
 EOF
 
-    # --- 辅助函数 ---
-    # 获取 CPU 总体使用率
-    get_cpu() { top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print 100 - $1}'; }
-    # 获取 内存 使用率
-    get_mem() { free | grep Mem | awk '{print $3/$2 * 100.0}'; }
-    
-    # CPU 消耗函数 (根据核心数调整压力)
-    burn_cpu() { 
-        # 运行 sha256sum 计算，持续 0.3s
-        timeout 0.3s sha256sum /dev/zero > /dev/null 2>&1
-    }
-
-    # 内存调整函数
-    current_mem_pid=""
-    adjust_mem() {
-        local target=$1
-        # 先清理旧进程
-        if [ ! -z "$current_mem_pid" ]; then 
-            kill $current_mem_pid 2>/dev/null 
-            wait $current_mem_pid 2>/dev/null
-        fi
-        
-        # 启动新进程
-        if (( $(echo "$target > 0" | bc -l) )); then
-            python3 $MEM_SCRIPT $target > /dev/null 2>&1 &
-            current_mem_pid=$!
-        else
-            current_mem_pid=""
-        fi
-    }
-
-    # 退出清理
-    trap "if [ ! -z '$current_mem_pid' ]; then kill $current_mem_pid 2>/dev/null; fi; rm -f $MEM_SCRIPT; exit 0" SIGINT SIGTERM
-
-    TARGET_AVG=$(echo "($TARGET_MAX + $TARGET_MIN) / 2" | bc)
-
-    # --- 主循环 ---
-    while true; do
-        cpu=$(get_cpu)
-        mem=$(get_mem)
-        
-        # 1. 计算内存需求
-        # 获取当前脚本占用的内存(MB)
-        script_mem_mb=0
-        if [ ! -z "$current_mem_pid" ] && ps -p $current_mem_pid > /dev/null; then
-             rss=$(ps -o rss= -p $current_mem_pid 2>/dev/null | awk '{print $1}')
-             if [ ! -z "$rss" ]; then script_mem_mb=$(echo "$rss / 1024" | bc); fi
-        else 
-             current_mem_pid=""
-        fi
-
-        # 计算"非脚本"的系统真实负载
-        # 真实负载% = (当前总内存% * 总内存MB - 脚本占用MB) / 总内存MB * 100
-        real_sys_usage=$(echo "($mem * $TOTAL_MEM / 100 - $script_mem_mb) / $TOTAL_MEM * 100" | bc -l)
-        if (( $(echo "$real_sys_usage < 0" | bc -l) )); then real_sys_usage=0; fi
-
-        # 内存策略：
-        if (( $(echo "$real_sys_usage > $TARGET_MAX" | bc -l) )); then
-            # 其他程序占用超过 MAX -> 脚本全部释放
-            if [ ! -z "$current_mem_pid" ]; then adjust_mem 0; fi
-        elif (( $(echo "$mem < $TARGET_MIN" | bc -l) )); then
-            # 总占用低于 MIN -> 补齐到 AVG
-            needed_mb=$(echo "$TOTAL_MEM * ($TARGET_AVG - $real_sys_usage) / 100" | bc)
-            adjust_mem $needed_mb
-        fi
-
-        # 2. 计算 CPU 需求
-        if (( $(echo "$cpu < $TARGET_MIN" | bc -l) )); then
-            # 计算差距
-            gap=$(echo "$TARGET_AVG - $cpu" | bc -l)
-            
-            # 根据核心数决定并发量
-            # 逻辑：如果 gap 很大，且核心数多，则多开几个线程
-            # 基础并发 = 核心数 * (Gap / 10)
-            threads=$(echo "$NUM_CORES * $gap / 10" | bc)
-            
-            # 限制线程数范围 [1, 核心数*2]
-            if [ "$threads" -lt "1" ]; then threads=1; fi
-            max_threads=$(echo "$NUM_CORES * 2" | bc)
-            if [ "$threads" -gt "$max_threads" ]; then threads=$max_threads; fi
-            
-            for ((i=1; i<=threads; i++)); do
-                burn_cpu &
-            done
-            wait
-        fi
-
-        sleep $INTERVAL
-    done
+    # 启动 Python 脚本
+    python3 -u $PYTHON_WORKER
 }
 
 # =========================================================
-# 2. 自动安装逻辑 (Systemd 入口)
+# 2. 自动安装与服务管理
 # =========================================================
 
 if [ "$1" == "daemon" ]; then
@@ -154,61 +196,42 @@ if [ "$1" == "daemon" ]; then
     exit 0
 fi
 
-echo ">>> VPS Resource Keeper: Auto-Installer"
-echo ">>> Step 1: Detecting System..."
+echo ">>> VPS Resource Keeper: Pro Edition"
+echo ">>> Step 1: Installing Dependencies..."
 
-# 检查 Root
 if [ "$(id -u)" != "0" ]; then echo "Error: Must run as root"; exit 1; fi
 
-# 自动安装依赖
+# 安装 python3 (基本所有 VPS 都有，防止万一)
 if [ -f /etc/debian_version ]; then
-    echo "    - OS: Debian/Ubuntu detected."
-    apt-get update -y >/dev/null 2>&1 && apt-get install -y bc python3 procps >/dev/null 2>&1
+    apt-get update -y >/dev/null 2>&1 && apt-get install -y python3 >/dev/null 2>&1
 elif [ -f /etc/redhat-release ]; then
-    echo "    - OS: CentOS/RHEL detected."
-    if command -v dnf &> /dev/null; then dnf install -y bc python3 procps >/dev/null 2>&1; else yum install -y bc python3 procps >/dev/null 2>&1; fi
+    yum install -y python3 >/dev/null 2>&1 || dnf install -y python3 >/dev/null 2>&1
 elif [ -f /etc/alpine-release ]; then
-    echo "    - OS: Alpine Linux detected."
-    apk update >/dev/null 2>&1 && apk add bc python3 procps >/dev/null 2>&1
-elif command -v pacman &> /dev/null; then
-    echo "    - OS: Arch Linux detected."
-    pacman -Sy --noconfirm bc python procps >/dev/null 2>&1
-else
-    echo "    - Unknown OS. Attempting to run anyway (dependencies might fail)."
+    apk add python3 >/dev/null 2>&1
 fi
 
-echo ">>> Step 2: Configuring Auto-Start Service..."
+echo ">>> Step 2: Configuring Systemd Service..."
 
-# 写入 Systemd 服务文件
 cat > $SERVICE_FILE <<EOF
 [Unit]
-Description=VPS Resource Keeper (Auto Hardware Detect)
+Description=VPS Resource Keeper Pro
 After=network.target
 
 [Service]
 Type=simple
 ExecStart=/bin/bash $SCRIPT_PATH daemon
 Restart=always
-RestartSec=5
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 启动服务
 systemctl daemon-reload
 systemctl enable $SERVICE_NAME >/dev/null 2>&1
 systemctl restart $SERVICE_NAME
 
-# 获取硬件信息用于显示安装结果
-CORES=$(nproc)
-MEM=$(free -m | awk '/^Mem:/{print $2}')
-
-echo ">>> Installation Complete!"
-echo "-----------------------------------------------------"
-echo " Detected CPU Cores : $CORES"
-echo " Detected Total RAM : ${MEM} MB"
-echo " Service Status     : Active (Running in background)"
-echo "-----------------------------------------------------"
-echo "To check logs: journalctl -u $SERVICE_NAME -f"
-echo "To stop:       systemctl stop $SERVICE_NAME; systemctl disable $SERVICE_NAME"
+echo ">>> Success! Running in background."
+echo ">>> The script will now smoothly ramp up usage to 20-25%."
+echo ">>> It may take 1-2 minutes to stabilize the Memory curve."
+echo ">>> Check status: systemctl status $SERVICE_NAME"
