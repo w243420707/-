@@ -63,36 +63,40 @@ install_caddy() {
 }
 
 # ==========================================
-# 3. 工具函数 (修复了IP获取逻辑)
+# 3. 工具函数 (强力修复 IP 获取)
 # ==========================================
 get_public_ip() {
-    # 尝试多个接口，增加稳定性
-    local ip=$(curl -s4m5 https://api.ipify.org)
+    # 定义接口列表，优先 ip.sb
+    local urls=("ip.sb" "ifconfig.co" "api.ipify.org" "icanhazip.com")
     
-    # 如果第一个失败或者返回的不是纯IP，尝试第二个
-    if [[ -z "$ip" ]] || [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        ip=$(curl -s4m5 https://icanhazip.com)
-    fi
-    
-    if [[ -z "$ip" ]] || [[ ! "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        ip=$(curl -s4m5 https://ifconfig.me)
-    fi
+    for url in "${urls[@]}"; do
+        # -s: 静默模式
+        # -4: 强制 IPv4
+        # -L: 跟随重定向
+        # -A: 模拟 Chrome 浏览器 User-Agent (解决 403 问题的关键)
+        local ip=$(curl -s -4 -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" "$url")
+        
+        # 清理空格
+        ip=$(echo "$ip" | sed 's/^[ \t]*//;s/[ \t]*$//')
 
-    # 清理一下可能的换行符
-    echo "$ip" | tr -d '\n'
+        # 正则校验：必须是 x.x.x.x 格式
+        if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+        # 如果获取到 HTML 或空的，循环继续尝试下一个
+    done
 }
 
 process_address() {
     local addr=$1
     addr=$(echo "$addr" | sed 's/^[ \t]*//;s/[ \t]*$//')
-    
-    # 更严格的IP判断
     local regex_ip="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
     if [[ $addr =~ $regex_ip ]]; then echo "${addr}:80"; else echo "${addr}"; fi
 }
 
 # ==========================================
-# 4. 生成监控脚本 (同步更新了IP获取逻辑)
+# 4. 生成监控脚本
 # ==========================================
 create_monitor_script() {
     cat > /usr/local/bin/ip_monitor.sh <<EOF
@@ -105,20 +109,21 @@ CHAT_ID_B64="${TG_CHAT_ID_B64}"
 BOT_TOKEN=\$(echo "\$TOKEN_B64" | base64 -d)
 CHAT_ID=\$(echo "\$CHAT_ID_B64" | base64 -d)
 
-# 增强的获取IP逻辑
+# 这里的 IP 获取逻辑必须和主脚本一致，否则监控会误报
 get_ip() {
-    local ip=\$(curl -s4m5 https://api.ipify.org)
-    if [[ ! "\$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        ip=\$(curl -s4m5 https://icanhazip.com)
-    fi
-    if [[ ! "\$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        ip=\$(curl -s4m5 https://ifconfig.me)
-    fi
-    echo "\$ip" | tr -d '\n'
+    local urls=("ip.sb" "ifconfig.co" "api.ipify.org")
+    for url in "\${urls[@]}"; do
+        local ip=\$(curl -s -4 -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" "\$url")
+        ip=\$(echo "\$ip" | sed 's/^[ \t]*//;s/[ \t]*$//')
+        if [[ "\$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo "\$ip"
+            return 0
+        fi
+    done
 }
 
 CURRENT_IP=\$(get_ip)
-# 如果三次都失败，直接退出
+# 如果三次都失败，直接退出，不写入任何东西
 [[ -z "\$CURRENT_IP" ]] && exit 0
 
 if [[ -f "\$IP_CACHE" ]]; then
@@ -172,7 +177,7 @@ configure_proxy() {
     local dec_token=$(echo "$TG_BOT_TOKEN_B64" | base64 -d)
     local dec_chat_id=$(echo "$TG_CHAT_ID_B64" | base64 -d)
     
-    # 增加一层检查，如果获取到的IP不对，必须强制手动输入
+    # 正则校验：确保 current_ip 是纯 IP，不是 HTML
     local regex_check="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
     
     echo -e "${SKYBLUE}步骤 1: 设置接入IP/域名${PLAIN}"
@@ -180,7 +185,8 @@ configure_proxy() {
     if [[ "$current_ip" =~ $regex_check ]]; then
         echo -e "本机IP: ${GREEN}[ ${current_ip} ]${PLAIN}"
     else
-        echo -e "${RED}警告: 自动获取IP失败，请手动输入！${PLAIN}"
+        echo -e "${RED}警告: 自动获取IP失败 (接口被拦截或无网络)${PLAIN}"
+        echo -e "请手动输入您的IP。"
         current_ip=""
     fi
 
@@ -189,7 +195,7 @@ configure_proxy() {
 
     if [[ -z "${input_domain}" ]]; then
         if [[ -z "${current_ip}" ]]; then
-             echo -e "${RED}无法获取本机IP，且输入为空，退出！${PLAIN}"
+             echo -e "${RED}错误：自动获取失败且未输入IP，无法继续！${PLAIN}"
              exit 1
         fi
         input_domain="${current_ip}"
@@ -237,8 +243,7 @@ EOF
             -d chat_id="${dec_chat_id}" -d text="${TG_MSG}" >/dev/null
     else
         echo -e "${RED}验证失败，请检查配置！${PLAIN}"
-        echo -e "写入的配置可能包含无效字符，正在回滚..."
-        # 简单回滚：删除最后4行
+        echo -e "自动回滚配置..."
         head -n -4 /etc/caddy/Caddyfile > /tmp/caddyfile_tmp && mv /tmp/caddyfile_tmp /etc/caddy/Caddyfile
     fi
 }
