@@ -29,7 +29,6 @@ check_sys() {
         release="unknown"
     fi
     
-    # 简单安装依赖
     if [[ ${release} == "centos" ]]; then
         yum install -y crontabs curl
         systemctl start crond && systemctl enable crond
@@ -79,10 +78,9 @@ get_public_ip() {
 process_address() {
     local addr=$1
     addr=$(echo "$addr" | sed 's/^[ \t]*//;s/[ \t]*$//')
-    # 关键修改：如果是IP，强制加上 :80 端口，避免 SSL 验证失败
+    # 强制加 :80 避免 SSL 申请失败
     local regex_ip="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
     if [[ $addr =~ $regex_ip ]]; then 
-        # 只有当没有端口号时才加 :80
         if [[ $addr != *":"* ]]; then
             echo "${addr}:80"
         else
@@ -94,7 +92,7 @@ process_address() {
 }
 
 # ==========================================
-# 4. 生成监控脚本
+# 4. 生成监控脚本 (使用 HTML 模式生成复制代码块)
 # ==========================================
 create_monitor_script() {
     cat > /usr/local/bin/ip_monitor.sh <<EOF
@@ -131,19 +129,18 @@ fi
 
 if [[ "\$CURRENT_IP" != "\$LAST_IP" ]]; then
     if grep -q "\$LAST_IP" "\$CADDY_FILE"; then
-        # 这里的替换逻辑要小心，确保只替换IP部分
         sed -i "s/\$LAST_IP/\$CURRENT_IP/g" "\$CADDY_FILE"
-        
         if caddy validate --config "\$CADDY_FILE" --adapter caddyfile >/dev/null 2>&1; then
             systemctl reload caddy
             echo "\$CURRENT_IP" > "\$IP_CACHE"
-            MSG="🚨 *IP 变更通知* 🚨%0A%0A旧: \`\$LAST_IP\`%0A新: \`\$CURRENT_IP\`%0A%0A✅ Caddy 配置已更新。"
+            # 这里的 <pre> 标签就是关键，它会生成你想要的那个复制框
+            MSG="🚨 <b>IP 变更通知</b> 🚨%0A%0A旧 IP:%0A<pre>\$LAST_IP</pre>%0A%0A新 IP:%0A<pre>\$CURRENT_IP</pre>%0A%0A✅ Caddy 配置已自动更新。"
         else
-            MSG="⚠️ *IP 变更失败* ⚠️%0A新 IP: \`\$CURRENT_IP\`%0A原因: 配置文件校验未通过，请手动检查。"
+            MSG="⚠️ <b>IP 变更失败</b> ⚠️%0A新 IP: <pre>\$CURRENT_IP</pre>%0A原因: Caddy 校验未通过。"
         fi
-        
+        # 注意这里改成了 parse_mode="HTML"
         curl -s -X POST "https://api.telegram.org/bot\${BOT_TOKEN}/sendMessage" \
-            -d chat_id="\${CHAT_ID}" -d parse_mode="Markdown" -d text="\${MSG}"
+            -d chat_id="\${CHAT_ID}" -d parse_mode="HTML" -d text="\${MSG}"
     fi
 fi
 EOF
@@ -170,9 +167,20 @@ manage_cron() {
 }
 
 # ==========================================
-# 6. 配置逻辑 (带Debug输出)
+# 6. 配置逻辑 (暴力重置 + HTML通知)
 # ==========================================
+reset_caddyfile() {
+    local file="/etc/caddy/Caddyfile"
+    echo -e "${YELLOW}正在完全重置 Caddyfile...${PLAIN}"
+    if [ -f "$file" ]; then
+        mv "$file" "${file}.bak_failed_$(date +%s)"
+    fi
+    touch "$file"
+}
+
 configure_proxy() {
+    reset_caddyfile
+
     local current_ip=$(get_public_ip)
     local enable_monitor=false
     local dec_token=$(echo "$TG_BOT_TOKEN_B64" | base64 -d)
@@ -194,7 +202,6 @@ configure_proxy() {
         echo -e "自定义域名/IP，${YELLOW}不开启监控${PLAIN}。"
     fi
     
-    # 这里会给纯IP加上 :80 后缀
     domain=$(process_address "$input_domain")
 
     echo -e "\n${SKYBLUE}步骤 2: 设置源站地址${PLAIN}"
@@ -203,16 +210,6 @@ configure_proxy() {
     [[ -z "${input_target}" ]] && echo -e "${RED}错误：不能为空${PLAIN}" && exit 1
     target=$(process_address "$input_target")
 
-    # 准备文件
-    if [ ! -f /etc/caddy/Caddyfile ]; then touch /etc/caddy/Caddyfile; fi
-    
-    # 确保文件末尾有换行，避免追加到上一行
-    sed -i '$a\' /etc/caddy/Caddyfile
-
-    # 备份旧文件，方便回滚
-    cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak
-
-    # 写入配置
     cat >> /etc/caddy/Caddyfile <<EOF
 ${domain} {
     reverse_proxy ${target}
@@ -220,30 +217,36 @@ ${domain} {
 }
 EOF
 
-    # 验证环节 (打印详细错误)
     echo -e "${YELLOW}正在验证 Caddy 配置...${PLAIN}"
     if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile > /tmp/caddy_error.log 2>&1; then
-        systemctl reload caddy
+        
+        if systemctl reload caddy 2>/dev/null; then
+            echo -e "${GREEN}Caddy 配置已重载。${PLAIN}"
+        else
+            echo -e "${YELLOW}服务未启动，正在启动 Caddy...${PLAIN}"
+            systemctl enable --now caddy
+            echo -e "${GREEN}Caddy 已启动。${PLAIN}"
+        fi
         
         if [[ "$enable_monitor" == "true" ]]; then
             echo "${current_ip}" > /root/.last_known_ip
             manage_cron "on"
-            TG_MSG="✅ 反代部署成功(监控开启)%0AIP: ${current_ip}"
+            # 使用 HTML 模式的 <pre> 标签包裹 IP
+            TG_MSG="✅ <b>反代部署成功(监控开启)</b>%0A%0A当前 IP:%0A<pre>${current_ip}</pre>"
         else
             manage_cron "off"
-            TG_MSG="✅ 反代部署成功(静态配置)%0A域名: ${input_domain}"
+            TG_MSG="✅ <b>反代部署成功(静态配置)</b>%0A%0A域名:%0A<pre>${input_domain}</pre>"
         fi
         
         echo -e "${GREEN}配置成功！${PLAIN}"
+        # 这里务必使用 parse_mode="HTML"
         curl -s -X POST "https://api.telegram.org/bot${dec_token}/sendMessage" \
-            -d chat_id="${dec_chat_id}" -d text="${TG_MSG}" >/dev/null
+            -d chat_id="${dec_chat_id}" -d parse_mode="HTML" -d text="${TG_MSG}" >/dev/null
     else
         echo -e "${RED}验证失败！${PLAIN}"
         echo -e "${RED}============= Caddy 报错详情 =============${PLAIN}"
         cat /tmp/caddy_error.log
         echo -e "${RED}=========================================${PLAIN}"
-        echo -e "自动回滚配置..."
-        mv /etc/caddy/Caddyfile.bak /etc/caddy/Caddyfile
     fi
     rm -f /tmp/caddy_error.log
 }
