@@ -25,17 +25,16 @@ check_sys() {
         release="debian"
     elif cat /etc/issue | grep -q -E -i "ubuntu"; then
         release="ubuntu"
-    elif cat /etc/issue | grep -q -E -i "centos|red hat|redhat"; then
-        release="centos"
     else
-        echo -e "${RED}系统不支持${PLAIN}" && exit 1
+        release="unknown"
     fi
     
+    # 简单安装依赖
     if [[ ${release} == "centos" ]]; then
-        yum install -y crontabs
+        yum install -y crontabs curl
         systemctl start crond && systemctl enable crond
     else
-        apt-get update && apt-get install -y cron
+        apt-get update && apt-get install -y cron curl
         systemctl start cron && systemctl enable cron
     fi
 }
@@ -50,11 +49,11 @@ install_caddy() {
     fi
     echo -e "${YELLOW}安装 Caddy...${PLAIN}"
     if [[ ${release} == "centos" ]]; then
-        yum install -y curl tar yum-plugin-copr
+        yum install -y yum-plugin-copr
         yum copr enable @caddy/caddy -y
         yum install caddy -y
     else
-        apt-get install -y curl tar debian-keyring debian-archive-keyring apt-transport-https
+        apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
         curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
         curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
         apt-get update && apt-get install caddy -y
@@ -63,36 +62,35 @@ install_caddy() {
 }
 
 # ==========================================
-# 3. 工具函数 (强力修复 IP 获取)
+# 3. 工具函数
 # ==========================================
 get_public_ip() {
-    # 定义接口列表，优先 ip.sb
     local urls=("ip.sb" "ifconfig.co" "api.ipify.org" "icanhazip.com")
-    
     for url in "${urls[@]}"; do
-        # -s: 静默模式
-        # -4: 强制 IPv4
-        # -L: 跟随重定向
-        # -A: 模拟 Chrome 浏览器 User-Agent (解决 403 问题的关键)
-        local ip=$(curl -s -4 -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" "$url")
-        
-        # 清理空格
+        local ip=$(curl -s -4 -L -A "Mozilla/5.0" "$url")
         ip=$(echo "$ip" | sed 's/^[ \t]*//;s/[ \t]*$//')
-
-        # 正则校验：必须是 x.x.x.x 格式
         if [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
             echo "$ip"
             return 0
         fi
-        # 如果获取到 HTML 或空的，循环继续尝试下一个
     done
 }
 
 process_address() {
     local addr=$1
     addr=$(echo "$addr" | sed 's/^[ \t]*//;s/[ \t]*$//')
+    # 关键修改：如果是IP，强制加上 :80 端口，避免 SSL 验证失败
     local regex_ip="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
-    if [[ $addr =~ $regex_ip ]]; then echo "${addr}:80"; else echo "${addr}"; fi
+    if [[ $addr =~ $regex_ip ]]; then 
+        # 只有当没有端口号时才加 :80
+        if [[ $addr != *":"* ]]; then
+            echo "${addr}:80"
+        else
+            echo "${addr}"
+        fi
+    else 
+        echo "${addr}"
+    fi
 }
 
 # ==========================================
@@ -109,11 +107,10 @@ CHAT_ID_B64="${TG_CHAT_ID_B64}"
 BOT_TOKEN=\$(echo "\$TOKEN_B64" | base64 -d)
 CHAT_ID=\$(echo "\$CHAT_ID_B64" | base64 -d)
 
-# 这里的 IP 获取逻辑必须和主脚本一致，否则监控会误报
 get_ip() {
     local urls=("ip.sb" "ifconfig.co" "api.ipify.org")
     for url in "\${urls[@]}"; do
-        local ip=\$(curl -s -4 -L -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36" "\$url")
+        local ip=\$(curl -s -4 -L -A "Mozilla/5.0" "\$url")
         ip=\$(echo "\$ip" | sed 's/^[ \t]*//;s/[ \t]*$//')
         if [[ "\$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
             echo "\$ip"
@@ -123,7 +120,6 @@ get_ip() {
 }
 
 CURRENT_IP=\$(get_ip)
-# 如果三次都失败，直接退出，不写入任何东西
 [[ -z "\$CURRENT_IP" ]] && exit 0
 
 if [[ -f "\$IP_CACHE" ]]; then
@@ -135,11 +131,17 @@ fi
 
 if [[ "\$CURRENT_IP" != "\$LAST_IP" ]]; then
     if grep -q "\$LAST_IP" "\$CADDY_FILE"; then
+        # 这里的替换逻辑要小心，确保只替换IP部分
         sed -i "s/\$LAST_IP/\$CURRENT_IP/g" "\$CADDY_FILE"
-        systemctl reload caddy
-        echo "\$CURRENT_IP" > "\$IP_CACHE"
         
-        MSG="🚨 *IP 变更通知* 🚨%0A%0A旧: \`\$LAST_IP\`%0A新: \`\$CURRENT_IP\`%0A%0A✅ Caddy 配置已更新。"
+        if caddy validate --config "\$CADDY_FILE" --adapter caddyfile >/dev/null 2>&1; then
+            systemctl reload caddy
+            echo "\$CURRENT_IP" > "\$IP_CACHE"
+            MSG="🚨 *IP 变更通知* 🚨%0A%0A旧: \`\$LAST_IP\`%0A新: \`\$CURRENT_IP\`%0A%0A✅ Caddy 配置已更新。"
+        else
+            MSG="⚠️ *IP 变更失败* ⚠️%0A新 IP: \`\$CURRENT_IP\`%0A原因: 配置文件校验未通过，请手动检查。"
+        fi
+        
         curl -s -X POST "https://api.telegram.org/bot\${BOT_TOKEN}/sendMessage" \
             -d chat_id="\${CHAT_ID}" -d parse_mode="Markdown" -d text="\${MSG}"
     fi
@@ -168,36 +170,20 @@ manage_cron() {
 }
 
 # ==========================================
-# 6. 配置逻辑
+# 6. 配置逻辑 (带Debug输出)
 # ==========================================
 configure_proxy() {
     local current_ip=$(get_public_ip)
     local enable_monitor=false
-    
     local dec_token=$(echo "$TG_BOT_TOKEN_B64" | base64 -d)
     local dec_chat_id=$(echo "$TG_CHAT_ID_B64" | base64 -d)
     
-    # 正则校验：确保 current_ip 是纯 IP，不是 HTML
-    local regex_check="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
-    
     echo -e "${SKYBLUE}步骤 1: 设置接入IP/域名${PLAIN}"
-    
-    if [[ "$current_ip" =~ $regex_check ]]; then
-        echo -e "本机IP: ${GREEN}[ ${current_ip} ]${PLAIN}"
-    else
-        echo -e "${RED}警告: 自动获取IP失败 (接口被拦截或无网络)${PLAIN}"
-        echo -e "请手动输入您的IP。"
-        current_ip=""
-    fi
-
+    echo -e "本机IP: ${GREEN}[ ${current_ip} ]${PLAIN}"
     read -e -p "请输入 (留空回车使用本机IP): " input_domain
     input_domain=$(echo "$input_domain" | sed 's/^[ \t]*//;s/[ \t]*$//')
 
     if [[ -z "${input_domain}" ]]; then
-        if [[ -z "${current_ip}" ]]; then
-             echo -e "${RED}错误：自动获取失败且未输入IP，无法继续！${PLAIN}"
-             exit 1
-        fi
         input_domain="${current_ip}"
         enable_monitor=true
         echo -e "已选择本机IP，${GREEN}开启监控${PLAIN}。"
@@ -208,44 +194,58 @@ configure_proxy() {
         echo -e "自定义域名/IP，${YELLOW}不开启监控${PLAIN}。"
     fi
     
+    # 这里会给纯IP加上 :80 后缀
     domain=$(process_address "$input_domain")
 
     echo -e "\n${SKYBLUE}步骤 2: 设置源站地址${PLAIN}"
     read -e -p "请输入源站 (如 8.8.8.8): " input_target
     input_target=$(echo "$input_target" | sed 's/^[ \t]*//;s/[ \t]*$//')
-    
     [[ -z "${input_target}" ]] && echo -e "${RED}错误：不能为空${PLAIN}" && exit 1
     target=$(process_address "$input_target")
 
+    # 准备文件
     if [ ! -f /etc/caddy/Caddyfile ]; then touch /etc/caddy/Caddyfile; fi
     
-    cat >> /etc/caddy/Caddyfile <<EOF
+    # 确保文件末尾有换行，避免追加到上一行
+    sed -i '$a\' /etc/caddy/Caddyfile
 
+    # 备份旧文件，方便回滚
+    cp /etc/caddy/Caddyfile /etc/caddy/Caddyfile.bak
+
+    # 写入配置
+    cat >> /etc/caddy/Caddyfile <<EOF
 ${domain} {
     reverse_proxy ${target}
     encode gzip
 }
 EOF
 
-    if [[ "$enable_monitor" == "true" ]]; then
-        echo "${current_ip}" > /root/.last_known_ip
-        manage_cron "on"
-        TG_MSG="✅ 反代部署成功(监控开启)%0AIP: ${current_ip}"
-    else
-        manage_cron "off"
-        TG_MSG="✅ 反代部署成功(静态配置)%0A域名: ${input_domain}"
-    fi
-
-    if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile &> /dev/null; then
+    # 验证环节 (打印详细错误)
+    echo -e "${YELLOW}正在验证 Caddy 配置...${PLAIN}"
+    if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile > /tmp/caddy_error.log 2>&1; then
         systemctl reload caddy
+        
+        if [[ "$enable_monitor" == "true" ]]; then
+            echo "${current_ip}" > /root/.last_known_ip
+            manage_cron "on"
+            TG_MSG="✅ 反代部署成功(监控开启)%0AIP: ${current_ip}"
+        else
+            manage_cron "off"
+            TG_MSG="✅ 反代部署成功(静态配置)%0A域名: ${input_domain}"
+        fi
+        
         echo -e "${GREEN}配置成功！${PLAIN}"
         curl -s -X POST "https://api.telegram.org/bot${dec_token}/sendMessage" \
             -d chat_id="${dec_chat_id}" -d text="${TG_MSG}" >/dev/null
     else
-        echo -e "${RED}验证失败，请检查配置！${PLAIN}"
+        echo -e "${RED}验证失败！${PLAIN}"
+        echo -e "${RED}============= Caddy 报错详情 =============${PLAIN}"
+        cat /tmp/caddy_error.log
+        echo -e "${RED}=========================================${PLAIN}"
         echo -e "自动回滚配置..."
-        head -n -4 /etc/caddy/Caddyfile > /tmp/caddyfile_tmp && mv /tmp/caddyfile_tmp /etc/caddy/Caddyfile
+        mv /etc/caddy/Caddyfile.bak /etc/caddy/Caddyfile
     fi
+    rm -f /tmp/caddy_error.log
 }
 
 # ==========================================
