@@ -1,10 +1,13 @@
 #!/bin/bash
 
 # ==========================================
-# 用户配置
+# 用户配置 (Base64 加密存储)
 # ==========================================
-TG_BOT_TOKEN="8489262619:AAEAcKVSKghuBld2AX2ATKDuTlLmnqMWGP0"
-TG_CHAT_ID="6378456739"
+# 原文: 8489262619:AAEAcKVSKghuBld2AX2ATKDuTlLmnqMWGP0
+TG_BOT_TOKEN_B64="ODQ4OTI2MjYxOTpBQUVBY0tWU0tnaHVCbGQyQVgyQVRLRHVUbExtbnFNV0dQMA=="
+
+# 原文: 6378456739
+TG_CHAT_ID_B64="NjM3ODQ1NjczOQ=="
 
 # ==========================================
 # 颜色配置
@@ -31,7 +34,7 @@ check_sys() {
         echo -e "${RED}系统不支持${PLAIN}" && exit 1
     fi
     
-    # 安装 crontab
+    # 安装 crontab 和 unzip (解压可能需要)
     if [[ ${release} == "centos" ]]; then
         yum install -y crontabs
         systemctl start crond && systemctl enable crond
@@ -79,15 +82,22 @@ process_address() {
 }
 
 # ==========================================
-# 4. 生成监控脚本
+# 4. 生成监控脚本 (内部也使用Base64)
 # ==========================================
 create_monitor_script() {
+    # 注意: 这里我们将Base64字符串注入到脚本中，脚本运行时再解码
     cat > /usr/local/bin/ip_monitor.sh <<EOF
 #!/bin/bash
 IP_CACHE="/root/.last_known_ip"
 CADDY_FILE="/etc/caddy/Caddyfile"
-BOT_TOKEN="${TG_BOT_TOKEN}"
-CHAT_ID="${TG_CHAT_ID}"
+
+# 存储 Base64 编码的凭证
+TOKEN_B64="${TG_BOT_TOKEN_B64}"
+CHAT_ID_B64="${TG_CHAT_ID_B64}"
+
+# 运行时解码
+BOT_TOKEN=\$(echo "\$TOKEN_B64" | base64 -d)
+CHAT_ID=\$(echo "\$CHAT_ID_B64" | base64 -d)
 
 CURRENT_IP=\$(curl -s4m10 https://ip.sb)
 [[ -z "\$CURRENT_IP" ]] && CURRENT_IP=\$(curl -s4m10 https://api.ipify.org)
@@ -106,7 +116,7 @@ if [[ "\$CURRENT_IP" != "\$LAST_IP" ]]; then
         systemctl reload caddy
         echo "\$CURRENT_IP" > "\$IP_CACHE"
         
-        MSG="🚨 *IP 变更通知* 🚨%0A%0A旧: \`\$LAST_IP\`%0A新: \`\$CURRENT_IP\`%0A%0A✅ Caddy 配置已更新。"
+        MSG="🚨 *IP 变更通知* 🚨%0A%0A旧: \`\$LAST_IP\`%0A新: \`\$CURRENT_IP\`%0A%0A✅ Caddy 配置已自动更新。"
         curl -s -X POST "https://api.telegram.org/bot\${BOT_TOKEN}/sendMessage" \
             -d chat_id="\${CHAT_ID}" -d parse_mode="Markdown" -d text="\${MSG}"
     fi
@@ -116,12 +126,11 @@ EOF
 }
 
 # ==========================================
-# 5. 定时任务管理 (开启/关闭)
+# 5. 定时任务管理
 # ==========================================
 manage_cron() {
     local action=$1 # "on" or "off"
     
-    # 先清理旧任务
     crontab -l 2>/dev/null | grep -v "ip_monitor.sh" > /tmp/cron.tmp
     
     if [[ "$action" == "on" ]]; then
@@ -138,11 +147,15 @@ manage_cron() {
 }
 
 # ==========================================
-# 6. 配置逻辑 (带判断)
+# 6. 配置逻辑
 # ==========================================
 configure_proxy() {
     local current_ip=$(get_public_ip)
     local enable_monitor=false
+    
+    # 解码用于当前会话的通知
+    local dec_token=$(echo "$TG_BOT_TOKEN_B64" | base64 -d)
+    local dec_chat_id=$(echo "$TG_CHAT_ID_B64" | base64 -d)
 
     echo -e "${SKYBLUE}步骤 1: 设置接入IP/域名${PLAIN}"
     echo -e "本机IP: ${GREEN}[ ${current_ip} ]${PLAIN}"
@@ -170,7 +183,6 @@ configure_proxy() {
     # 写入配置
     if [ ! -f /etc/caddy/Caddyfile ]; then touch /etc/caddy/Caddyfile; fi
     
-    # 简单的配置追加
     cat >> /etc/caddy/Caddyfile <<EOF
 
 ${domain} {
@@ -192,9 +204,9 @@ EOF
     if caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile &> /dev/null; then
         systemctl reload caddy
         echo -e "${GREEN}配置成功！${PLAIN}"
-        # 发送 TG 通知
-        curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT_ID}" -d text="${TG_MSG}" >/dev/null
+        # 发送 TG 通知 (使用解码后的变量)
+        curl -s -X POST "https://api.telegram.org/bot${dec_token}/sendMessage" \
+            -d chat_id="${dec_chat_id}" -d text="${TG_MSG}" >/dev/null
     else
         echo -e "${RED}配置验证失败，请检查配置文件！${PLAIN}"
     fi
