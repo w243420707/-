@@ -311,7 +311,7 @@ send_telegram() {
     curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
         -d chat_id="$TG_CHAT_ID" \
         -d text="$message" \
-        -d parse_mode="Markdown" > /dev/null
+        -d parse_mode="HTML" > /dev/null
   fi
 }
 
@@ -413,7 +413,7 @@ else
         log_error "Cloudflare API 响应内容: $ZONE_RESPONSE"
         log_error "请根据上方响应内容检查原因 (如 6003=Headers无效, 9103=未知错误等)"
         log_error "常见原因: 1. 使用了 API Token 而不是 Global Key; 2. 邮箱与 Key 不匹配; 3. 域名未在账号下激活"
-        send_telegram "Cloudflare DDNS 配置失败！无法获取 Zone ID。响应: \`$ZONE_RESPONSE\`"
+        send_telegram "Cloudflare DDNS 配置失败！无法获取 Zone ID。响应: <pre>$ZONE_RESPONSE</pre>"
         exit 1
     fi
 
@@ -462,15 +462,15 @@ fi
 if [ "$RESPONSE" != "${RESPONSE%success*}" ] && [ "$(echo $RESPONSE | grep "\"success\":true")" != "" ]; then
   log_success "更新成功！"
   send_telegram "Cloudflare DDNS 更新成功！
-域名: \`$CFRECORD_NAME\`
-新IP: \`$WAN_IP\`"
+域名: <pre>$CFRECORD_NAME</pre>
+新IP: <pre>$WAN_IP</pre>"
   echo $WAN_IP > $WAN_IP_FILE
   exit
 else
   log_error '出错了 :('
   log_error "响应内容: $RESPONSE"
   send_telegram "Cloudflare DDNS 更新失败！
-域名: \`$CFRECORD_NAME\`
-错误信息: \`$RESPONSE\`"
+域名: <pre>$CFRECORD_NAME</pre>
+错误信息: <pre>$RESPONSE</pre>"
   exit 1
 fi
