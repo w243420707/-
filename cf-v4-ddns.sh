@@ -391,8 +391,18 @@ if [ -f $ID_FILE ] && [ $(wc -l $ID_FILE | cut -d " " -f 1) == 4 ] \
     CFRECORD_ID=$(sed -n '2p' "$ID_FILE")
 else
     log_info "正在更新 zone_identifier 和 record_identifier"
-    CFZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$CFZONE_NAME" -H "X-Auth-Email: $CFUSER" -H "X-Auth-Key: $CFKEY" -H "Content-Type: application/json" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
-    CFRECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CFZONE_ID/dns_records?name=$CFRECORD_NAME" -H "X-Auth-Email: $CFUSER" -H "X-Auth-Key: $CFKEY" -H "Content-Type: application/json" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)
+    # Use || true to prevent script from exiting if grep finds nothing (which happens if record doesn't exist)
+    CFZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$CFZONE_NAME" -H "X-Auth-Email: $CFUSER" -H "X-Auth-Key: $CFKEY" -H "Content-Type: application/json" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
+    CFRECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CFZONE_ID/dns_records?name=$CFRECORD_NAME" -H "X-Auth-Email: $CFUSER" -H "X-Auth-Key: $CFKEY" -H "Content-Type: application/json" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
+    
+    if [ -z "$CFZONE_ID" ]; then
+        log_error "获取 Zone ID 失败！请检查您的 API Key、邮箱和主域名是否正确。"
+        log_error "API Key: ${CFKEY:0:6}..."
+        log_error "Email: $CFUSER"
+        log_error "Zone: $CFZONE_NAME"
+        exit 1
+    fi
+
     echo "$CFZONE_ID" > $ID_FILE
     echo "$CFRECORD_ID" >> $ID_FILE
     echo "$CFZONE_NAME" >> $ID_FILE
@@ -402,11 +412,21 @@ fi
 # If WAN is changed, update cloudflare
 log_info "正在更新 DNS 到 $WAN_IP"
 
-RESPONSE=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$CFZONE_ID/dns_records/$CFRECORD_ID" \
-  -H "X-Auth-Email: $CFUSER" \
-  -H "X-Auth-Key: $CFKEY" \
-  -H "Content-Type: application/json" \
-  --data "{\"id\":\"$CFZONE_ID\",\"type\":\"$CFRECORD_TYPE\",\"name\":\"$CFRECORD_NAME\",\"content\":\"$WAN_IP\", \"ttl\":$CFTTL}")
+if [ -z "$CFRECORD_ID" ]; then
+    log_info "Cloudflare 上不存在该记录，正在尝试创建新记录..."
+    RESPONSE=$(curl -s -X POST "https://api.cloudflare.com/client/v4/zones/$CFZONE_ID/dns_records" \
+      -H "X-Auth-Email: $CFUSER" \
+      -H "X-Auth-Key: $CFKEY" \
+      -H "Content-Type: application/json" \
+      --data "{\"type\":\"$CFRECORD_TYPE\",\"name\":\"$CFRECORD_NAME\",\"content\":\"$WAN_IP\", \"ttl\":$CFTTL, \"proxied\":false}")
+else
+    log_info "记录已存在 (ID: $CFRECORD_ID)，正在更新..."
+    RESPONSE=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/zones/$CFZONE_ID/dns_records/$CFRECORD_ID" \
+      -H "X-Auth-Email: $CFUSER" \
+      -H "X-Auth-Key: $CFKEY" \
+      -H "Content-Type: application/json" \
+      --data "{\"id\":\"$CFZONE_ID\",\"type\":\"$CFRECORD_TYPE\",\"name\":\"$CFRECORD_NAME\",\"content\":\"$WAN_IP\", \"ttl\":$CFTTL, \"proxied\":false}")
+fi
 
 if [ "$RESPONSE" != "${RESPONSE%success*}" ] && [ "$(echo $RESPONSE | grep "\"success\":true")" != "" ]; then
   log_success "更新成功！"
