@@ -391,19 +391,32 @@ if [ -f $ID_FILE ] && [ $(wc -l $ID_FILE | cut -d " " -f 1) == 4 ] \
     CFRECORD_ID=$(sed -n '2p' "$ID_FILE")
 else
     log_info "正在更新 zone_identifier 和 record_identifier"
-    # Use || true to prevent script from exiting if grep finds nothing (which happens if record doesn't exist)
-    CFZONE_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$CFZONE_NAME" -H "X-Auth-Email: $CFUSER" -H "X-Auth-Key: $CFKEY" -H "Content-Type: application/json" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
+    
+    # Debug: Capture full response to diagnose issues
+    ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$CFZONE_NAME" \
+        -H "X-Auth-Email: $CFUSER" \
+        -H "X-Auth-Key: $CFKEY" \
+        -H "Content-Type: application/json")
+    
+    # Extract Zone ID
+    CFZONE_ID=$(echo "$ZONE_RESPONSE" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
     
     if [ -z "$CFZONE_ID" ]; then
-        log_error "获取 Zone ID 失败！请检查您的 API Key、邮箱和主域名是否正确。"
-        log_error "API Key: ${CFKEY:0:6}..."
-        log_error "Email: $CFUSER"
-        log_error "Zone: $CFZONE_NAME"
-        send_telegram "Cloudflare DDNS 配置失败！无法获取 Zone ID。请检查配置。"
+        log_error "获取 Zone ID 失败！"
+        log_error "Cloudflare API 响应内容: $ZONE_RESPONSE"
+        log_error "请根据上方响应内容检查原因 (如 6003=Headers无效, 9103=未知错误等)"
+        log_error "常见原因: 1. 使用了 API Token 而不是 Global Key; 2. 邮箱与 Key 不匹配; 3. 域名未在账号下激活"
+        send_telegram "Cloudflare DDNS 配置失败！无法获取 Zone ID。响应: $ZONE_RESPONSE"
         exit 1
     fi
 
-    CFRECORD_ID=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CFZONE_ID/dns_records?name=$CFRECORD_NAME" -H "X-Auth-Email: $CFUSER" -H "X-Auth-Key: $CFKEY" -H "Content-Type: application/json" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
+    # Get Record ID
+    RECORD_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CFZONE_ID/dns_records?name=$CFRECORD_NAME" \
+        -H "X-Auth-Email: $CFUSER" \
+        -H "X-Auth-Key: $CFKEY" \
+        -H "Content-Type: application/json")
+    
+    CFRECORD_ID=$(echo "$RECORD_RESPONSE" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
 
     echo "$CFZONE_ID" > $ID_FILE
     echo "$CFRECORD_ID" >> $ID_FILE
