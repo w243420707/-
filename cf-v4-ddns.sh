@@ -193,6 +193,16 @@ if [ "${1:-}" = "install" ]; then
         log_info "Telegram Chat ID 已提供: $TG_CHAT_ID"
     fi
 
+    # Cleanup Old Config/Cache
+    log_info "正在清理旧配置和缓存..."
+    # Remove cache files for the specific host being configured
+    rm -f "$HOME/.cf-id_$CFRECORD_NAME.txt"
+    rm -f "$HOME/.cf-wan_ip_$CFRECORD_NAME.txt"
+    # Remove old log file if exists
+    rm -f "$LOG_FILE"
+    # Remove old script if exists
+    rm -f "$TARGET_PATH"
+
     # Install Script
     echo ""
     log_info "正在安装脚本到 $TARGET_PATH..."
@@ -219,9 +229,12 @@ if [ "${1:-}" = "install" ]; then
     JOB="*/1 * * * * $CRON_CMD"
 
     # Remove existing job for this script to prevent duplicates
+    log_info "正在清理 Crontab 中旧的本脚本任务 (保留其他任务)..."
     TMP_CRON=$(mktemp)
     crontab -l 2>/dev/null > "$TMP_CRON" || true
-    grep -v "$TARGET_PATH" "$TMP_CRON" > "$TMP_CRON.new" || true
+    # Use grep -F -v to match fixed string (not regex) and invert match
+    # This ensures we only remove lines containing the exact script path
+    grep -F -v "$TARGET_PATH" "$TMP_CRON" > "$TMP_CRON.new" || true
     mv "$TMP_CRON.new" "$TMP_CRON"
 
     # Add new job
