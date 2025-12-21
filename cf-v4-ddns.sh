@@ -192,7 +192,11 @@ if [ "${1:-}" = "install" ]; then
     elif [[ -n "$TG_CHAT_ID" ]]; then
         log_info "Telegram Chat ID 已提供: $TG_CHAT_ID"
     fi
-
+    # Normalize CFRECORD_NAME to FQDN if needed (ensure we clean the right cache file)
+    if [[ "$CFRECORD_NAME" != "$CFZONE_NAME" ]] && [[ "${CFRECORD_NAME##*$CFZONE_NAME}" != "" ]]; then
+        CFRECORD_NAME="$CFRECORD_NAME.$CFZONE_NAME"
+        log_warn "主机名自动修正为 FQDN: $CFRECORD_NAME"
+    fi
     # Cleanup Old Config/Cache
     log_info "正在清理旧配置和缓存..."
     # Remove cache files for the specific host being configured
@@ -387,7 +391,9 @@ fi
 ID_FILE=$HOME/.cf-id_$CFRECORD_NAME.txt
 if [ -f $ID_FILE ] && [ $(wc -l $ID_FILE | cut -d " " -f 1) == 4 ] \
   && [ "$(sed -n '3p' "$ID_FILE")" == "$CFZONE_NAME" ] \
-  && [ "$(sed -n '4p' "$ID_FILE")" == "$CFRECORD_NAME" ]; then
+  && [ "$(sed -n '4p' "$ID_FILE")" == "$CFRECORD_NAME" ] \
+  && [ -n "$(sed -n '1p' "$ID_FILE")" ] \
+  && [ -n "$(sed -n '2p' "$ID_FILE")" ]; then
     CFZONE_ID=$(sed -n '1p' "$ID_FILE")
     CFRECORD_ID=$(sed -n '2p' "$ID_FILE")
 else
