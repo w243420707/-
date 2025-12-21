@@ -306,7 +306,8 @@ send_telegram() {
   if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
     curl -s -X POST "https://api.telegram.org/bot$TG_BOT_TOKEN/sendMessage" \
         -d chat_id="$TG_CHAT_ID" \
-        -d text="$message" > /dev/null
+        -d text="$message" \
+        -d parse_mode="Markdown" > /dev/null
   fi
 }
 
@@ -406,17 +407,26 @@ else
         log_error "Cloudflare API 响应内容: $ZONE_RESPONSE"
         log_error "请根据上方响应内容检查原因 (如 6003=Headers无效, 9103=未知错误等)"
         log_error "常见原因: 1. 使用了 API Token 而不是 Global Key; 2. 邮箱与 Key 不匹配; 3. 域名未在账号下激活"
-        send_telegram "Cloudflare DDNS 配置失败！无法获取 Zone ID。响应: $ZONE_RESPONSE"
+        send_telegram "Cloudflare DDNS 配置失败！无法获取 Zone ID。响应: \`$ZONE_RESPONSE\`"
         exit 1
     fi
 
     # Get Record ID
-    RECORD_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CFZONE_ID/dns_records?name=$CFRECORD_NAME" \
+    # 增加 &type=$CFRECORD_TYPE 以精确匹配记录类型
+    RECORD_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CFZONE_ID/dns_records?name=$CFRECORD_NAME&type=$CFRECORD_TYPE" \
         -H "X-Auth-Email: $CFUSER" \
         -H "X-Auth-Key: $CFKEY" \
         -H "Content-Type: application/json")
     
     CFRECORD_ID=$(echo "$RECORD_RESPONSE" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
+
+    if [ -z "$CFRECORD_ID" ]; then
+        log_warn "未找到现有的 $CFRECORD_TYPE 记录，准备创建新记录。"
+        log_warn "查询域名: $CFRECORD_NAME"
+        log_warn "API 响应: $RECORD_RESPONSE"
+    else
+        log_info "找到现有记录 ID: $CFRECORD_ID"
+    fi
 
     echo "$CFZONE_ID" > $ID_FILE
     echo "$CFRECORD_ID" >> $ID_FILE
@@ -446,15 +456,15 @@ fi
 if [ "$RESPONSE" != "${RESPONSE%success*}" ] && [ "$(echo $RESPONSE | grep "\"success\":true")" != "" ]; then
   log_success "更新成功！"
   send_telegram "Cloudflare DDNS 更新成功！
-域名: $CFRECORD_NAME
-新IP: $WAN_IP"
+域名: \`$CFRECORD_NAME\`
+新IP: \`$WAN_IP\`"
   echo $WAN_IP > $WAN_IP_FILE
   exit
 else
   log_error '出错了 :('
   log_error "响应内容: $RESPONSE"
   send_telegram "Cloudflare DDNS 更新失败！
-域名: $CFRECORD_NAME
-错误信息: $RESPONSE"
+域名: \`$CFRECORD_NAME\`
+错误信息: \`$RESPONSE\`"
   exit 1
 fi
