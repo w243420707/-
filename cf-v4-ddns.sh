@@ -70,7 +70,7 @@ if [ "${1:-}" = "install" ]; then
 
     clear
     echo -e "${CYAN}============================================================${NC}"
-    echo -e "${CYAN}       Cloudflare DDNS 一键安装脚本                         ${NC}"
+    echo -e "${CYAN}       Cloudflare DDNS 一键安装脚本 (v2.1)                  ${NC}"
     echo -e "${CYAN}============================================================${NC}"
     echo ""
 
