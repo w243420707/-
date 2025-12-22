@@ -1,99 +1,133 @@
 #!/bin/bash
-echo "=== 一键安全清理系统日志、缓存并添加定时任务 ==="
+# =========================================================
+# 脚本名称: Pro System Cleaner (Silent Edition)
+# 版本: v4.0 (No Logs)
+# =========================================================
 
-# 检查 root 权限
+# --- 🎨 样式定义 ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+SKYBLUE='\033[0;36m'
+BLUE='\033[0;34m'
+PLAIN='\033[0m'
+BOLD='\033[1m'
+
+CLEAN_SCRIPT_PATH="/usr/local/bin/safe-system-cleanup.sh"
+
+# --- 📝 辅助打印函数 ---
+function print_banner() {
+    clear
+    echo -e "${BLUE}============================================================${PLAIN}"
+    echo -e "${SKYBLUE}      🤫 Linux 系统静默清理工具 (Silent Mode)      ${PLAIN}"
+    echo -e "${BLUE}============================================================${PLAIN}"
+}
+function msg_process() { echo -e "${YELLOW} [....] ${PLAIN} $1..."; }
+function msg_success() { echo -e "${GREEN} [DONE] ${PLAIN} $1"; }
+function msg_error() { echo -e "${RED} [ERR!] ${PLAIN} $1"; }
+
 if [ "$EUID" -ne 0 ]; then
-    echo "请使用 sudo 运行此脚本: sudo bash $0"
+    msg_error "请使用 sudo 运行此脚本"
     exit 1
 fi
 
-# 1️⃣ 安全清理系统日志（使用 truncate 保持文件存在）
-echo "清理系统日志..."
-truncate -s 0 /var/log/syslog
-truncate -s 0 /var/log/kern.log
-[ -f /var/log/messages ] && truncate -s 0 /var/log/messages
+# ====================
+# 🔴 卸载功能
+# ====================
+function uninstall_all() {
+    print_banner
+    echo -e "${RED}${BOLD}🚨 正在执行卸载...${PLAIN}\n"
 
-# 2️⃣ 安全清理旧日志和 journal
-echo "清理旧日志文件和 journal..."
-# 只删除压缩的旧日志文件，保留当前日志
-find /var/log -name "syslog.*" -name "kern.log.*" -type f -mtime +7 -delete 2>/dev/null
-# 安全清理 journal，保留3天日志
-journalctl --vacuum-time=3d
+    # 从 crontab 移除
+    crontab -l 2>/dev/null | grep -v "safe-system-cleanup.sh" | crontab -
+    msg_success "定时任务已移除"
 
-# 3️⃣ 配置 systemd journal 限制
-echo "配置 systemd journal 限制..."
-if ! grep -q "^SystemMaxUse=" /etc/systemd/journald.conf; then
-    echo "SystemMaxUse=200M" >> /etc/systemd/journald.conf
-else
-    sed -i 's/^SystemMaxUse=.*/SystemMaxUse=200M/' /etc/systemd/journald.conf
-fi
+    # 删除脚本
+    rm -f "$CLEAN_SCRIPT_PATH"
+    msg_success "脚本文件已删除"
 
-# 重启 journal 服务（仅在配置变更时）
-if systemctl is-active systemd-journald >/dev/null 2>&1; then
-    systemctl restart systemd-journald
-    echo "journald 服务已重启"
-fi
+    # 恢复配置
+    if grep -q "^SystemMaxUse=200M" /etc/systemd/journald.conf; then
+        sed -i '/^SystemMaxUse=200M/d' /etc/systemd/journald.conf
+        systemctl restart systemd-journald
+        msg_success "已移除 journald 限制"
+    fi
 
-# 4️⃣ 清理 apt 缓存
-echo "清理 apt 缓存..."
-apt clean 2>/dev/null  echo "apt clean 失败（可能未安装）"
+    echo -e "\n${GREEN}✅ 卸载完成。${PLAIN}\n"
+}
 
-# 5️⃣ 安全清理临时文件（只清理7天前的文件）
-echo "清理临时文件..."
-find /var/tmp -type f -atime +7 -delete 2>/dev/null
-find /tmp -type f -atime +7 -delete 2>/dev/null
+# ====================
+# 🟢 安装与清理功能
+# ====================
+function install_and_clean() {
+    print_banner
+    echo -e "${BOLD}🛠️  开始部署...${PLAIN}\n"
 
-# 6️⃣ 输出清理结果
-echo "=== 清理完成 ==="
-echo "当前磁盘占用："
-df -h | grep -E '(/dev/vda1|/dev/sda1|/$)' | head -1
-echo ""
-echo "相关目录大小："
-du -sh /var/log /var/cache /var/tmp /tmp 2>/dev/null
+    # 1️⃣ 立即执行一次清理
+    msg_process "执行首次清理"
+    truncate -s 0 /var/log/syslog 2>/dev/null
+    truncate -s 0 /var/log/kern.log 2>/dev/null
+    [ -f /var/log/messages ] && truncate -s 0 /var/log/messages
+    find /var/log -name "syslog.*" -name "kern.log.*" -type f -mtime +7 -delete 2>/dev/null
+    journalctl --vacuum-time=3d >/dev/null 2>&1
+    command -v apt >/dev/null && apt clean 2>/dev/null
+    command -v yum >/dev/null && yum clean all 2>/dev/null
+    find /var/tmp -type f -atime +7 -delete 2>/dev/null
+    find /tmp -type f -atime +7 -delete 2>/dev/null
+    msg_success "清理完成"
 
-# 7️⃣ 创建安全的清理脚本
-CLEAN_SCRIPT="/usr/local/bin/safe-system-cleanup.sh"
-cat > $CLEAN_SCRIPT << 'EOF'
+    # 2️⃣ Systemd 优化
+    msg_process "优化日志配置"
+    if ! grep -q "SystemMaxUse=" /etc/systemd/journald.conf; then
+        echo "SystemMaxUse=200M" >> /etc/systemd/journald.conf
+        systemctl restart systemd-journald
+        msg_success "Journal 限制已添加"
+    else
+        echo -e "${BLUE} [INFO] ${PLAIN} 配置已存在，跳过"
+    fi
+
+    # 3️⃣ 生成自动化脚本 (脚本内部也添加静默处理)
+    msg_process "生成静默执行脚本"
+    cat > $CLEAN_SCRIPT_PATH << 'EOF'
 #!/bin/bash
-# 安全系统清理脚本
+# Auto-generated Silent Cleaner
 [ "$EUID" -ne 0 ] && exit 1
-
-# 清理日志
-truncate -s 0 /var/log/syslog
-truncate -s 0 /var/log/kern.log
-[ -f /var/log/messages ] && truncate -s 0 /var/log/messages
-
-# 清理旧日志文件（7天前）
+# 所有命令重定向错误输出到 /dev/null
+truncate -s 0 /var/log/syslog 2>/dev/null
+truncate -s 0 /var/log/kern.log 2>/dev/null
+[ -f /var/log/messages ] && truncate -s 0 /var/log/messages 2>/dev/null
 find /var/log -name "syslog.*" -name "kern.log.*" -type f -mtime +7 -delete 2>/dev/null
-
-# 清理 journal（保留3天）
-journalctl --vacuum-time=3d 2>/dev/null
-
-# 清理包缓存
-command -v apt >/dev/null && apt clean
-command -v yum >/dev/null && yum clean all
-
-# 清理临时文件（7天前）
+journalctl --vacuum-time=3d >/dev/null 2>&1
+command -v apt >/dev/null && apt clean >/dev/null 2>&1
+command -v yum >/dev/null && yum clean all >/dev/null 2>&1
 find /var/tmp -type f -atime +7 -delete 2>/dev/null
 find /tmp -type f -atime +7 -delete 2>/dev/null
 EOF
+    chmod +x $CLEAN_SCRIPT_PATH
+    msg_success "脚本生成完毕"
 
-chmod +x $CLEAN_SCRIPT
+    # 4️⃣ 配置 Crontab (关键修改点)
+    msg_process "添加静默定时任务"
+    
+    # 重点： >/dev/null 2>&1  这里确保了 Crontab 运行时不会发邮件，不会写日志
+    JOB_CMD="0 * * * * $CLEAN_SCRIPT_PATH >/dev/null 2>&1"
+    
+    (crontab -l 2>/dev/null | grep -v "safe-system-cleanup.sh"; echo "$JOB_CMD") | crontab -
+    
+    msg_success "任务已添加 (静默模式)"
 
-# 8️⃣ 添加安全的定时任务
-CRON_JOB="0 * * * * root $CLEAN_SCRIPT"
-if ! grep -q "$CLEAN_SCRIPT" /etc/crontab 2>/dev/null; then
-    echo "$CRON_JOB" >> /etc/crontab
-    echo "定时任务已添加到 /etc/crontab"
-else
-    echo "定时任务已存在"
-fi
+    echo -e "\n${GREEN}✅ 部署完成！${PLAIN}"
+    echo -e " 验证命令: ${YELLOW}sudo crontab -l${PLAIN}"
+}
 
-# 重启 cron 服务
-systemctl restart cron 2>/dev/null  systemctl restart crond 2>/dev/null
-
-echo "=== 部署完成 ==="
-echo "安全清理脚本: $CLEAN_SCRIPT"
-echo "定时任务: 每小时自动运行"
-echo "手动运行: sudo $CLEAN_SCRIPT"
-
+# ====================
+# 🚀 主入口
+# ====================
+case "$1" in
+    uninstall|remove)
+        uninstall_all
+        ;;
+    *)
+        install_and_clean
+        ;;
+esac
