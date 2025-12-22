@@ -81,7 +81,7 @@ EOF
 chmod +x $CLEAN_SCRIPT
 
 # 8️⃣ 添加安全的定时任务
-CRON_JOB="0 3 * * * root $CLEAN_SCRIPT"
+CRON_JOB="0 * * * * root $CLEAN_SCRIPT"
 if ! grep -q "$CLEAN_SCRIPT" /etc/crontab 2>/dev/null; then
     echo "$CRON_JOB" >> /etc/crontab
     echo "定时任务已添加到 /etc/crontab"
