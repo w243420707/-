@@ -94,6 +94,6 @@ systemctl restart cron 2>/dev/null  systemctl restart crond 2>/dev/null
 
 echo "=== 部署完成 ==="
 echo "安全清理脚本: $CLEAN_SCRIPT"
-echo "定时任务: 每天凌晨3点自动运行"
+echo "定时任务: 每小时自动运行"
 echo "手动运行: sudo $CLEAN_SCRIPT"
 
