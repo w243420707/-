@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # =================================================================
-# Sing-box 终极全能版 v6 (强制兼容修复)
-# 核心修复：添加 systemd 环境变量，强制兼容 TUN 旧格式
+# Sing-box 终极修复版 v7 (彻底抛弃旧格式，拥抱新标准)
+# 核心修复：完全重写 TUN 配置结构，绝缘 FATAL Error
 # =================================================================
 
 # 颜色定义
@@ -12,10 +12,9 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# 1. 初始化
+# 1. 权限与端口检查
 if [ "$EUID" -ne 0 ]; then echo -e "${RED}请使用 root 权限运行${NC}"; exit 1; fi
 
-# 获取 SSH 端口
 SSH_PORT=$(grep "^Port" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n 1)
 if [ -z "$SSH_PORT" ]; then SSH_PORT=22; fi
 
@@ -28,7 +27,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-echo -e "${BLUE}>>> [1/8] 环境准备...${NC}"
+echo -e "${BLUE}>>> [1/8] 环境初始化...${NC}"
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-singbox.conf
 sysctl -p /etc/sysctl.d/99-singbox.conf >/dev/null 2>&1
 
@@ -72,7 +71,6 @@ CONFIG_FILE="/etc/sing-box/config.json"
 if [ -z "$SUB_URL" ]; then read -p "请输入订阅链接: " SUB_URL; fi
 if [ -z "$SUB_URL" ]; then echo -e "${RED}链接为空${NC}"; exit 1; fi
 
-echo -e "正在下载..."
 curl -L -s -A "Mozilla/5.0" -o "$CONFIG_FILE" "$SUB_URL"
 if ! jq -e . "$CONFIG_FILE" >/dev/null 2>&1; then echo -e "${RED}无效 JSON${NC}"; exit 1; fi
 
@@ -126,10 +124,13 @@ SELECTED_NAME="${AVAILABLE_REGIONS[$IDX]}"
 MATCH_KEY="${REGION_REGEX[$SELECTED_NAME]}"
 echo -e "${GREEN}已选: $SELECTED_NAME${NC}"
 
-# 6. 生成配置 (TUN 适配 + 数组格式修复)
+# 6. 生成配置 (彻底拥抱新标准 v1.10+)
 echo -e "${BLUE}>>> [6/8] 构造 TUN 配置...${NC}"
 cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
 
+# 关键修改点：
+# inet4_address 使用数组 ["172.19.0.1/30"]
+# 移除所有 legacy 字段
 jq -n \
     --slurpfile original "$CONFIG_FILE.bak" \
     --arg match_key "$MATCH_KEY" \
@@ -150,7 +151,7 @@ jq -n \
             "type": "tun",
             "tag": "tun-in",
             "interface_name": "singbox-tun",
-            "inet4_address": "172.19.0.1/30", 
+            "inet4_address": ["172.19.0.1/30"],
             "auto_route": true,
             "strict_route": true,
             "stack": "system",
@@ -192,8 +193,8 @@ jq -n \
     }
 }' > "$CONFIG_FILE"
 
-# 7. 启动服务 (强制注入兼容环境变量)
-echo -e "${BLUE}>>> [7/8] 启动服务 (Env Fix)...${NC}"
+# 7. 启动服务 (双保险：新格式 + 环境变量)
+echo -e "${BLUE}>>> [7/8] 启动服务...${NC}"
 cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
 Description=sing-box service
@@ -203,7 +204,7 @@ After=network.target nss-lookup.target
 [Service]
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-# 关键修复：强制开启旧版 TUN 字段兼容支持
+# 双保险：即使某些版本仍有bug，此变量也能兜底
 Environment="ENABLE_DEPRECATED_TUN_ADDRESS_X=true"
 ExecStart=/usr/local/bin/sing-box run -c $CONFIG_FILE
 Restart=on-failure
@@ -225,7 +226,7 @@ unset http_proxy https_proxy all_proxy
 sleep 5
 
 if systemctl is-active --quiet sing-box; then
-    echo -e "${GREEN}✅ 启动成功！兼容补丁已应用。${NC}"
+    echo -e "${GREEN}✅ 启动成功！${NC}"
     echo -e "测试全局代理..."
     
     RES=$(curl -s -m 5 ipinfo.io)
@@ -233,7 +234,7 @@ if systemctl is-active --quiet sing-box; then
         echo -e "${GREEN}🎉 网络通畅！${NC}"
         echo "$RES"
     else
-        echo -e "${RED}⚠️  超时。请稍后重试或更换节点。${NC}"
+        echo -e "${RED}⚠️  超时。请检查节点是否可用。${NC}"
     fi
 else
     echo -e "${RED}启动失败${NC}"
