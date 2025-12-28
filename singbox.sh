@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # =========================================================
-# Sing-box 全局接管流量 (TUN模式)
-# 特性：智能分组 + 强制SSH直连(防失联)
+# Sing-box 全局接管流量 (TUN模式) - 修复版
+# 修复内容：补全 Python 脚本 try/except 语法闭合
 # =========================================================
 
 RED='\033[0;31m'
@@ -36,14 +36,13 @@ if [ -z "$SUB_URL" ]; then
     exit 1
 fi
 
-# --- 1. 核心：开启 IP 转发 (全局代理必须) ---
+# --- 1. 开启 IP 转发 ---
 echo -e "${YELLOW}[1/5] 开启内核流量转发...${PLAIN}"
 echo 'net.ipv4.ip_forward=1' > /etc/sysctl.d/99-singbox.conf
 sysctl --system > /dev/null 2>&1
 
-# --- 2. 核心：处理配置文件 (Python 生成 TUN 配置) ---
-echo -e "${YELLOW}[2/5] 下载订阅并生成全局配置...${PLAIN}"
-# 确保安装 python3
+# --- 2. 准备环境 ---
+echo -e "${YELLOW}[2/5] 检查依赖环境...${PLAIN}"
 if [ -f /etc/debian_version ]; then
     apt-get update -y && apt-get install -y python3 curl wget
 elif [ -f /etc/redhat-release ]; then
@@ -52,6 +51,8 @@ elif [ -f /etc/alpine-release ]; then
     apk add python3 curl wget
 fi
 
+# --- 3. 生成配置 (修复 Python 语法) ---
+echo -e "${YELLOW}[3/5] 下载订阅并生成全局配置...${PLAIN}"
 TEMP_JSON="/tmp/singbox_sub.json"
 wget -O "$TEMP_JSON" "$SUB_URL"
 
@@ -72,6 +73,7 @@ def get_group_name(tag):
     if re.search(r'🇺🇸|US|USA|AMERICA|美国', tag): return "🇺🇸 美国节点"
     if re.search(r'🇸🇬|SG|SINGAPORE|新加坡', tag): return "🇸🇬 新加坡节点"
     if re.search(r'🇹🇼|TW|TAIWAN|台湾', tag): return "🇹🇼 台湾节点"
+    if re.search(r'🇰🇷|KR|KOREA|韩国', tag): return "🇰🇷 韩国节点"
     return "🏳️ 其他节点"
 
 try:
@@ -134,10 +136,9 @@ try:
     new_outbounds.append({"type": "dns", "tag": "dns-out"})
     new_outbounds.append({"type": "block", "tag": "block"})
 
-    # --- 最终配置 (全局流量接管关键部分) ---
+    # --- 最终配置 ---
     final_config = {
         "log": {"level": "info", "timestamp": True},
-        # 1. DNS 劫持 (必须，否则无法解析)
         "dns": {
             "servers": [
                 {"tag": "remote_dns", "address": "8.8.8.8", "detour": "PROXY"},
@@ -149,7 +150,6 @@ try:
             "final": "remote_dns",
             "strategy": "ipv4_only"
         },
-        # 2. TUN 网卡 (劫持所有流量)
         "inbounds": [
             {
                 "type": "tun",
@@ -157,7 +157,7 @@ try:
                 "interface_name": "tun0",
                 "inet4_address": "172.19.0.1/30",
                 "auto_route": True,
-                "strict_route": False, # 关闭严格路由以避免回环问题
+                "strict_route": False,
                 "stack": "system",
                 "sniff": True
             },
@@ -180,7 +180,7 @@ try:
         "route": {
             "rules": [
                 {"protocol": "dns", "outbound": "dns-out"},
-                # --- 核心保护：SSH 流量强制直连，不走代理 ---
+                # 核心：SSH 直连保护
                 {"port": 22, "outbound": "DIRECT"},
                 {"protocol": "ssh", "outbound": "DIRECT"},
                 
@@ -194,16 +194,22 @@ try:
 
     with open(target_file, 'w', encoding='utf-8') as f:
         json.dump(final_config, f, indent=2, ensure_ascii=False)
+    
+    print("Config generated successfully.")
+
+except Exception as e:
+    print(f"Python script error: {e}")
+    sys.exit(1)
 EOF
 
 python3 /tmp/gen_tun_config.py
 if [ $? -ne 0 ]; then
-    echo -e "${RED}配置生成失败！请检查订阅。${PLAIN}"
+    echo -e "${RED}配置生成失败！请检查上方报错信息。${PLAIN}"
     exit 1
 fi
 
-# --- 3. 授权 ---
-# 给 sing-box 开通网络权限，防止 permission denied
+# --- 4. 授权与重启 ---
+echo -e "${YELLOW}[4/5] 配置服务权限并重启...${PLAIN}"
 mkdir -p /etc/systemd/system/sing-box.service.d/
 cat > /etc/systemd/system/sing-box.service.d/override.conf <<EOF
 [Service]
@@ -212,20 +218,21 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 EOF
 systemctl daemon-reload
-
-# --- 4. 重启 ---
-echo -e "${YELLOW}[4/5] 重启 Sing-box...${PLAIN}"
+systemctl enable sing-box > /dev/null 2>&1
 systemctl restart sing-box
 
 # --- 5. 验证 ---
-echo -e "${YELLOW}[5/5] 验证连接...${PLAIN}"
-sleep 2
-IP=$(curl -s4 --max-time 3 ifconfig.me)
+echo -e "${YELLOW}[5/5] 验证代理状态 (等待3秒)...${PLAIN}"
+sleep 3
+IP=$(curl -s4 --max-time 5 ifconfig.me)
 
-echo -e "\n${GREEN}=============================================${PLAIN}"
-echo -e "${GREEN}      全局代理 (TUN) 已激活！      ${PLAIN}"
-echo -e "${GREEN}=============================================${PLAIN}"
-echo -e "WebUI: http://$(curl -s4 ifconfig.me):$UI_PORT/ui/"
-echo -e "当前 IP: $IP (如果是机场IP则成功)"
-echo -e "SSH 保护: 已排除 22 端口，SSH 连接不受影响。"
-echo -e "${GREEN}=============================================${PLAIN}"
+if [ -z "$IP" ]; then
+    echo -e "${RED}无法获取IP，网络可能在重启中，请稍后手动测试 'curl ip.sb'${PLAIN}"
+else
+    echo -e "\n${GREEN}=============================================${PLAIN}"
+    echo -e "${GREEN}      全局代理 (TUN) 已激活！      ${PLAIN}"
+    echo -e "${GREEN}=============================================${PLAIN}"
+    echo -e "WebUI: http://你的IP:$UI_PORT/ui/"
+    echo -e "当前出口 IP: $IP"
+    echo -e "${GREEN}=============================================${PLAIN}"
+fi
