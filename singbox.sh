@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # =================================================================
-# Sing-box 终极兼容版 v17 (支持 Hy2 端口段 + 修复全部报错)
-# 核心改动：升级 v1.11.4 + 注入兼容性环境变量
+# Sing-box 外科手术版 v18 (智能过滤坏节点 + 完美支持 Hy2)
+# 核心修复: 自动剔除 "anytls" 等不支持的协议类型
 # =================================================================
 
 # 颜色
@@ -15,9 +15,9 @@ NC='\033[0m'
 if [ "$EUID" -ne 0 ]; then echo -e "${RED}必须使用 root 权限${NC}"; exit 1; fi
 
 # ----------------------------------------------------------------
-# 1. 暴力清除旧版本
+# 1. 暴力清除旧环境
 # ----------------------------------------------------------------
-echo -e "${BLUE}>>> [1/9] 清除旧版本...${NC}"
+echo -e "${BLUE}>>> [1/9] 清理环境...${NC}"
 systemctl stop sing-box >/dev/null 2>&1
 systemctl disable sing-box >/dev/null 2>&1
 killall -9 sing-box >/dev/null 2>&1
@@ -25,7 +25,7 @@ rm -f /usr/local/bin/sing-box /usr/bin/sing-box /bin/sing-box
 echo -e "${GREEN}清理完成。${NC}"
 
 # ----------------------------------------------------------------
-# 2. 安装 v1.11.4 (支持 server_ports)
+# 2. 安装 v1.11.4 (必须用这个版本支持 server_ports)
 # ----------------------------------------------------------------
 echo -e "${BLUE}>>> [2/9] 下载 Sing-box v1.11.4...${NC}"
 ARCH=$(uname -m)
@@ -35,9 +35,7 @@ case $ARCH in
     *) echo -e "${RED}不支持: $ARCH${NC}"; exit 1 ;;
 esac
 
-# 升级到 v1.11.4 以支持 Hy2 新特性
 URL="https://github.com/SagerNet/sing-box/releases/download/v1.11.4/sing-box-1.11.4-linux-$SING_ARCH.tar.gz"
-
 curl -L -s -o sing-box.tar.gz "$URL"
 if [ ! -f "sing-box.tar.gz" ]; then echo -e "${RED}下载失败！${NC}"; exit 1; fi
 
@@ -51,7 +49,7 @@ INSTALLED_VER=$(/usr/local/bin/sing-box version | head -n 1 | awk '{print $3}')
 echo -e "已安装: ${GREEN}$INSTALLED_VER${NC}"
 
 # ----------------------------------------------------------------
-# 3. 系统初始化
+# 3. 系统参数
 # ----------------------------------------------------------------
 echo -e "${BLUE}>>> [3/9] 初始化系统...${NC}"
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-singbox.conf
@@ -89,12 +87,24 @@ curl -L -s -A "Mozilla/5.0" -o "$CONFIG_FILE" "$SUB_URL"
 if ! jq -e . "$CONFIG_FILE" >/dev/null 2>&1; then echo -e "${RED}无效 JSON${NC}"; exit 1; fi
 
 # ----------------------------------------------------------------
-# 5. 扫描节点
+# 5. 扫描并 *过滤* 节点 (关键修复步骤)
 # ----------------------------------------------------------------
-echo -e "${BLUE}>>> [5/9] 解析节点...${NC}"
-jq -r '.outbounds[] | select(.type != "direct" and .type != "block" and .type != "dns" and .type != "selector" and .type != "urltest") | .tag' "$CONFIG_FILE" > /tmp/singbox_tags.txt
+echo -e "${BLUE}>>> [5/9] 解析并过滤坏节点...${NC}"
+
+# 这里的 jq 命令增加了 select 逻辑，只保留 sing-box 真正支持的标准协议
+# 剔除了 anytls, selector, direct, block, dns, urltest 等干扰项
+jq -r '.outbounds[] | select(
+    .type != "direct" and 
+    .type != "block" and 
+    .type != "dns" and 
+    .type != "selector" and 
+    .type != "urltest" and 
+    .type != "anytls"  # <--- 专门过滤那个报错的鬼东西
+) | .tag' "$CONFIG_FILE" > /tmp/singbox_tags.txt
+
 TOTAL_COUNT=$(wc -l < /tmp/singbox_tags.txt)
-if [ "$TOTAL_COUNT" -eq 0 ]; then echo -e "${RED}无节点${NC}"; exit 1; fi
+if [ "$TOTAL_COUNT" -eq 0 ]; then echo -e "${RED}无有效节点 (可能全部被过滤)${NC}"; exit 1; fi
+echo -e "有效节点数: ${GREEN}$TOTAL_COUNT${NC}"
 
 # ----------------------------------------------------------------
 # 6. 国家选择 (完整版)
@@ -142,9 +152,9 @@ MATCH_KEY="${REGION_REGEX[$SELECTED_NAME]}"
 echo -e "${GREEN}已选: $SELECTED_NAME${NC}"
 
 # ----------------------------------------------------------------
-# 7. 生成配置 (v1.11 适配)
+# 7. 生成配置 (剔除坏节点)
 # ----------------------------------------------------------------
-echo -e "${BLUE}>>> [7/9] 构造配置...${NC}"
+echo -e "${BLUE}>>> [7/9] 构造配置 (自动剔除 anytls)...${NC}"
 cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
 
 jq -n \
@@ -177,8 +187,14 @@ jq -n \
         }
     ],
     "outbounds": (
+        # 1. 第一步：获取所有非标准节点
         ($original[0].outbounds | map(select(.type != "direct" and .type != "block" and .type != "dns" and .type != "selector" and .type != "urltest"))) as $all_nodes |
-        ($all_nodes | map(select(.tag | test($match_key; "i")))) as $selected_nodes |
+        
+        # 2. 第二步：强力清洗，剔除 "anytls" 等不支持的类型
+        ($all_nodes | map(select(.type != "anytls"))) as $clean_nodes |
+
+        # 3. 第三步：根据地区匹配
+        ($clean_nodes | map(select(.tag | test($match_key; "i")))) as $selected_nodes |
         [
             {
                 "type": "urltest",
@@ -207,12 +223,9 @@ jq -n \
 }' > "$CONFIG_FILE"
 
 # ----------------------------------------------------------------
-# 8. 启动 (关键: 注入兼容性变量)
+# 8. 启动
 # ----------------------------------------------------------------
 echo -e "${BLUE}>>> [8/9] 启动服务...${NC}"
-
-# 这里是最关键的修复点！
-# 我们使用环境变量来告诉新版 sing-box：“不要报错，像旧版本一样运行 TUN 模式”
 cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
 Description=sing-box service
@@ -221,9 +234,7 @@ After=network.target
 [Service]
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-# 屏蔽 Legacy TUN 报错
 Environment="ENABLE_DEPRECATED_TUN_ADDRESS_X=true"
-# 屏蔽 GeoIP/GeoSite 旧字段报错
 Environment="ENABLE_DEPRECATED_GEOIP=true"
 Environment="ENABLE_DEPRECATED_GEOSITE=true"
 ExecStart=/usr/local/bin/sing-box run -c $CONFIG_FILE
