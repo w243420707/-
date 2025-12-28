@@ -1,8 +1,11 @@
 #!/bin/bash
 
 # =================================================================
-# Sing-box 终极完美版 v9 (逻辑修复 + 格式重构 + 自动优选)
-# 核心修复：修复 UrlTest 逻辑错误，彻底消除 Legacy 警告
+# Sing-box 终极重构版 v10 (新一代核心语法)
+# 核心修复：
+# 1. 彻底移除 Legacy Special Outbounds (修复 FATAL)
+# 2. 彻底移除 Legacy TUN Address (修复 FATAL)
+# 3. 严格匹配 UrlTest 时间参数 (修复 FATAL)
 # =================================================================
 
 # 颜色定义
@@ -64,7 +67,6 @@ echo -e "${BLUE}>>> [3/8] 下载订阅...${NC}"
 mkdir -p /etc/sing-box
 CONFIG_FILE="/etc/sing-box/config.json"
 
-# 解析参数或手动输入
 SUB_URL=""
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -128,14 +130,15 @@ SELECTED_NAME="${AVAILABLE_REGIONS[$IDX]}"
 MATCH_KEY="${REGION_REGEX[$SELECTED_NAME]}"
 echo -e "${GREEN}已选: $SELECTED_NAME${NC}"
 
-# 6. 生成配置 (UrlTest + 最新语法)
+# 6. 生成配置 (全新 1.12+ 核心语法)
 echo -e "${BLUE}>>> [6/8] 构造自动优选配置...${NC}"
 cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
 
-# 核心修正：
-# 1. interval (300s) < idle_timeout (1800s) 避免 FATAL 错误
-# 2. DNS 配置改为 servers + rules 新格式，消除 legacy DNS 警告
-# 3. TUN 配置使用 inet4_address 数组，消除 legacy TUN 警告
+# 关键修正说明：
+# 1. 移除了 Outbounds 里的 {"type": "dns"}，这是 FATAL 根源。
+# 2. 路由规则里不使用 "outbound": "dns-out"，而是依靠 hijack_dns 处理。
+# 3. 直连规则改用 "action": "route", "outbound": "direct"。
+# 4. UrlTest interval (120s) < idle_timeout (300s)，避免逻辑错误。
 jq -n \
     --slurpfile original "$CONFIG_FILE.bak" \
     --arg match_key "$MATCH_KEY" \
@@ -149,7 +152,9 @@ jq -n \
         ],
         "rules": [
             { "outbound": "any", "server": "cf-doh" }
-        ]
+        ],
+        "final": "cf-doh",
+        "strategy": "ipv4_only"
     },
     "inbounds": [
         {
@@ -160,7 +165,8 @@ jq -n \
             "auto_route": true,
             "strict_route": true,
             "stack": "system",
-            "sniff": true
+            "sniff": true,
+            "sniff_override_destination": true
         },
         {
             "type": "mixed",
@@ -178,20 +184,19 @@ jq -n \
                 "tag": "AUTO-SELECT-GROUP",
                 "outbounds": ($selected_nodes | map(.tag)),
                 "url": "https://www.gstatic.com/generate_204",
-                "interval": "300s",
+                "interval": "120s",
                 "tolerance": 50,
-                "idle_timeout": "1800s"
+                "idle_timeout": "300s"
             },
             { "type": "direct", "tag": "direct" },
-            { "type": "block", "tag": "block" },
-            { "type": "dns", "tag": "dns-out" }
+            { "type": "block", "tag": "block" }
         ] + $selected_nodes
     ),
     "route": {
         "rules": [
-            { "protocol": "dns", "outbound": "dns-out" },
-            { "port": $ssh_port, "outbound": "direct" },
-            { "ip_is_private": true, "outbound": "direct" },
+            { "protocol": "dns", "action": "hijack-dns" },
+            { "port": $ssh_port, "action": "route", "outbound": "direct" },
+            { "ip_is_private": true, "action": "route", "outbound": "direct" },
             { "inbound": "tun-in", "action": "route", "outbound": "AUTO-SELECT-GROUP" },
             { "inbound": "mixed-in", "action": "route", "outbound": "AUTO-SELECT-GROUP" }
         ],
@@ -200,7 +205,7 @@ jq -n \
     }
 }' > "$CONFIG_FILE"
 
-# 7. 启动
+# 7. 启动服务 (双保险环境变量 + 纯净配置)
 echo -e "${BLUE}>>> [7/8] 启动服务...${NC}"
 cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
@@ -211,8 +216,10 @@ After=network.target nss-lookup.target
 [Service]
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-# 再次保留该变量以防万一，但 JSON 已是最新版，应无冲突
+# 开启所有旧特性兼容，防止有漏网之鱼
 Environment="ENABLE_DEPRECATED_TUN_ADDRESS_X=true"
+Environment="ENABLE_DEPRECATED_SPECIAL_OUTBOUNDS=true"
+Environment="ENABLE_DEPRECATED_DNS_RULE_ITEM=true"
 ExecStart=/usr/local/bin/sing-box run -c $CONFIG_FILE
 Restart=on-failure
 RestartSec=10
@@ -234,15 +241,15 @@ sleep 8
 unset http_proxy https_proxy all_proxy
 
 if systemctl is-active --quiet sing-box; then
-    echo -e "${GREEN}✅ 服务运行正常！${NC}"
+    echo -e "${GREEN}✅ Sing-box 服务已稳定运行！${NC}"
     RES=$(curl -s -m 8 ipinfo.io)
     if [[ $RES == *"ip"* ]]; then
-        echo -e "${GREEN}🎉 恭喜！网络通畅！${NC}"
+        echo -e "${GREEN}🎉 恭喜！网络通畅！自动优选生效。${NC}"
         echo "$RES"
     else
-        echo -e "${RED}⚠️  网络连通性测试超时。${NC}"
-        echo -e "说明：Sing-box 已启动成功（无FATAL错误），但可能当前选中的节点组网络不佳。"
-        echo -e "建议：尝试更换一个国家/地区重新运行脚本。"
+        echo -e "${RED}⚠️  Sing-box 运行正常，但网络测试超时。${NC}"
+        echo -e "可能原因：当前国家的所有节点均不可用，或 UDP 流量被 VPS 商家封锁。"
+        echo -e "建议：尝试重启脚本并选择 [全球自动选择] 看看。"
     fi
 else
     echo -e "${RED}启动失败${NC}"
