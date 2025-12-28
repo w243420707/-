@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # =========================================================
-# Sing-box 全局接管流量 (TUN模式) - 修复版
-# 修复内容：补全 Python 脚本 try/except 语法闭合
+# Sing-box 全局接管 (TUN模式) - 最终修正版
+# 修复：将 WebUI (9090) 加入直连白名单，解决打不开面板的问题
 # =========================================================
 
 RED='\033[0;31m'
@@ -51,8 +51,8 @@ elif [ -f /etc/alpine-release ]; then
     apk add python3 curl wget
 fi
 
-# --- 3. 生成配置 (修复 Python 语法) ---
-echo -e "${YELLOW}[3/5] 下载订阅并生成全局配置...${PLAIN}"
+# --- 3. 生成配置 (已修复路由规则) ---
+echo -e "${YELLOW}[3/5] 下载订阅并生成配置 (已添加UI直连规则)...${PLAIN}"
 TEMP_JSON="/tmp/singbox_sub.json"
 wget -O "$TEMP_JSON" "$SUB_URL"
 
@@ -81,7 +81,6 @@ try:
         data = json.load(f)
     
     proxies = []
-    # 提取节点
     for out in data.get('outbounds', []):
         if out.get('type') not in ['direct', 'dns', 'block', 'selector', 'urltest']:
             proxies.append(out)
@@ -103,21 +102,21 @@ try:
     # 构建 Outbounds
     new_outbounds = []
     
-    # 1. 主选择器
+    # Selector 构建
     selector_groups = ["♻️ 自动选择", "🚀 节点选择"] + list(groups.keys()) + ["DIRECT"]
     new_outbounds.append({"type": "selector", "tag": "PROXY", "outbounds": selector_groups})
     
-    # 2. 自动测速
+    # 自动测速
     new_outbounds.append({
         "type": "urltest", "tag": "♻️ 自动选择", 
         "outbounds": all_proxy_tags, 
         "url": "http://www.gstatic.com/generate_204", "interval": "3m", "tolerance": 50
     })
     
-    # 3. 手动选择
+    # 手动选择
     new_outbounds.append({"type": "selector", "tag": "🚀 节点选择", "outbounds": all_proxy_tags})
 
-    # 4. 地区分组
+    # 地区分组
     for g_name, tags in groups.items():
         if len(tags) > 1:
             auto_tag = f"⚡ {g_name} 自动"
@@ -180,9 +179,12 @@ try:
         "route": {
             "rules": [
                 {"protocol": "dns", "outbound": "dns-out"},
-                # 核心：SSH 直连保护
+                # --- 关键修正 ---
+                # 1. SSH 直连
                 {"port": 22, "outbound": "DIRECT"},
                 {"protocol": "ssh", "outbound": "DIRECT"},
+                # 2. WebUI 面板端口直连 (修复无法访问面板的问题)
+                {"port": ui_port, "outbound": "DIRECT"},
                 
                 {"clash_mode": "direct", "outbound": "DIRECT"},
                 {"clash_mode": "global", "outbound": "PROXY"}
@@ -204,12 +206,12 @@ EOF
 
 python3 /tmp/gen_tun_config.py
 if [ $? -ne 0 ]; then
-    echo -e "${RED}配置生成失败！请检查上方报错信息。${PLAIN}"
+    echo -e "${RED}配置生成失败！请检查报错。${PLAIN}"
     exit 1
 fi
 
 # --- 4. 授权与重启 ---
-echo -e "${YELLOW}[4/5] 配置服务权限并重启...${PLAIN}"
+echo -e "${YELLOW}[4/5] 重启服务...${PLAIN}"
 mkdir -p /etc/systemd/system/sing-box.service.d/
 cat > /etc/systemd/system/sing-box.service.d/override.conf <<EOF
 [Service]
@@ -222,17 +224,18 @@ systemctl enable sing-box > /dev/null 2>&1
 systemctl restart sing-box
 
 # --- 5. 验证 ---
-echo -e "${YELLOW}[5/5] 验证代理状态 (等待3秒)...${PLAIN}"
+echo -e "${YELLOW}[5/5] 等待服务启动...${PLAIN}"
 sleep 3
 IP=$(curl -s4 --max-time 5 ifconfig.me)
 
 if [ -z "$IP" ]; then
-    echo -e "${RED}无法获取IP，网络可能在重启中，请稍后手动测试 'curl ip.sb'${PLAIN}"
+    echo -e "${RED}检测 IP 超时，但服务应该已运行。请稍后手动测试。${PLAIN}"
 else
     echo -e "\n${GREEN}=============================================${PLAIN}"
-    echo -e "${GREEN}      全局代理 (TUN) 已激活！      ${PLAIN}"
+    echo -e "${GREEN}      全局代理 (TUN) 已安装完毕！      ${PLAIN}"
     echo -e "${GREEN}=============================================${PLAIN}"
     echo -e "WebUI: http://你的IP:$UI_PORT/ui/"
+    echo -e "SSH与面板端口已加入白名单，连接不受代理影响。"
     echo -e "当前出口 IP: $IP"
     echo -e "${GREEN}=============================================${PLAIN}"
 fi
