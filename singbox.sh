@@ -19,40 +19,39 @@ urlencode() {
 }
 
 # ==========================================
-# 1. Root 检查
+# 1. Root 检查与环境准备
 # ==========================================
 if [[ $EUID -ne 0 ]]; then
    echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${PLAIN}"
    exit 1
 fi
 
+# 停止旧服务，防止干扰
+systemctl stop sing-box >/dev/null 2>&1
+
 clear
 echo -e "${BLUE}#############################################################${PLAIN}"
 echo -e "${BLUE}#                                                           #${PLAIN}"
-echo -e "${BLUE}#   Sing-box 旗舰版 (自动识别 TUN/普通模式 + 故障降级)      #${PLAIN}"
+echo -e "${BLUE}#   Sing-box 修复版 (纯 Mixed 模式 + 环境变量代理)          #${PLAIN}"
 echo -e "${BLUE}#                                                           #${PLAIN}"
 echo -e "${BLUE}#############################################################${PLAIN}"
 echo -e ""
 
-# ==========================================
-# 2. 用户交互与订阅智能处理
-# ==========================================
-echo -e "${GREEN}步骤 1/5: 初始化环境...${PLAIN}"
+echo -e "${GREEN}步骤 1/5: 初始化环境与同步时间...${PLAIN}"
+# 强制同步时间，防止节点连接失败
 if [ -f /etc/debian_version ]; then
     apt-get update -y >/dev/null 2>&1
-    apt-get install -y curl wget tar unzip jq python3 cron >/dev/null 2>&1
-    systemctl enable cron >/dev/null 2>&1
-    systemctl start cron >/dev/null 2>&1
+    apt-get install -y curl wget tar unzip jq python3 cron ntpdate >/dev/null 2>&1
 elif [ -f /etc/redhat-release ]; then
-    yum install -y curl wget tar unzip jq python3 crontabs >/dev/null 2>&1
-    systemctl enable crond >/dev/null 2>&1
-    systemctl start crond >/dev/null 2>&1
+    yum install -y curl wget tar unzip jq python3 crontabs ntpdate >/dev/null 2>&1
 fi
+ntpdate pool.ntp.org >/dev/null 2>&1
+echo -e "${GREEN}系统时间已校准。${PLAIN}"
 
 echo -e ""
 
 # ==========================================
-# 优先读取命令行参数 $1
+# 2. 用户交互
 # ==========================================
 if [[ -n "$1" ]]; then
     SUB_URL="$1"
@@ -73,6 +72,7 @@ else
     
     wget --no-check-certificate -q -O /tmp/singbox_raw.json "$SUB_URL"
     
+    # 简单的格式检查
     if [[ -s /tmp/singbox_raw.json ]] && jq -e '.outbounds' /tmp/singbox_raw.json >/dev/null 2>&1; then
         echo -e "${GREEN}检测到链接已经是 Sing-box 格式，跳过第三方转换。${PLAIN}"
         cp /tmp/singbox_raw.json /tmp/singbox_pre.json
@@ -136,7 +136,7 @@ else
 fi
 
 # ==========================================
-# 3. 安装 Sing-box 核心
+# 3. 安装 Sing-box
 # ==========================================
 echo -e ""
 echo -e "${GREEN}步骤 2/5: 安装 Sing-box...${PLAIN}"
@@ -171,60 +171,60 @@ mv Yacd-meta-gh-pages/* "$WEBUI_DIR"
 rm -rf Yacd-meta-gh-pages webui.zip
 
 # ==========================================
-# 5. 生成智能监控脚本 (含 TUN 检测与降级)
+# 5. 生成 Monitor 脚本 (纯 Mixed 模式)
 # ==========================================
-echo -e "${GREEN}步骤 4/5: 生成自动化脚本 (Watchdog)...${PLAIN}"
+echo -e "${GREEN}步骤 4/5: 生成自动化脚本...${PLAIN}"
 
-# 生成 monitor.sh
 cat > "$MONITOR_SCRIPT" <<EOF
 #!/bin/bash
-# Sing-box Watchdog - 智能 TUN/普通模式切换版
+# Sing-box Watchdog - 纯 Mixed 模式 + ENV 代理
 
 SUB_URL="$SUB_URL"
 FILTER_REGEX="$FINAL_REGEX"
 CONFIG_FILE="$CONFIG_FILE"
-WEBUI_DIR="$WEBUI_DIR"
 LOG_FILE="$LOG_FILE"
 PROXY_PORT=2080
 MAX_RETRIES=3
 USE_CONVERSION=$USE_CONVERSION
 
 timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
+urlencode() { python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "\$1"; }
 
-urlencode() {
-    python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "\$1"
+# 核心：设置全局环境变量（替代 TUN）
+enable_proxy_env() {
+    export http_proxy="http://127.0.0.1:\$PROXY_PORT"
+    export https_proxy="http://127.0.0.1:\$PROXY_PORT"
+    export all_proxy="socks5://127.0.0.1:\$PROXY_PORT"
+    # 写入到 profile 让其他 session 也生效 (可选)
+    echo "export http_proxy=\"http://127.0.0.1:\$PROXY_PORT\"" > /etc/profile.d/singbox_proxy.sh
+    echo "export https_proxy=\"http://127.0.0.1:\$PROXY_PORT\"" >> /etc/profile.d/singbox_proxy.sh
+    echo "export all_proxy=\"socks5://127.0.0.1:\$PROXY_PORT\"" >> /etc/profile.d/singbox_proxy.sh
 }
 
-# 检查代理连通性
+disable_proxy_env() {
+    unset http_proxy https_proxy all_proxy
+    rm -f /etc/profile.d/singbox_proxy.sh
+}
+
 check_proxy() {
-    # 统一通过本地 HTTP 代理测试，无论是否开启 TUN，2080 端口都应存在
+    # 明确指定使用 localhost 的代理端口进行测试
     http_code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 --proxy http://127.0.0.1:\$PROXY_PORT https://www.google.com/generate_204)
     if [[ "\$http_code" == "204" ]]; then return 0; else return 1; fi
 }
 
 update_subscription() {
-    echo "\$(timestamp) - [核心] 正在停止服务以进行无干扰更新..." >> "\$LOG_FILE"
+    echo "\$(timestamp) - 停止服务，准备更新..." >> "\$LOG_FILE"
     systemctl stop sing-box
-    
-    echo "\$(timestamp) - 开始下载最新订阅..." >> "\$LOG_FILE"
+    disable_proxy_env # 关闭代理环境，确保 wget 走直连
     
     if [[ "\$USE_CONVERSION" == "false" ]]; then
-        # === 直连模式 ===
         wget --no-check-certificate -q -O /tmp/singbox_new.json "\$SUB_URL"
         if [[ -n "\$FILTER_REGEX" ]] && [[ -s /tmp/singbox_new.json ]]; then
-             echo "\$(timestamp) - 执行本地过滤: \$FILTER_REGEX" >> "\$LOG_FILE"
-             jq --arg re "\$FILTER_REGEX" '
-                .outbounds |= map(
-                    select(
-                        (.type | test("Selector|URLTest|Direct|Block"; "i")) or 
-                        (.tag | test(\$re; "i"))
-                    )
-                )
-             ' /tmp/singbox_new.json > /tmp/singbox_filtered.json
+             echo "\$(timestamp) - 执行本地过滤..." >> "\$LOG_FILE"
+             jq --arg re "\$FILTER_REGEX" '.outbounds |= map(select((.type | test("Selector|URLTest|Direct|Block"; "i")) or (.tag | test(\$re; "i"))))' /tmp/singbox_new.json > /tmp/singbox_filtered.json
              mv /tmp/singbox_filtered.json /tmp/singbox_new.json
         fi
     else
-        # === API 转换模式 ===
         ENCODED_URL=\$(urlencode "\$SUB_URL")
         INCLUDE_PARAM=""
         if [[ -n "\$FILTER_REGEX" ]]; then
@@ -235,55 +235,16 @@ update_subscription() {
         wget -q -O /tmp/singbox_new.json "\$API_URL"
     fi
     
-    # === 关键逻辑：检测 TUN 支持 ===
-    # 尝试创建 TUN 设备节点（如果不存在）
-    if [[ ! -e /dev/net/tun ]]; then
-        mkdir -p /dev/net
-        mknod /dev/net/tun c 10 200 >/dev/null 2>&1
-        chmod 600 /dev/net/tun >/dev/null 2>&1
-    fi
-
-    INBOUND_CONFIG=""
-    
-    if [[ -c /dev/net/tun ]]; then
-        echo "\$(timestamp) - [模式] 检测到 TUN 设备，启用全局 TUN 模式。" >> "\$LOG_FILE"
-        INBOUND_CONFIG='{
-          "inbounds": [
-            {
-                "type": "tun",
-                "tag": "tun-in",
-                "interface_name": "tun0",
-                "inet4_address": "172.19.0.1/30",
-                "mtu": 1400,
-                "auto_route": true,
-                "strict_route": false,
-                "stack": "system",
-                "sniff": true
-            },
-            {
-                "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "::",
-                "listen_port": 2080
-            }
-          ]
-        }'
-    else
-        echo "\$(timestamp) - [模式] 未检测到 TUN 设备 (LXC/OpenVZ?)，启用标准混合端口模式。" >> "\$LOG_FILE"
-        INBOUND_CONFIG='{
-          "inbounds": [
-            {
-                "type": "mixed",
-                "tag": "mixed-in",
-                "listen": "::",
-                "listen_port": 2080
-            }
-          ]
-        }'
-    fi
-    
-    # 基础 WebUI 配置
-    WEBUI_BASE='{
+    # === 纯 Mixed 配置 (最稳) ===
+    WEBUI_CONFIG='{
+      "inbounds": [
+        {
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "::",
+            "listen_port": 2080
+        }
+      ],
       "experimental": {
         "cache_file": { "enabled": true, "path": "cache.db" },
         "clash_api": {
@@ -296,103 +257,74 @@ update_subscription() {
         }
       }
     }'
-
+    
     if [[ -s /tmp/singbox_new.json ]] && jq . /tmp/singbox_new.json >/dev/null 2>&1; then
-        # 1. 移除旧 inbound，准备合并
         jq 'del(.inbounds)' /tmp/singbox_new.json > /tmp/singbox_clean.json
+        jq -s '.[0] * .[1]' /tmp/singbox_clean.json <(echo "\$WEBUI_CONFIG") > /tmp/singbox_merged.json
         
-        # 2. 组合 (WebUI + Inbounds)
-        echo "\$WEBUI_BASE" > /tmp/webui.json
-        echo "\$INBOUND_CONFIG" > /tmp/inbound.json
-        jq -s '.[0] * .[1]' /tmp/webui.json /tmp/inbound.json > /tmp/config_base.json
-        
-        # 3. 最终合并 (订阅 + 基础配置)
-        jq -s '.[0] * .[1]' /tmp/singbox_clean.json /tmp/config_base.json > /tmp/singbox_merged.json
-        
-        # 4. 强制锁定 Auto 组
+        # 强制锁定 Auto 组
         AUTO_TAG=\$(jq -r '.outbounds[] | select(.type=="urltest") | .tag' /tmp/singbox_merged.json | head -n 1)
         if [[ -n "\$AUTO_TAG" ]]; then
-             jq --arg auto_tag "\$AUTO_TAG" '
-                (
-                  (.outbounds[] | select(.tag=="Proxy" and .type=="selector").default) // 
-                  (.outbounds[] | select(.type=="selector").default)
-                ) = \$auto_tag
-             ' /tmp/singbox_merged.json > "\$CONFIG_FILE"
+             jq --arg auto_tag "\$AUTO_TAG" '((.outbounds[] | select(.tag=="Proxy" and .type=="selector").default) // (.outbounds[] | select(.type=="selector").default)) = \$auto_tag' /tmp/singbox_merged.json > "\$CONFIG_FILE"
         else
              mv /tmp/singbox_merged.json "\$CONFIG_FILE"
         fi
         
-        echo "\$(timestamp) - 配置生成完毕，尝试启动服务..." >> "\$LOG_FILE"
+        echo "\$(timestamp) - 启动服务..." >> "\$LOG_FILE"
         systemctl start sing-box
-        sleep 10 
+        sleep 10
         
         if check_proxy; then
-            echo "\$(timestamp) - [成功] 服务已恢复，代理可用。" >> "\$LOG_FILE"
+            echo "\$(timestamp) - [成功] 代理连通，启用系统环境变量。" >> "\$LOG_FILE"
+            enable_proxy_env
         else
-            echo "\$(timestamp) - [失败] 新节点依然无法连通，停止服务以释放网络。" >> "\$LOG_FILE"
+            echo "\$(timestamp) - [失败] 节点不可用，保持停止状态。" >> "\$LOG_FILE"
             systemctl stop sing-box
+            disable_proxy_env
         fi
     else
-        echo "\$(timestamp) - [错误] 订阅下载失败，保持服务关闭状态。" >> "\$LOG_FILE"
+        echo "\$(timestamp) - [错误] 订阅下载失败。" >> "\$LOG_FILE"
     fi
 }
 
-# 逻辑入口
-if [[ "\$1" == "force" ]]; then
-    update_subscription
-    exit 0
-fi
+if [[ "\$1" == "force" ]]; then update_subscription; exit 0; fi
 
 if systemctl is-active --quiet sing-box; then
-    # 服务在运行，检查连通性
     FAIL_COUNT=0
     for ((i=1; i<=MAX_RETRIES; i++)); do
-        if check_proxy; then
-            exit 0 # 一切正常
-        else
-            FAIL_COUNT=\$((FAIL_COUNT+1))
-            sleep 2
-        fi
+        if check_proxy; then exit 0; else FAIL_COUNT=\$((FAIL_COUNT+1)); sleep 2; fi
     done
-    
     if [[ \$FAIL_COUNT -eq \$MAX_RETRIES ]]; then
-        echo "\$(timestamp) - 检测到节点不可用，触发故障恢复流程..." >> "\$LOG_FILE"
+        echo "\$(timestamp) - 连通性检测失败，触发更新..." >> "\$LOG_FILE"
         update_subscription
     fi
 else
-    # 服务停止中，尝试恢复
-    echo "\$(timestamp) - 服务当前处于停止状态，尝试更新订阅并重新启动..." >> "\$LOG_FILE"
+    echo "\$(timestamp) - 服务未运行，尝试恢复..." >> "\$LOG_FILE"
     update_subscription
 fi
 EOF
 
 chmod +x "$MONITOR_SCRIPT"
-
-# 设置 Crontab
 crontab -l | grep -v "$MONITOR_SCRIPT" > /tmp/cron_bk
-echo "*/5 * * * * $MONITOR_SCRIPT" >> /tmp/cron_bk 
+echo "*/5 * * * * $MONITOR_SCRIPT" >> /tmp/cron_bk
 crontab /tmp/cron_bk
 rm /tmp/cron_bk
 
-echo -e "${GREEN}监控脚本已部署：每5分钟检测一次连通性。${PLAIN}"
+echo -e "${GREEN}监控脚本已部署。${PLAIN}"
 
 # ==========================================
-# 6. 初次生成与启动
+# 6. 启动与检查
 # ==========================================
-echo -e "${GREEN}步骤 5/5: 初次生成配置并启动...${PLAIN}"
-
-# 执行一次强制更新流程 (force 模式)
+echo -e "${GREEN}步骤 5/5: 初次启动...${PLAIN}"
 bash "$MONITOR_SCRIPT" force
 
+# Systemd 服务文件
 cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
-Description=sing-box service
-Documentation=https://sing-box.sagernet.org
+Description=sing-box
 After=network.target nss-lookup.target
 
 [Service]
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 ExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json
 Restart=on-failure
 RestartSec=10
@@ -401,32 +333,23 @@ LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
 EOF
-
 systemctl daemon-reload
-systemctl disable sing-box > /dev/null 2>&1 
-
-if command -v ufw > /dev/null; then
-    ufw allow 9090/tcp >/dev/null
-    ufw allow 2080/tcp >/dev/null
-elif command -v firewall-cmd > /dev/null; then
-    firewall-cmd --zone=public --add-port=9090/tcp --permanent >/dev/null 2>&1
-    firewall-cmd --zone=public --add-port=2080/tcp --permanent >/dev/null 2>&1
-    firewall-cmd --reload >/dev/null 2>&1
-else
-    iptables -I INPUT -p tcp --dport 9090 -j ACCEPT >/dev/null 2>&1
-    iptables -I INPUT -p tcp --dport 2080 -j ACCEPT >/dev/null 2>&1
-fi
-
-IPV4=$(curl -s4m8 ip.sb)
 
 echo -e ""
 echo -e "${GREEN}=========================================${PLAIN}"
-echo -e "${GREEN}           全自动部署完成！              ${PLAIN}"
-echo -e "${GREEN}=========================================${PLAIN}"
-echo -e "WebUI 面板:     ${BLUE}http://${IPV4}:9090/ui/${PLAIN}"
-echo -e "代理端口:       ${YELLOW}2080${PLAIN} (Mixed)"
-echo -e "-----------------------------------------"
-echo -e "故障处理:       节点挂掉 -> 自动停止代理 -> 更新订阅 -> 尝试重启"
-echo -e "筛选规则:       ${YELLOW}${FINAL_REGEX:-全部保留}${PLAIN}"
-echo -e "模式自检:       脚本将自动识别是否支持 TUN"
+# 检查运行状态
+if systemctl is-active --quiet sing-box; then
+    echo -e "${GREEN}状态:           Sing-box 正在运行 ${PLAIN}"
+    # 再次测试
+    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 --proxy http://127.0.0.1:2080 https://www.google.com/generate_204)
+    if [[ "$HTTP_CODE" == "204" ]]; then
+         echo -e "${GREEN}连接测试:       成功 (204)${PLAIN}"
+         echo -e "全局代理:       通过环境变量设置 (http_proxy)"
+    else
+         echo -e "${RED}连接测试:       失败 (请检查节点是否有效)${PLAIN}"
+    fi
+else
+    echo -e "${RED}状态:           Sing-box 未启动 (可能无可用节点)${PLAIN}"
+fi
+echo -e "WebUI:          http://$(curl -s4m5 ip.sb):9090/ui/"
 echo -e "${GREEN}=========================================${PLAIN}"
