@@ -1,10 +1,8 @@
 #!/bin/bash
 
 # =================================================================
-# Sing-box 核弹修复版 v14
-# 锁定版本: v1.10.1 (黄金稳定版)
-# 解决问题: 版本过低导致的 "unknown field action"
-# 解决问题: 路由死循环导致的 "operation not permitted"
+# Sing-box 核爆清理重装版 v15 (强制更新二进制文件)
+# 核心目标：彻底清除旧版本，确保安装支持新语法的 v1.10.1
 # =================================================================
 
 # 颜色
@@ -17,24 +15,75 @@ NC='\033[0m'
 if [ "$EUID" -ne 0 ]; then echo -e "${RED}必须使用 root 权限${NC}"; exit 1; fi
 
 # ----------------------------------------------------------------
-# 1. 暴力清理环境 (防止旧版本残留)
+# 1. 暴力清除旧版本 (关键步骤)
 # ----------------------------------------------------------------
-echo -e "${BLUE}>>> [1/8] 暴力清理旧版本...${NC}"
+echo -e "${BLUE}>>> [1/9] 正在查找并删除系统中的旧版 Sing-box...${NC}"
+
+# 停止服务
 systemctl stop sing-box >/dev/null 2>&1
 systemctl disable sing-box >/dev/null 2>&1
+killall -9 sing-box >/dev/null 2>&1
+
+# 删除所有可能存在的路径
 rm -f /usr/local/bin/sing-box
-rm -f /etc/systemd/system/sing-box.service
-systemctl daemon-reload
-echo -e "${GREEN}清理完成。${NC}"
+rm -f /usr/bin/sing-box
+rm -f /bin/sing-box
+rm -f /sbin/sing-box
+rm -rf /usr/local/sing-box
+
+# 再次确认清理干净
+if command -v sing-box >/dev/null; then
+    echo -e "${RED}严重错误：无法删除旧版本 Sing-box！${NC}"
+    echo -e "请手动运行: which sing-box 找到它并删除。"
+    exit 1
+else
+    echo -e "${GREEN}旧版本清理完成。${NC}"
+fi
 
 # ----------------------------------------------------------------
-# 2. 系统参数优化
+# 2. 独立下载与版本验证 (防止假死)
 # ----------------------------------------------------------------
-echo -e "${BLUE}>>> [2/8] 优化系统参数...${NC}"
+echo -e "${BLUE}>>> [2/9] 下载 Sing-box v1.10.1 (黄金稳定版)...${NC}"
+ARCH=$(uname -m)
+case $ARCH in
+    x86_64) SING_ARCH="amd64" ;;
+    aarch64|arm64) SING_ARCH="arm64" ;;
+    *) echo -e "${RED}不支持: $ARCH${NC}"; exit 1 ;;
+esac
+
+# 下载到临时文件名，确保不被旧文件干扰
+curl -L -s -o sing-box-install.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v1.10.1/sing-box-1.10.1-linux-$SING_ARCH.tar.gz"
+
+if [ ! -f "sing-box-install.tar.gz" ]; then
+    echo -e "${RED}下载失败！网络不通或 GitHub 被墙。${NC}"; exit 1
+fi
+
+tar -xzf sing-box-install.tar.gz
+DIR_NAME=$(tar -tf sing-box-install.tar.gz | head -1 | cut -f1 -d"/")
+
+# 移动文件
+cp "$DIR_NAME/sing-box" /usr/local/bin/sing-box
+chmod +x /usr/local/bin/sing-box
+rm -rf sing-box-install.tar.gz "$DIR_NAME"
+
+# *** 核心验证 ***
+INSTALLED_VER=$(/usr/local/bin/sing-box version | head -n 1 | awk '{print $3}')
+echo -e "当前安装版本: ${YELLOW}$INSTALLED_VER${NC}"
+
+# 检查版本号是否足够新 (1.10.1)
+if [[ "$INSTALLED_VER" != "1.10.1" ]]; then
+    echo -e "${RED}版本验证失败！期望 1.10.1，实际安装的是 $INSTALLED_VER${NC}"
+    echo -e "系统可能存在严重的缓存或文件锁定问题。"
+    exit 1
+fi
+echo -e "${GREEN}版本验证通过！${NC}"
+
+# ----------------------------------------------------------------
+# 3. 系统初始化
+# ----------------------------------------------------------------
+echo -e "${BLUE}>>> [3/9] 初始化系统参数...${NC}"
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-singbox.conf
 sysctl -p /etc/sysctl.d/99-singbox.conf >/dev/null 2>&1
-
-# 获取 SSH 端口
 SSH_PORT=$(grep "^Port" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n 1)
 if [ -z "$SSH_PORT" ]; then SSH_PORT=22; fi
 
@@ -44,41 +93,14 @@ for pkg in curl jq tar; do
         if command -v apt-get >/dev/null; then apt-get update && apt-get install -y $pkg
         elif command -v yum >/dev/null; then yum install -y $pkg
         elif command -v apk >/dev/null; then apk add $pkg
-        else echo -e "${RED}缺依赖: curl jq tar${NC}"; exit 1; fi
+        fi
     fi
 done
 
 # ----------------------------------------------------------------
-# 3. 强制安装 v1.10.1 (黄金稳定版)
+# 4. 下载订阅
 # ----------------------------------------------------------------
-echo -e "${BLUE}>>> [3/8] 下载 Sing-box v1.10.1...${NC}"
-ARCH=$(uname -m)
-case $ARCH in
-    x86_64) SING_ARCH="amd64" ;;
-    aarch64|arm64) SING_ARCH="arm64" ;;
-    *) echo -e "${RED}不支持: $ARCH${NC}"; exit 1 ;;
-esac
-
-# 直接指定下载链接，不走 API，防止被限流或下载到错误版本
-URL="https://github.com/SagerNet/sing-box/releases/download/v1.10.1/sing-box-1.10.1-linux-$SING_ARCH.tar.gz"
-
-curl -L -s -o sing-box.tar.gz "$URL"
-if [ $? -ne 0 ]; then echo -e "${RED}下载失败，请检查网络或 GitHub 连接${NC}"; exit 1; fi
-
-tar -xzf sing-box.tar.gz
-DIR_NAME=$(tar -tf sing-box.tar.gz | head -1 | cut -f1 -d"/")
-cp "$DIR_NAME/sing-box" /usr/local/bin/
-chmod +x /usr/local/bin/sing-box
-rm -rf sing-box.tar.gz "$DIR_NAME"
-
-# 验证版本
-VER=$(/usr/local/bin/sing-box version | head -n 1 | awk '{print $3}')
-echo -e "已安装版本: ${GREEN}$VER${NC}"
-
-# ----------------------------------------------------------------
-# 4. 准备订阅
-# ----------------------------------------------------------------
-echo -e "${BLUE}>>> [4/8] 处理订阅...${NC}"
+echo -e "${BLUE}>>> [4/9] 下载配置...${NC}"
 mkdir -p /etc/sing-box
 CONFIG_FILE="/etc/sing-box/config.json"
 
@@ -98,7 +120,7 @@ if ! jq -e . "$CONFIG_FILE" >/dev/null 2>&1; then echo -e "${RED}无效 JSON${NC
 # ----------------------------------------------------------------
 # 5. 扫描节点
 # ----------------------------------------------------------------
-echo -e "${BLUE}>>> [5/8] 解析节点...${NC}"
+echo -e "${BLUE}>>> [5/9] 解析节点...${NC}"
 jq -r '.outbounds[] | select(.type != "direct" and .type != "block" and .type != "dns" and .type != "selector" and .type != "urltest") | .tag' "$CONFIG_FILE" > /tmp/singbox_tags.txt
 TOTAL_COUNT=$(wc -l < /tmp/singbox_tags.txt)
 if [ "$TOTAL_COUNT" -eq 0 ]; then echo -e "${RED}无节点${NC}"; exit 1; fi
@@ -150,16 +172,10 @@ MATCH_KEY="${REGION_REGEX[$SELECTED_NAME]}"
 echo -e "${GREEN}已选: $SELECTED_NAME${NC}"
 
 # ----------------------------------------------------------------
-# 7. 生成配置 (适配 v1.10.1 语法)
+# 7. 生成配置 (v1.10.1 完美适配)
 # ----------------------------------------------------------------
-echo -e "${BLUE}>>> [7/8] 构造配置 (Fix Loop & DNS)...${NC}"
+echo -e "${BLUE}>>> [7/9] 构造配置...${NC}"
 cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
-
-# 核心配置：
-# 1. DNS: 强制使用 Google UDP (1.1.1.1 可能被 VPS 商家干扰)
-# 2. TUN: auto_route=true 配合 stack=system
-# 3. Route: 使用 action: route (v1.10 标准)
-# 4. UrlTest: interval < idle_timeout
 
 jq -n \
     --slurpfile original "$CONFIG_FILE.bak" \
@@ -223,7 +239,7 @@ jq -n \
 # ----------------------------------------------------------------
 # 8. 启动与验证
 # ----------------------------------------------------------------
-echo -e "${BLUE}>>> [8/8] 启动服务...${NC}"
+echo -e "${BLUE}>>> [8/9] 启动服务...${NC}"
 cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
 Description=sing-box service
@@ -251,8 +267,8 @@ sleep 8
 unset http_proxy https_proxy all_proxy
 
 if systemctl is-active --quiet sing-box; then
-    echo -e "${GREEN}✅ Sing-box 运行中！${NC}"
-    echo -e "正在测试 Google (8秒超时)..."
+    echo -e "${GREEN}✅ 启动成功！${NC}"
+    echo -e "正在测试 Google..."
     RES=$(curl -s -m 8 ipinfo.io)
     
     if [[ $RES == *"ip"* ]]; then
@@ -260,11 +276,9 @@ if systemctl is-active --quiet sing-box; then
         echo "$RES" | grep "ip"
         echo "$RES" | grep "country"
     else
-        echo -e "${RED}⚠️  网络超时。${NC}"
-        echo -e "可能原因：当前所选国家的所有节点都不可用，或者 VPS 防火墙限制。"
-        echo -e "建议：尝试重启脚本，选择 [全球自动选择] 试试。"
+        echo -e "${RED}⚠️  网络超时，建议切换地区重试。${NC}"
     fi
 else
-    echo -e "${RED}❌ 启动失败。日志如下：${NC}"
+    echo -e "${RED}❌ 启动失败。${NC}"
     journalctl -u sing-box -n 20 --no-pager
 fi
