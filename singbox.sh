@@ -1,264 +1,155 @@
 #!/bin/bash
 
-# =================================================================
-# Sing-box 最终完美版 v19
-# 1. 测速地址更换为: https://www.google.com/generate_204
-# 2. 自动过滤 anytls 等不支持的节点
-# 3. 完美兼容 Hysteria2 端口段
-# =================================================================
+# =========================================================
+# Sing-box + WebUI (Metacubexd) 一键全自动安装脚本
+# =========================================================
 
-# 颜色
+# 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
-NC='\033[0m'
+PLAIN='\033[0m'
 
-if [ "$EUID" -ne 0 ]; then echo -e "${RED}必须使用 root 权限${NC}"; exit 1; fi
-
-# ----------------------------------------------------------------
-# 1. 环境清理
-# ----------------------------------------------------------------
-echo -e "${BLUE}>>> [1/9] 清理旧环境...${NC}"
-systemctl stop sing-box >/dev/null 2>&1
-systemctl disable sing-box >/dev/null 2>&1
-killall -9 sing-box >/dev/null 2>&1
-rm -f /usr/local/bin/sing-box /usr/bin/sing-box /bin/sing-box
-echo -e "${GREEN}清理完成。${NC}"
-
-# ----------------------------------------------------------------
-# 2. 安装 v1.11.4
-# ----------------------------------------------------------------
-echo -e "${BLUE}>>> [2/9] 下载 Sing-box v1.11.4...${NC}"
-ARCH=$(uname -m)
-case $ARCH in
-    x86_64) SING_ARCH="amd64" ;;
-    aarch64|arm64) SING_ARCH="arm64" ;;
-    *) echo -e "${RED}不支持: $ARCH${NC}"; exit 1 ;;
-esac
-
-URL="https://github.com/SagerNet/sing-box/releases/download/v1.11.4/sing-box-1.11.4-linux-$SING_ARCH.tar.gz"
-curl -L -s -o sing-box.tar.gz "$URL"
-if [ ! -f "sing-box.tar.gz" ]; then echo -e "${RED}下载失败！${NC}"; exit 1; fi
-
-tar -xzf sing-box.tar.gz
-DIR_NAME=$(tar -tf sing-box.tar.gz | head -1 | cut -f1 -d"/")
-cp "$DIR_NAME/sing-box" /usr/local/bin/sing-box
-chmod +x /usr/local/bin/sing-box
-rm -rf sing-box.tar.gz "$DIR_NAME"
-
-# ----------------------------------------------------------------
-# 3. 系统初始化
-# ----------------------------------------------------------------
-echo -e "${BLUE}>>> [3/9] 初始化系统...${NC}"
-echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-singbox.conf
-sysctl -p /etc/sysctl.d/99-singbox.conf >/dev/null 2>&1
-SSH_PORT=$(grep "^Port" /etc/ssh/sshd_config 2>/dev/null | awk '{print $2}' | head -n 1)
-if [ -z "$SSH_PORT" ]; then SSH_PORT=22; fi
-
-for pkg in curl jq tar; do
-    if ! command -v $pkg >/dev/null; then
-        if command -v apt-get >/dev/null; then apt-get update && apt-get install -y $pkg
-        elif command -v yum >/dev/null; then yum install -y $pkg
-        elif command -v apk >/dev/null; then apk add $pkg
-        fi
-    fi
-done
-
-# ----------------------------------------------------------------
-# 4. 下载订阅
-# ----------------------------------------------------------------
-echo -e "${BLUE}>>> [4/9] 下载订阅...${NC}"
-mkdir -p /etc/sing-box
 CONFIG_FILE="/etc/sing-box/config.json"
+WEBUI_DIR="/etc/sing-box/ui"
+UI_PORT="9090"
 
-SUB_URL=""
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --sub) SUB_URL="$2"; shift 2 ;;
-        *) shift ;;
-    esac
-done
-if [ -z "$SUB_URL" ]; then read -p "请输入订阅链接: " SUB_URL; fi
-if [ -z "$SUB_URL" ]; then echo -e "${RED}链接为空${NC}"; exit 1; fi
+# 检查 Root 权限
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}错误: 请使用 root 用户运行此脚本！${PLAIN}" 
+   exit 1
+fi
 
-curl -L -s -A "Mozilla/5.0" -o "$CONFIG_FILE" "$SUB_URL"
-if ! jq -e . "$CONFIG_FILE" >/dev/null 2>&1; then echo -e "${RED}无效 JSON${NC}"; exit 1; fi
+echo -e "${BLUE}正在初始化环境...${PLAIN}"
 
-# ----------------------------------------------------------------
-# 5. 过滤坏节点
-# ----------------------------------------------------------------
-echo -e "${BLUE}>>> [5/9] 解析并过滤坏节点...${NC}"
-jq -r '.outbounds[] | select(
-    .type != "direct" and 
-    .type != "block" and 
-    .type != "dns" and 
-    .type != "selector" and 
-    .type != "urltest" and 
-    .type != "anytls"
-) | .tag' "$CONFIG_FILE" > /tmp/singbox_tags.txt
+# 1. 安装基础依赖 (curl, wget, tar, unzip, jq)
+# jq 用于处理 JSON 配置文件
+if [ -f /etc/debian_version ]; then
+    apt-get update -y
+    apt-get install -y curl wget tar unzip jq
+elif [ -f /etc/redhat-release ]; then
+    yum install -y curl wget tar unzip jq
+else
+    echo -e "${RED}无法识别的操作系统，脚本仅支持 Debian/Ubuntu 或 CentOS/RHEL${PLAIN}"
+    exit 1
+fi
 
-TOTAL_COUNT=$(wc -l < /tmp/singbox_tags.txt)
-if [ "$TOTAL_COUNT" -eq 0 ]; then echo -e "${RED}无有效节点${NC}"; exit 1; fi
+# 2. 安装 Sing-box
+echo -e "${YELLOW}[1/4] 检查 Sing-box 安装状态...${PLAIN}"
+if ! command -v sing-box &> /dev/null; then
+    echo -e "未检测到 sing-box，正在安装最新正式版..."
+    bash <(curl -fsSL https://sing-box.app/deb-install.sh)
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}Sing-box 安装失败！${PLAIN}"
+        exit 1
+    fi
+    echo -e "${GREEN}Sing-box 安装成功。${PLAIN}"
+else
+    echo -e "${GREEN}Sing-box 已安装，跳过。${PLAIN}"
+fi
 
-# ----------------------------------------------------------------
-# 6. 国家选择
-# ----------------------------------------------------------------
-REGIONS_DB=(
-"中华人民共和国|CH|🇨🇳|China" "香港|HK|🇭🇰|Hong Kong" "台湾|TW|🇹🇼|Taiwan" "澳门|MC|🇲🇴|Macau" "日本|JA|🇯🇵|Japan|JP" "韩国|KS|🇰🇷|Korea|KR" "新加坡|SN|🇸🇬|Singapore|SG" "美国|US|🇺🇸|United States|USA" "英国|UK|🇬🇧|United Kingdom|Britain" "德国|GM|🇩🇪|Germany|DE" "法国|FR|🇫🇷|France" "俄罗斯|RS|🇷🇺|Russia|RU" "加拿大|CA|🇨🇦|Canada" "澳大利亚|AS|🇦🇺|Australia|AU" "印度|IN|🇮🇳|India" "巴西|BR|🇧🇷|Brazil" "阿根廷|AR|🇦🇷|Argentina" "土耳其|TU|🇹🇷|Turkey" "荷兰|NL|🇳🇱|Netherlands" "意大利|IT|🇮🇹|Italy" "西班牙|SP|🇪🇸|Spain" "瑞士|SZ|🇨🇭|Switzerland" "瑞典|SW|🇸🇪|Sweden" "挪威|NO|🇳🇴|Norway" "芬兰|FI|🇫🇮|Finland" "丹麦|DA|🇩🇰|Denmark" "波兰|PL|🇵🇱|Poland" "乌克兰|UP|🇺🇦|Ukraine" "以色列|IS|🇮🇱|Israel" "阿联酋|AE|🇦🇪|UAE" "沙特阿拉伯|SA|🇸🇦|Saudi Arabia" "南非|SF|🇿🇦|South Africa" "埃及|EG|🇪🇬|Egypt" "泰国|TH|🇹🇭|Thailand" "越南|VM|🇻🇳|Vietnam" "印度尼西亚|ID|🇮🇩|Indonesia" "菲律宾|RP|🇵🇭|Philippines" "马来西亚|MY|🇲🇾|Malaysia" "柬埔寨|CB|🇰🇭|Cambodia" "老挝|LA|🇱🇦|Laos" "缅甸|BM|🇲🇲|Myanmar" "巴基斯坦|PK|🇵🇰|Pakistan" "伊朗|IR|🇮🇷|Iran" "伊拉克|IZ|🇮🇶|Iraq" "阿富汗|AF|🇦🇫|Afghanistan" "蒙古国|MG|🇲🇳|Mongolia" "朝鲜|KN|🇰🇵|North Korea" "新西兰|NZ|🇳🇿|New Zealand" "爱尔兰|EI|🇮🇪|Ireland" "奥地利|AU|🇦🇹|Austria" "比利时|BE|🇧🇪|Belgium" "捷克|EZ|🇨🇿|Czech" "匈牙利|HU|🇭🇺|Hungary" "罗马尼亚|RO|🇷🇴|Romania" "保加利亚|BU|🇧🇬|Bulgaria" "希腊|GR|🇬🇷|Greece" "葡萄牙|PO|🇵🇹|Portugal" "塞尔维亚|RI|🇷🇸|Serbia" "克罗地亚|HR|🇭🇷|Croatia" "斯洛伐克|LO|🇸🇰|Slovakia" "斯洛文尼亚|SI|🇸🇮|Slovenia" "冰岛|IC|🇮🇸|Iceland" "爱沙尼亚|EN|🇪🇪|Estonia" "拉脱维亚|LG|🇱🇻|Latvia" "立陶宛|LH|🇱🇹|Lithuania" "白俄罗斯|BO|🇧🇾|Belarus" "哈萨克斯坦|KZ|🇰🇿|Kazakhstan" "乌兹别克斯坦|UZ|🇺🇿|Uzbekistan" "吉尔吉斯斯坦|KG|🇰🇬|Kyrgyzstan" "塔吉克斯坦|TI|🇹🇯|Tajikistan" "土库曼斯坦|TX|🇹🇲|Turkmenistan" "格鲁吉亚|GG|🇬🇪|Georgia" "阿塞拜疆|AJ|🇦🇿|Azerbaijan" "亚美尼亚|AM|🇦🇲|Armenia" "墨西哥|MX|🇲🇽|Mexico" "智利|CI|🇨🇱|Chile" "哥伦比亚|CO|🇨🇴|Colombia" "秘鲁|PE|🇵🇪|Peru" "委内瑞拉|VE|🇻🇪|Venezuela" "古巴|CU|🇨🇺|Cuba" "尼日利亚|NI|🇳🇬|Nigeria" "肯尼亚|KE|🇰🇪|Kenya" "摩洛哥|MO|🇲🇦|Morocco" "阿尔及利亚|AG|🇩🇿|Algeria" "突尼斯|TS|🇹🇳|Tunisia" "利比亚|LY|🇱🇾|Libya" "卡塔尔|QA|🇶🇦|Qatar" "科威特|KU|🇰🇼|Kuwait" "阿曼|MU|🇴🇲|Oman" "也门|YM|🇾🇪|Yemen" "约旦|JO|🇯🇴|Jordan" "黎巴嫩|LE|🇱🇧|Lebanon" "叙利亚|SY|🇸🇾|Syria" "巴勒斯坦|GZ|🇵🇸|Palestine" "塞浦路斯|CY|🇨🇾|Cyprus" "马耳他|MT|🇲🇹|Malta" "卢森堡|LU|🇱🇺|Luxembourg" "摩纳哥|MN|🇲🇨|Monaco" "梵蒂冈|VT|🇻🇦|Vatican" "安道尔|AN|🇦🇩|Andorra" "圣马力诺|SM|🇸🇲|San Marino" "列支敦士登|LS|🇱🇮|Liechtenstein" "摩尔多瓦|MD|🇲🇩|Moldova" "波黑|BK|🇧🇦|Bosnia" "黑山|MJ|🇲🇪|Montenegro" "北马其顿|MK|🇲🇰|North Macedonia" "阿尔巴尼亚|AL|🇦🇱|Albania" "科索沃|KV|🇽🇰|Kosovo" "不丹|BT|🇧🇹|Bhutan" "尼泊尔|NP|🇳🇵|Nepal" "孟加拉国|BG|🇧🇩|Bangladesh" "斯里兰卡|CE|🇱🇰|Sri Lanka" "马尔代夫|MV|🇲🇻|Maldives" "文莱|BX|🇧🇳|Brunei" "东帝汶|TT|🇹🇱|East Timor" "巴布亚新几内亚|PP|🇵🇬|Papua New Guinea" "斐济|FJ|🇫🇯|Fiji" "所罗门群岛|BP|🇸🇧|Solomon" "瓦努阿图|NH|🇻🇺|Vanuatu" "萨摩亚|WS|🇼🇸|Samoa" "汤加|TN|🇹🇴|Tonga" "图瓦卢|TV|🇹🇻|Tuvalu" "基里巴斯|KR|🇰🇮|Kiribati" "瑙鲁|NR|🇳🇷|Nauru" "帕劳|PS|🇵🇼|Palau" "密克罗尼西亚|FM|🇫🇲|Micronesia" "马绍尔群岛|RM|🇲🇭|Marshall" "牙买加|JM|🇯🇲|Jamaica" "海地|HA|🇭🇹|Haiti" "多米尼加|DR|🇩🇴|Dominican" "巴哈马|BF|🇧🇸|Bahamas" "巴巴多斯|BB|🇧🇧|Barbados" "特立尼达和多巴哥|TD|🇹🇹|Trinidad" "哥斯达黎加|CS|🇨🇷|Costa Rica" "巴拿马|PM|🇵🇦|Panama" "危地马拉|GT|🇬🇹|Guatemala" "洪都拉斯|HO|🇭🇳|Honduras" "萨尔瓦多|ES|🇸🇻|El Salvador" "尼加拉瓜|NU|🇳🇮|Nicaragua" "伯利兹|BH|🇧🇿|Belize" "厄瓜多尔|EC|🇪🇨|Ecuador" "玻利维亚|BL|🇧🇴|Bolivia" "巴拉圭|PA|🇵🇾|Paraguay" "乌拉圭|UY|🇺🇾|Uruguay" "圭亚那|GY|🇬🇾|Guyana" "苏里南|NS|🇸🇷|Suriname" "埃塞俄比亚|ET|🇪🇹|Ethiopia" "坦桑尼亚|TZ|🇹🇿|Tanzania" "乌干达|UG|🇺🇬|Uganda" "卢旺达|RW|🇷🇼|Rwanda" "布隆迪|BY|🇧🇮|Burundi" "苏丹|SU|🇸🇩|Sudan" "南苏丹|OD|🇸🇸|South Sudan" "吉布提|DJ|🇩🇯|Djibouti" "索马里|SO|🇸🇴|Somalia" "厄立特里亚|ER|🇪🇷|Eritrea" "马达加斯加|MA|🇲🇬|Madagascar" "毛里求斯|MP|🇲🇺|Mauritius" "塞舌尔|SE|🇸🇨|Seychelles" "科摩罗|CN|🇰🇲|Comoros" "莫桑比克|MZ|🇲🇿|Mozambique" "津巴布韦|ZI|🇿🇼|Zimbabwe" "赞比亚|ZA|🇿🇲|Zambia" "马拉维|MI|🇲🇼|Malawi" "博茨瓦纳|BC|🇧🇼|Botswana" "纳米比亚|WA|🇳🇦|Namibia" "安哥拉|AO|🇦🇴|Angola" "刚果民主共和国|CG|🇨🇩|Congo" "刚果共和国|CF|🇨🇬|Congo" "加蓬|GB|🇬🇦|Gabon" "赤道几内亚|EK|🇬🇶|Equatorial Guinea" "喀麦隆|CM|🇨🇲|Cameroon" "乍得|CD|🇹🇩|Chad" "中非|CT|🇨🇫|Central African" "加纳|GH|🇬🇭|Ghana" "科特迪瓦|IV|🇨🇮|Cote dIvoire" "利比里亚|LI|🇱🇷|Liberia" "塞拉利昂|SL|🇸🇱|Sierra Leone" "几内亚|GV|🇬🇳|Guinea" "几内亚比绍|PU|🇬🇼|Guinea-Bissau" "塞内加尔|SG|🇸🇳|Senegal" "冈比亚|GA|🇬🇲|Gambia" "马里|ML|🇲🇱|Mali" "布基纳法索|UV|🇧🇫|Burkina Faso" "尼日尔|NG|🇳🇪|Niger" "贝宁|BN|🇧🇯|Benin" "多哥|TO|🇹🇬|Togo" "毛里塔尼亚|MR|🇲🇷|Mauritania" "西撒哈拉|WI|🇪🇭|Western Sahara"
+# 3. 下载并部署 WebUI (Metacubexd)
+echo -e "${YELLOW}[2/4] 部署 WebUI 面板 (Metacubexd)...${PLAIN}"
+mkdir -p "$WEBUI_DIR"
+
+# 清理旧文件
+rm -rf "$WEBUI_DIR"/*
+
+echo -e "正在从 GitHub 下载 WebUI 资源..."
+# 使用 gh-pages 分支的 zip 包
+wget -O "$WEBUI_DIR/ui.zip" "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip"
+
+if [ $? -ne 0 ]; then
+    echo -e "${RED}WebUI 下载失败，请检查服务器网络 (GitHub 连接)。${PLAIN}"
+    exit 1
+fi
+
+echo -e "正在解压..."
+unzip -o "$WEBUI_DIR/ui.zip" -d "$WEBUI_DIR" > /dev/null 2>&1
+# 移动子文件夹内容到 ui 根目录
+mv "$WEBUI_DIR/metacubexd-gh-pages"/* "$WEBUI_DIR/"
+rm -rf "$WEBUI_DIR/metacubexd-gh-pages" "$WEBUI_DIR/ui.zip"
+echo -e "${GREEN}WebUI 部署完成，路径: $WEBUI_DIR${PLAIN}"
+
+# 4. 智能配置 Config.json
+echo -e "${YELLOW}[3/4] 配置 Sing-box API 设置...${PLAIN}"
+
+# 如果配置文件不存在，创建一个基础模板
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo -e "未找到配置文件，创建默认配置..."
+    cat > "$CONFIG_FILE" <<EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "::",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+fi
+
+# 使用 jq 工具合并配置，强制开启 Clash API 和 external_ui
+# 下面的命令会读取现有的 config.json，并插入/覆盖 experimental 字段
+echo -e "正在更新配置文件..."
+cp "$CONFIG_FILE" "${CONFIG_FILE}.bak" # 备份原配置
+
+# 定义要注入的 JSON 片段
+API_CONFIG=$(cat <<EOF
+{
+  "clash_api": {
+    "external_controller": "0.0.0.0:$UI_PORT",
+    "external_ui": "$WEBUI_DIR",
+    "secret": "",
+    "default_mode": "rule"
+  }
+}
+EOF
 )
 
-AVAILABLE_REGIONS=()
-declare -A REGION_COUNTS
-declare -A REGION_REGEX
+# 使用 jq 将配置合并 (如果 experimental 不存在则创建，如果存在则合并 clash_api)
+# 逻辑：读取文件 -> 如果没有 experimental 键，添加它 -> 在 experimental 中合并 clash_api -> 写回文件
+jq --argjson api "$API_CONFIG" '.experimental += $api | .experimental.clash_api = $api.clash_api' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
 
-AVAILABLE_REGIONS+=("全球自动选择 (Global Auto)")
-REGION_COUNTS["全球自动选择 (Global Auto)"]=$TOTAL_COUNT
-REGION_REGEX["全球自动选择 (Global Auto)"]=".*"
-
-for item in "${REGIONS_DB[@]}"; do
-    IFS='|' read -r CN_NAME CODE EMOJI EN_KEY <<< "$item"
-    if [ -n "$EN_KEY" ]; then MATCH_STR="($CN_NAME|$CODE|$EMOJI|$EN_KEY)"; else MATCH_STR="($CN_NAME|$CODE|$EMOJI)"; fi
-    COUNT=$(grep -E -i "$MATCH_STR" /tmp/singbox_tags.txt | wc -l)
-    if [ "$COUNT" -gt 0 ]; then
-        DISPLAY_NAME="$EMOJI $CN_NAME ($CODE)"
-        AVAILABLE_REGIONS+=("$DISPLAY_NAME")
-        REGION_COUNTS["$DISPLAY_NAME"]=$COUNT
-        REGION_REGEX["$DISPLAY_NAME"]="$MATCH_STR"
-    fi
-done
-
-echo -e "${GREEN}=====================================${NC}"
-i=0
-for region in "${AVAILABLE_REGIONS[@]}"; do
-    printf " [%-2d] %-35s - %d\n" $i "$region" "${REGION_COUNTS[$region]}"
-    ((i++))
-done
-echo -e "${GREEN}=====================================${NC}"
-read -p "选择: " IDX
-
-if [[ ! "$IDX" =~ ^[0-9]+$ ]] || [ "$IDX" -ge "${#AVAILABLE_REGIONS[@]}" ]; then
-    echo -e "${RED}无效，使用全球自动选择${NC}"
-    SELECTED_NAME="${AVAILABLE_REGIONS[0]}"
+if [ $? -eq 0 ]; then
+    echo -e "${GREEN}配置文件更新成功！(已备份原文件为 config.json.bak)${PLAIN}"
 else
-    SELECTED_NAME="${AVAILABLE_REGIONS[$IDX]}"
+    echo -e "${RED}配置文件更新失败，请检查 json 格式。恢复原文件...${PLAIN}"
+    mv "${CONFIG_FILE}.bak" "$CONFIG_FILE"
+    exit 1
 fi
-MATCH_KEY="${REGION_REGEX[$SELECTED_NAME]}"
-echo -e "${GREEN}已选: $SELECTED_NAME${NC}"
 
-# ----------------------------------------------------------------
-# 7. 生成配置
-# ----------------------------------------------------------------
-echo -e "${BLUE}>>> [7/9] 构造配置...${NC}"
-cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
-
-jq -n \
-    --slurpfile original "$CONFIG_FILE.bak" \
-    --arg match_key "$MATCH_KEY" \
-    --argjson ssh_port "$SSH_PORT" \
-    '{
-    "log": { "level": "info", "timestamp": true },
-    "dns": {
-        "servers": [
-            { "tag": "google", "address": "8.8.8.8", "detour": "direct" },
-            { "tag": "local", "address": "local", "detour": "direct" }
-        ],
-        "rules": [
-            { "outbound": "any", "server": "google" }
-        ],
-        "final": "google"
-    },
-    "inbounds": [
-        {
-            "type": "tun",
-            "tag": "tun-in",
-            "interface_name": "singbox-tun",
-            "inet4_address": ["172.19.0.1/30"],
-            "mtu": 1280,
-            "auto_route": true,
-            "strict_route": false,
-            "stack": "system",
-            "sniff": true
-        }
-    ],
-    "outbounds": (
-        ($original[0].outbounds | map(select(.type != "direct" and .type != "block" and .type != "dns" and .type != "selector" and .type != "urltest"))) as $all_nodes |
-        ($all_nodes | map(select(.type != "anytls"))) as $clean_nodes |
-        ($clean_nodes | map(select(.tag | test($match_key; "i")))) as $selected_nodes |
-        [
-            {
-                "type": "urltest",
-                "tag": "AUTO-SELECT-GROUP",
-                "outbounds": ($selected_nodes | map(.tag)),
-                "url": "https://www.google.com/generate_204",
-                "interval": "300s",
-                "tolerance": 50,
-                "idle_timeout": "1800s"
-            },
-            { "type": "direct", "tag": "direct" },
-            { "type": "block", "tag": "block" },
-            { "type": "dns", "tag": "dns-out" }
-        ] + $selected_nodes
-    ),
-    "route": {
-        "rules": [
-            { "protocol": "dns", "action": "route", "outbound": "dns-out" },
-            { "port": $ssh_port, "action": "route", "outbound": "direct" },
-            { "ip_is_private": true, "action": "route", "outbound": "direct" },
-            { "inbound": "tun-in", "action": "route", "outbound": "AUTO-SELECT-GROUP" }
-        ],
-        "auto_detect_interface": true,
-        "final": "AUTO-SELECT-GROUP"
-    }
-}' > "$CONFIG_FILE"
-
-# ----------------------------------------------------------------
-# 8. 启动
-# ----------------------------------------------------------------
-echo -e "${BLUE}>>> [8/9] 启动服务...${NC}"
-cat > /etc/systemd/system/sing-box.service <<EOF
-[Unit]
-Description=sing-box service
-After=network.target
-
-[Service]
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-Environment="ENABLE_DEPRECATED_TUN_ADDRESS_X=true"
-Environment="ENABLE_DEPRECATED_GEOIP=true"
-Environment="ENABLE_DEPRECATED_GEOSITE=true"
-ExecStart=/usr/local/bin/sing-box run -c $CONFIG_FILE
-Restart=on-failure
-RestartSec=10
-LimitNOFILE=infinity
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
+# 5. 重启服务
+echo -e "${YELLOW}[4/4] 重启 Sing-box 服务...${PLAIN}"
 systemctl daemon-reload
-systemctl enable sing-box >/dev/null 2>&1
+systemctl enable sing-box > /dev/null 2>&1
 systemctl restart sing-box
 
-echo -e "${YELLOW}等待 8 秒...${NC}"
-sleep 8
-
-unset http_proxy https_proxy all_proxy
-
+# 检查服务状态
 if systemctl is-active --quiet sing-box; then
-    echo -e "${GREEN}✅ 启动成功！${NC}"
-    echo -e "正在使用 Google generate_204 进行连通性测试..."
-    
-    # 核心改动：使用 -w %{http_code} 检测 HTTP 状态码是否为 204
-    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "https://www.google.com/generate_204")
-    
-    if [ "$HTTP_CODE" == "204" ]; then
-        echo -e "${GREEN}🎉 网络通畅！(HTTP 204 返回正常)${NC}"
-    else
-        echo -e "${RED}⚠️  连接失败。HTTP状态码: $HTTP_CODE${NC}"
-        echo -e "建议：重新运行脚本，尝试选择具体的国家（如美国或香港）。"
-    fi
+    IP=$(curl -s4 ifconfig.me)
+    echo -e "\n${GREEN}=============================================${PLAIN}"
+    echo -e "${GREEN}          安装与配置全部完成！               ${PLAIN}"
+    echo -e "${GREEN}=============================================${PLAIN}"
+    echo -e "WebUI 访问地址: ${BLUE}http://$IP:$UI_PORT/ui/${PLAIN}"
+    echo -e "API 地址:       ${BLUE}http://$IP:$UI_PORT${PLAIN}"
+    echo -e "配置文件路径:   ${YELLOW}$CONFIG_FILE${PLAIN}"
+    echo -e "UI文件路径:     ${YELLOW}$WEBUI_DIR${PLAIN}"
+    echo -e "${GREEN}=============================================${PLAIN}"
+    echo -e "注意：请确保你的云服务器防火墙已放行 TCP ${RED}$UI_PORT${PLAIN} 端口"
 else
-    echo -e "${RED}❌ 启动失败。${NC}"
-    journalctl -u sing-box -n 20 --no-pager
+    echo -e "${RED}服务启动失败！请使用 'journalctl -u sing-box -e' 查看日志。${PLAIN}"
 fi
