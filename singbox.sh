@@ -26,7 +26,7 @@ if [[ $EUID -ne 0 ]]; then
    exit 1
 fi
 
-# 停止旧服务并清理旧的环境变量（防止冲突）
+# 停止旧服务并清理环境
 systemctl stop sing-box >/dev/null 2>&1
 unset http_proxy https_proxy all_proxy
 sed -i '/singbox_proxy.sh/d' ~/.bashrc
@@ -35,13 +35,12 @@ rm -f /etc/profile.d/singbox_proxy.sh
 clear
 echo -e "${BLUE}#############################################################${PLAIN}"
 echo -e "${BLUE}#                                                           #${PLAIN}"
-echo -e "${BLUE}#   Sing-box TUN 全局接管版 (强制所有流量走代理)            #${PLAIN}"
+echo -e "${BLUE}#   Sing-box TUN 完美版 (全局接管 + 智能节点筛选)           #${PLAIN}"
 echo -e "${BLUE}#                                                           #${PLAIN}"
 echo -e "${BLUE}#############################################################${PLAIN}"
 echo -e ""
 
 echo -e "${GREEN}步骤 1/5: 初始化环境...${PLAIN}"
-
 # 开启 IP 转发（TUN 模式必须）
 echo "net.ipv4.ip_forward=1" > /etc/sysctl.d/99-singbox.conf
 echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.d/99-singbox.conf
@@ -61,17 +60,12 @@ if [[ ! -e /dev/net/tun ]]; then
     mknod /dev/net/tun c 10 200
     chmod 600 /dev/net/tun
 fi
-
 if [[ ! -c /dev/net/tun ]]; then
-    echo -e "${RED}严重警告：系统未检测到 TUN 设备！TUN 模式可能无法启动。${PLAIN}"
-    echo -e "${YELLOW}如果你是 LXC/OpenVZ VPS，请在控制面板开启 TUN/TAP 功能。${PLAIN}"
-    read -p "按回车继续尝试，或 Ctrl+C 退出..."
+    echo -e "${RED}警告：未检测到 TUN 设备，脚本尝试继续，但可能失败。${PLAIN}"
 fi
 
-echo -e ""
-
 # ==========================================
-# 2. 用户交互
+# 2. 用户交互与节点筛选 (恢复菜单功能)
 # ==========================================
 if [[ -n "$1" ]]; then
     SUB_URL="$1"
@@ -92,7 +86,7 @@ else
     wget --no-check-certificate -q -O /tmp/singbox_raw.json "$SUB_URL"
     
     if [[ -s /tmp/singbox_raw.json ]] && jq -e '.outbounds' /tmp/singbox_raw.json >/dev/null 2>&1; then
-        echo -e "${GREEN}格式正确，准备配置。${PLAIN}"
+        echo -e "${GREEN}格式正确，准备解析...${PLAIN}"
         cp /tmp/singbox_raw.json /tmp/singbox_pre.json
         USE_CONVERSION=false
     else
@@ -101,18 +95,52 @@ else
         PRE_API="https://api.v1.mk/sub?target=sing-box&url=${ENCODED_URL}&insert=false&config=https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Json/config.json"
         wget --no-check-certificate -q -O /tmp/singbox_pre.json "$PRE_API"
     fi
-    
-    # 简单的节点筛选逻辑 (简化版，直接问是否全选)
+
+    # === 恢复：智能国家筛选菜单 ===
     NODE_TAGS=$(jq -r '.outbounds[] | select(.type | test("Selector|URLTest|Direct|Block") | not) | .tag' /tmp/singbox_pre.json)
+    
+    REGION_DATA=(
+"阿富汗 (AF)|🇦🇫|AF|Afghanistan|阿富汗" "阿尔巴尼亚 (AL)|🇦🇱|AL|Albania|阿尔巴尼亚" "阿尔及利亚 (AG)|🇩🇿|AG|Algeria|阿尔及利亚" "安道尔 (AN)|🇦🇩|AN|Andorra|安道尔" "安哥拉 (AO)|🇦🇴|AO|Angola|安哥拉" "阿根廷 (AR)|🇦🇷|AR|Argentina|阿根廷" "澳大利亚 (AS)|🇦🇺|AS|Australia|澳大利亚" "奥地利 (AU)|🇦🇹|AU|Austria|奥地利" "阿塞拜疆 (AJ)|🇦🇿|AJ|Azerbaijan|阿塞拜疆" "巴哈马 (BF)|🇧🇸|BF|Bahamas|巴哈马" "巴林 (BA)|🇧🇭|BA|Bahrain|巴林" "孟加拉国 (BG)|🇧🇩|BG|Bangladesh|孟加拉" "白俄罗斯 (BO)|🇧🇾|BO|Belarus|白俄罗斯" "比利时 (BE)|🇧🇪|BE|Belgium|比利时" "伯利兹 (BH)|🇧🇿|BH|Belize|伯利兹" "玻利维亚 (BL)|🇧🇴|BL|Bolivia|玻利维亚" "波黑 (BK)|🇧🇦|BK|Bosnia|波黑" "巴西 (BR)|🇧🇷|BR|Brazil|巴西" "文莱 (BX)|🇧🇳|BX|Brunei|文莱" "保加利亚 (BU)|🇧🇬|BU|Bulgaria|保加利亚" "柬埔寨 (CB)|🇰🇭|CB|Cambodia|柬埔寨" "加拿大 (CA)|🇨🇦|CA|Canada|加拿大" "智利 (CI)|🇨🇱|CI|Chile|智利" "中国 (CN)|🇨🇳|CN|China|中国|回国" "哥伦比亚 (CO)|🇨🇴|CO|Colombia|哥伦比亚" "刚果 (CG)|🇨🇬|CG|Congo|刚果" "哥斯达黎加 (CS)|🇨🇷|CS|Costa Rica|哥斯达黎加" "克罗地亚 (HR)|🇭🇷|HR|Croatia|克罗地亚" "古巴 (CU)|🇨🇺|CU|Cuba|古巴" "塞浦路斯 (CY)|🇨🇾|CY|Cyprus|塞浦路斯" "捷克 (EZ)|🇨🇿|EZ|Czech|捷克" "丹麦 (DA)|🇩🇰|DA|Denmark|丹麦" "厄瓜多尔 (EC)|🇪🇨|EC|Ecuador|厄瓜多尔" "埃及 (EG)|🇪🇬|EG|Egypt|埃及" "爱沙尼亚 (EN)|🇪🇪|EN|Estonia|爱沙尼亚" "芬兰 (FI)|🇫🇮|FI|Finland|芬兰" "法国 (FR)|🇫🇷|FR|France|法国" "格鲁吉亚 (GG)|🇬🇪|GG|Georgia|格鲁吉亚" "德国 (DE)|🇩🇪|DE|Germany|德国" "加纳 (GH)|🇬🇭|GH|Ghana|加纳" "希腊 (GR)|🇬🇷|GR|Greece|希腊" "危地马拉 (GT)|🇬🇹|GT|Guatemala|危地马拉" "海地 (HA)|🇭🇹|HA|Haiti|海地" "洪都拉斯 (HO)|🇭🇳|HO|Honduras|洪都拉斯" "香港 (HK)|🇭🇰|HK|Hong Kong|HongKong|香港" "匈牙利 (HU)|🇭🇺|HU|Hungary|匈牙利" "冰岛 (IC)|🇮🇸|IC|Iceland|冰岛" "印度 (IN)|🇮🇳|IN|India|印度" "印度尼西亚 (ID)|🇮🇩|ID|Indonesia|印尼|印度尼西亚" "伊朗 (IR)|🇮🇷|IR|Iran|伊朗" "伊拉克 (IZ)|🇮🇶|IZ|Iraq|伊拉克" "爱尔兰 (EI)|🇮🇪|EI|Ireland|爱尔兰" "以色列 (IS)|🇮🇱|IS|Israel|以色列" "意大利 (IT)|🇮🇹|IT|Italy|意大利" "牙买加 (JM)|🇯🇲|JM|Jamaica|牙买加" "日本 (JP)|🇯🇵|JP|Japan|日本" "约旦 (JO)|🇯🇴|JO|Jordan|约旦" "哈萨克斯坦 (KZ)|🇰🇿|KZ|Kazakhstan|哈萨克斯坦" "肯尼亚 (KE)|🇰🇪|KE|Kenya|肯尼亚" "韩国 (KR)|🇰🇷|KR|South Korea|Korea|韩国" "科威特 (KU)|🇰🇼|KU|Kuwait|科威特" "吉尔吉斯斯坦 (KG)|🇰🇬|KG|Kyrgyzstan|吉尔吉斯" "老挝 (LA)|🇱🇦|LA|Laos|老挝" "拉脱维亚 (LG)|🇱🇻|LG|Latvia|拉脱维亚" "黎巴嫩 (LE)|🇱🇧|LE|Lebanon|黎巴嫩" "立陶宛 (LH)|🇱🇹|LH|Lithuania|立陶宛" "卢森堡 (LU)|🇱🇺|LU|Luxembourg|卢森堡" "澳门 (MC)|🇲🇴|MC|Macao|Macau|澳门" "北马其顿 (MK)|🇲🇰|MK|Macedonia|北马其顿" "马来西亚 (MY)|🇲🇾|MY|Malaysia|马来西亚" "马耳他 (MT)|🇲🇹|MT|Malta|马耳他" "墨西哥 (MX)|🇲🇽|MX|Mexico|墨西哥" "摩尔多瓦 (MD)|🇲🇩|MD|Moldova|摩尔多瓦" "摩纳哥 (MN)|🇲🇨|MN|Monaco|摩纳哥" "蒙古 (MG)|🇲🇳|MG|Mongolia|蒙古" "黑山 (MJ)|🇲🇪|MJ|Montenegro|黑山" "摩洛哥 (MO)|🇲🇦|MO|Morocco|摩洛哥" "尼泊尔 (NP)|🇳🇵|NP|Nepal|尼泊尔" "荷兰 (NL)|🇳🇱|NL|Netherlands|Holland|荷兰" "新西兰 (NZ)|🇳🇿|NZ|New Zealand|新西兰" "尼日利亚 (NI)|🇳🇬|NI|Nigeria|尼日利亚" "挪威 (NO)|🇳🇴|NO|Norway|挪威" "阿曼 (MU)|🇴🇲|MU|Oman|阿曼" "巴基斯坦 (PK)|🇵🇰|PK|Pakistan|巴基斯坦" "巴拿马 (PM)|🇵🇦|PM|Panama|巴拿马" "巴拉圭 (PA)|🇵🇾|PA|Paraguay|巴拉圭" "秘鲁 (PE)|🇵🇪|PE|Peru|秘鲁" "菲律宾 (RP)|🇵🇭|RP|Philippines|菲律宾" "波兰 (PL)|🇵🇱|PL|Poland|波兰" "葡萄牙 (PO)|🇵🇹|PO|Portugal|葡萄牙" "卡塔尔 (QA)|🇶🇦|QA|Qatar|卡塔尔" "罗马尼亚 (RO)|🇷🇴|RO|Romania|罗马尼亚" "台湾 (TW)|🇹🇼|TW|Taiwan|TaiWan|台湾" "俄罗斯 (RS)|🇷🇺|RS|Russia|俄罗斯" "沙特阿拉伯 (SA)|🇸🇦|SA|Saudi Arabia|沙特" "塞尔维亚 (RI)|🇷🇸|RI|Serbia|塞尔维亚" "新加坡 (SG)|🇸🇬|SG|Singapore|新加坡" "斯洛伐克 (LO)|🇸🇰|LO|Slovakia|斯洛伐克" "斯洛文尼亚 (SI)|🇸🇮|SI|Slovenia|斯洛文尼亚" "南非 (SF)|🇿🇦|SF|South Africa|南非" "西班牙 (SP)|🇪🇸|SP|Spain|西班牙" "斯里兰卡 (CE)|🇱🇰|CE|Sri Lanka|斯里兰卡" "瑞典 (SW)|🇸🇪|SW|Sweden|瑞典" "瑞士 (SZ)|🇨🇭|SZ|Switzerland|瑞士" "叙利亚 (SY)|🇸🇾|SY|Syria|叙利亚" "塔吉克斯坦 (TI)|🇹🇯|TI|Tajikistan|塔吉克斯坦" "泰国 (TH)|🇹🇭|TH|Thailand|泰国" "突尼斯 (TS)|🇹🇳|TS|Tunisia|突尼斯" "土耳其 (TU)|🇹🇷|TU|Turkey|土耳其" "土库曼斯坦 (TX)|🇹🇲|TX|Turkmenistan|土库曼斯坦" "乌克兰 (UP)|🇺🇦|UP|Ukraine|乌克兰" "阿联酋 (AE)|🇦🇪|AE|United Arab Emirates|UAE|阿联酋" "英国 (UK)|🇬🇧|UK|United Kingdom|Britain|英国" "美国 (US)|🇺🇸|US|United States|USA|America|美国" "乌拉圭 (UY)|🇺🇾|UY|Uruguay|乌拉圭" "乌兹别克斯坦 (UZ)|🇺🇿|UZ|Uzbekistan|乌兹别克斯坦" "委内瑞拉 (VE)|🇻🇪|VE|Venezuela|委内瑞拉" "越南 (VM)|🇻🇳|VM|Vietnam|越南"
+    )
+
+    FOUND_REGEXS=()
+    FOUND_NAMES=()
+    
     echo -e "----------------------------------------"
-    echo -e "${YELLOW}是否要过滤特定国家节点？(y/n)${PLAIN}"
-    read -p "默认保留所有 (n): " FILTER_YN
-    if [[ "$FILTER_YN" == "y" ]]; then
-        read -p "请输入要保留的国家关键词 (如 UK, US, HK): " KEYWORD
-        if [[ -n "$KEYWORD" ]]; then
-            FINAL_REGEX="$KEYWORD"
-            echo -e "${GREEN}已设置过滤关键词: $FINAL_REGEX${PLAIN}"
+    echo -e "${GREEN}检测到以下地区的节点：${PLAIN}"
+    idx=1
+    for item in "${REGION_DATA[@]}"; do
+        NAME="${item%%|*}"
+        KEYWORDS="${item#*|}"
+        COUNT=$(echo "$NODE_TAGS" | grep -Ei "$KEYWORDS" | wc -l)
+        if [[ $COUNT -gt 0 ]]; then
+            echo -e "${GREEN}[$idx]${PLAIN} $NAME - ${YELLOW}$COUNT${PLAIN} 个节点"
+            FOUND_REGEXS+=("$KEYWORDS")
+            FOUND_NAMES+=("$NAME")
+            ((idx++))
         fi
+    done
+    echo -e "----------------------------------------"
+    echo -e "${GREEN}[0]${PLAIN} 保留所有节点 (默认)"
+    echo -e ""
+    
+    echo -e "${YELLOW}请输入要保留的地区编号 (例如 1 3，空格分隔)，或输入 0 全选:${PLAIN}"
+    read -p "选择: " USER_CHOICE
+
+    if [[ -n "$USER_CHOICE" && "$USER_CHOICE" != "0" ]]; then
+        REGEX_PARTS=()
+        SELECTED_NAMES=""
+        for i in $USER_CHOICE; do
+            REAL_IDX=$((i-1))
+            if [[ -n "${FOUND_REGEXS[$REAL_IDX]}" ]]; then
+                REGEX_PARTS+=("(${FOUND_REGEXS[$REAL_IDX]})")
+                SELECTED_NAMES+="${FOUND_NAMES[$REAL_IDX]} "
+            fi
+        done
+        FINAL_REGEX=$(IFS="|"; echo "${REGEX_PARTS[*]}")
+        echo -e "${GREEN}已设定持久化过滤：$SELECTED_NAMES${PLAIN}"
+    else
+        echo -e "${GREEN}保留所有节点。${PLAIN}"
     fi
 fi
 
@@ -198,7 +226,6 @@ update_subscription() {
     fi
     
     # === 关键：TUN 全局配置 ===
-    # 包含 DNS劫持、Auto Route 和 TUN Inbound
     TUN_CONFIG='{
       "log": {
         "level": "info",
@@ -265,7 +292,6 @@ update_subscription() {
     }'
     
     if [[ -s /tmp/singbox_new.json ]] && jq . /tmp/singbox_new.json >/dev/null 2>&1; then
-        # 清理旧的 dns, inbounds, route, experimental 字段，使用 TUN 模板覆盖
         jq 'del(.dns, .inbounds, .route, .experimental, .log)' /tmp/singbox_new.json > /tmp/singbox_clean.json
         jq -s '.[0] * .[1]' /tmp/singbox_clean.json <(echo "\$TUN_CONFIG") > /tmp/singbox_merged.json
         
@@ -347,7 +373,6 @@ if systemctl is-active --quiet sing-box; then
     echo -e "${GREEN}状态:           Sing-box (TUN模式) 正在运行 ${PLAIN}"
     # 测试
     echo -e "正在测试全局流量接管情况..."
-    # 此时无需 proxy 参数，直接 curl 应该变 IP
     IP_INFO=$(curl -s --max-time 5 ip.sb) 
     if [[ -n "$IP_INFO" ]]; then
          echo -e "${GREEN}当前公网IP:     $IP_INFO (如果不是本机IP，说明全局成功！)${PLAIN}"
