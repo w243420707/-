@@ -29,23 +29,25 @@ urlencode() {
     python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "$1"
 }
 
-# 清理 iptables 规则的函数
+# 彻底清理旧规则
 flush_iptables() {
     ip rule del fwmark 1 lookup 100 2>/dev/null
     ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
     
+    # 清理所有相关的链
+    iptables -t mangle -D OUTPUT -j SINGBOX_OUTPUT 2>/dev/null
+    iptables -t mangle -F SINGBOX_OUTPUT 2>/dev/null
+    iptables -t mangle -X SINGBOX_OUTPUT 2>/dev/null
+    
+    # 清理可能残留的 PREROUTING (旧脚本留下的)
     iptables -t mangle -D PREROUTING -j SINGBOX_TPROXY 2>/dev/null
-    iptables -t mangle -D OUTPUT -j SINGBOX_DIVERT 2>/dev/null
     iptables -t mangle -F SINGBOX_TPROXY 2>/dev/null
     iptables -t mangle -X SINGBOX_TPROXY 2>/dev/null
-    iptables -t mangle -F SINGBOX_DIVERT 2>/dev/null
-    iptables -t mangle -X SINGBOX_DIVERT 2>/dev/null
 }
 
 uninstall_singbox() {
     echo -e "${YELLOW}正在清理网络规则...${PLAIN}"
     flush_iptables
-    
     echo -e "${YELLOW}停止服务...${PLAIN}"
     systemctl stop sing-box >/dev/null 2>&1
     systemctl disable sing-box >/dev/null 2>&1
@@ -54,19 +56,16 @@ uninstall_singbox() {
     rm -rf /etc/sing-box
     rm -f /etc/systemd/system/sing-box.service
     rm -f "$LOG_FILE"
-    
     systemctl daemon-reload
-    echo -e "${GREEN}✅ 卸载完成，TProxy 规则已清除。${PLAIN}"
+    echo -e "${GREEN}✅ 卸载完成。${PLAIN}"
 }
 
 install_singbox() {
-    # 1. 检查内核模块 (关键步骤)
-    echo -e "${GREEN}步骤 1/6: 检查 TProxy 依赖...${PLAIN}"
+    # 1. 检查内核模块
+    echo -e "${GREEN}步骤 1/7: 检查 TProxy 依赖...${PLAIN}"
     if ! modprobe xt_TPROXY >/dev/null 2>&1; then
         echo -e "${RED}警告: 无法加载 xt_TPROXY 模块！${PLAIN}"
-        echo -e "${YELLOW}如果这一步失败，说明你的 VPS 内核不支持 TProxy，建议换回 ProxyChains 方案。${PLAIN}"
-        read -p "是否强制继续? (y/n): " force_c
-        if [[ "$force_c" != "y" ]]; then return; fi
+        return
     else
         echo -e "${GREEN}内核模块检查通过。${PLAIN}"
     fi
@@ -89,7 +88,7 @@ install_singbox() {
     fi
     if [[ -z "$SUB_URL" ]]; then echo -e "${RED}链接为空！${PLAIN}"; return; fi
 
-    echo -e "${GREEN}下载订阅...${PLAIN}"
+    echo -e "${GREEN}下载并解析订阅...${PLAIN}"
     wget --no-check-certificate -q -O /tmp/singbox_raw.json "$SUB_URL"
     if [[ -s /tmp/singbox_raw.json ]] && jq -e '.outbounds' /tmp/singbox_raw.json >/dev/null 2>&1; then
         cp /tmp/singbox_raw.json /tmp/singbox_pre.json
@@ -102,8 +101,41 @@ install_singbox() {
         USE_CONVERSION=true
     fi
 
-    # 4. 安装 Sing-box
-    echo -e "${GREEN}步骤 2/6: 部署 Sing-box...${PLAIN}"
+    # 4. 地区筛选逻辑
+    NODE_TAGS=$(jq -r '.outbounds[] | select(.type | test("Selector|URLTest|Direct|Block") | not) | .tag' /tmp/singbox_pre.json)
+    REGION_DATA=(
+"阿富汗 (AF)|🇦🇫|AF|Afghanistan|阿富汗" "阿尔巴尼亚 (AL)|🇦🇱|AL|Albania|阿尔巴尼亚" "阿尔及利亚 (AG)|🇩🇿|AG|Algeria|阿尔及利亚" "安道尔 (AN)|🇦🇩|AN|Andorra|安道尔" "安哥拉 (AO)|🇦🇴|AO|Angola|安哥拉" "阿根廷 (AR)|🇦🇷|AR|Argentina|阿根廷" "澳大利亚 (AS)|🇦🇺|AS|Australia|澳大利亚" "奥地利 (AU)|🇦🇹|AU|Austria|奥地利" "阿塞拜疆 (AJ)|🇦🇿|AJ|Azerbaijan|阿塞拜疆" "巴哈马 (BF)|🇧🇸|BF|Bahamas|巴哈马" "巴林 (BA)|🇧🇭|BA|Bahrain|巴林" "孟加拉国 (BG)|🇧🇩|BG|Bangladesh|孟加拉" "白俄罗斯 (BO)|🇧🇾|BO|Belarus|白俄罗斯" "比利时 (BE)|🇧🇪|BE|Belgium|比利时" "伯利兹 (BH)|🇧🇿|BH|Belize|伯利兹" "玻利维亚 (BL)|🇧🇴|BL|Bolivia|玻利维亚" "波黑 (BK)|🇧🇦|BK|Bosnia|波黑" "巴西 (BR)|🇧🇷|BR|Brazil|巴西" "文莱 (BX)|🇧🇳|BX|Brunei|文莱" "保加利亚 (BU)|🇧🇬|BU|Bulgaria|保加利亚" "柬埔寨 (CB)|🇰🇭|CB|Cambodia|柬埔寨" "加拿大 (CA)|🇨🇦|CA|Canada|加拿大" "智利 (CI)|🇨🇱|CI|Chile|智利" "中国 (CN)|🇨🇳|CN|China|中国|回国" "哥伦比亚 (CO)|🇨🇴|CO|Colombia|哥伦比亚" "刚果 (CG)|🇨🇬|CG|Congo|刚果" "哥斯达黎加 (CS)|🇨🇷|CS|Costa Rica|哥斯达黎加" "克罗地亚 (HR)|🇭🇷|HR|Croatia|克罗地亚" "古巴 (CU)|🇨🇺|CU|Cuba|古巴" "塞浦路斯 (CY)|🇨🇾|CY|Cyprus|塞浦路斯" "捷克 (EZ)|🇨🇿|EZ|Czech|捷克" "丹麦 (DA)|🇩🇰|DA|Denmark|丹麦" "厄瓜多尔 (EC)|🇪🇨|EC|Ecuador|厄瓜多尔" "埃及 (EG)|🇪🇬|EG|Egypt|埃及" "爱沙尼亚 (EN)|🇪🇪|EN|Estonia|爱沙尼亚" "芬兰 (FI)|🇫🇮|FI|Finland|芬兰" "法国 (FR)|🇫🇷|FR|France|法国" "格鲁吉亚 (GG)|🇬🇪|GG|Georgia|格鲁吉亚" "德国 (DE)|🇩🇪|DE|Germany|德国" "加纳 (GH)|🇬🇭|GH|Ghana|加纳" "希腊 (GR)|🇬🇷|GR|Greece|希腊" "危地马拉 (GT)|🇬🇹|GT|Guatemala|危地马拉" "海地 (HA)|🇭🇹|HA|Haiti|海地" "洪都拉斯 (HO)|🇭🇳|HO|Honduras|洪都拉斯" "香港 (HK)|🇭🇰|HK|Hong Kong|HongKong|香港" "匈牙利 (HU)|🇭🇺|HU|Hungary|匈牙利" "冰岛 (IC)|🇮🇸|IC|Iceland|冰岛" "印度 (IN)|🇮🇳|IN|India|印度" "印度尼西亚 (ID)|🇮🇩|ID|Indonesia|印尼|印度尼西亚" "伊朗 (IR)|🇮🇷|IR|Iran|伊朗" "伊拉克 (IZ)|🇮🇶|IZ|Iraq|伊拉克" "爱尔兰 (EI)|🇮🇪|EI|Ireland|爱尔兰" "以色列 (IS)|🇮🇱|IS|Israel|以色列" "意大利 (IT)|🇮🇹|IT|Italy|意大利" "牙买加 (JM)|🇯🇲|JM|Jamaica|牙买加" "日本 (JP)|🇯🇵|JP|Japan|日本" "约旦 (JO)|🇯🇴|JO|Jordan|约旦" "哈萨克斯坦 (KZ)|🇰🇿|KZ|Kazakhstan|哈萨克斯坦" "肯尼亚 (KE)|🇰🇪|KE|Kenya|肯尼亚" "韩国 (KR)|🇰🇷|KR|South Korea|Korea|韩国" "科威特 (KU)|🇰🇼|KU|Kuwait|科威特" "吉尔吉斯斯坦 (KG)|🇰🇬|KG|Kyrgyzstan|吉尔吉斯" "老挝 (LA)|🇱🇦|LA|Laos|老挝" "拉脱维亚 (LG)|🇱🇻|LG|Latvia|拉脱维亚" "黎巴嫩 (LE)|🇱🇧|LE|Lebanon|黎巴嫩" "立陶宛 (LH)|🇱🇹|LH|Lithuania|立陶宛" "卢森堡 (LU)|🇱🇺|LU|Luxembourg|卢森堡" "澳门 (MC)|🇲🇴|MC|Macao|Macau|澳门" "北马其顿 (MK)|🇲🇰|MK|Macedonia|北马其顿" "马来西亚 (MY)|🇲🇾|MY|Malaysia|马来西亚" "马耳他 (MT)|🇲🇹|MT|Malta|马耳他" "墨西哥 (MX)|🇲🇽|MX|Mexico|墨西哥" "摩尔多瓦 (MD)|🇲🇩|MD|Moldova|摩尔多瓦" "摩纳哥 (MN)|🇲🇨|MN|Monaco|摩纳哥" "蒙古 (MG)|🇲🇳|MG|Mongolia|蒙古" "黑山 (MJ)|🇲🇪|MJ|Montenegro|黑山" "摩洛哥 (MO)|🇲🇦|MO|Morocco|摩洛哥" "尼泊尔 (NP)|🇳🇵|NP|Nepal|尼泊尔" "荷兰 (NL)|🇳🇱|NL|Netherlands|Holland|荷兰" "新西兰 (NZ)|🇳🇿|NZ|New Zealand|新西兰" "尼日利亚 (NI)|🇳🇬|NI|Nigeria|尼日利亚" "挪威 (NO)|🇳🇴|NO|Norway|挪威" "阿曼 (MU)|🇴🇲|MU|Oman|阿曼" "巴基斯坦 (PK)|🇵🇰|PK|Pakistan|巴基斯坦" "巴拿马 (PM)|🇵🇦|PM|Panama|巴拿马" "巴拉圭 (PA)|🇵🇾|PA|Paraguay|巴拉圭" "秘鲁 (PE)|🇵🇪|PE|Peru|秘鲁" "菲律宾 (RP)|🇵🇭|RP|Philippines|菲律宾" "波兰 (PL)|🇵🇱|PL|Poland|波兰" "葡萄牙 (PO)|🇵🇹|PO|Portugal|葡萄牙" "卡塔尔 (QA)|🇶🇦|QA|Qatar|卡塔尔" "罗马尼亚 (RO)|🇷🇴|RO|Romania|罗马尼亚" "台湾 (TW)|🇹🇼|TW|Taiwan|TaiWan|台湾" "俄罗斯 (RS)|🇷🇺|RS|Russia|俄罗斯" "沙特阿拉伯 (SA)|🇸🇦|SA|Saudi Arabia|沙特" "塞尔维亚 (RI)|🇷🇸|RI|Serbia|塞尔维亚" "新加坡 (SG)|🇸🇬|SG|Singapore|新加坡" "斯洛伐克 (LO)|🇸🇰|LO|Slovakia|斯洛伐克" "斯洛文尼亚 (SI)|🇸🇮|SI|Slovenia|斯洛文尼亚" "南非 (SF)|🇿🇦|SF|South Africa|南非" "西班牙 (SP)|🇪🇸|SP|Spain|西班牙" "斯里兰卡 (CE)|🇱🇰|CE|Sri Lanka|斯里兰卡" "瑞典 (SW)|🇸🇪|SW|Sweden|瑞典" "瑞士 (SZ)|🇨🇭|SZ|Switzerland|瑞士" "叙利亚 (SY)|🇸🇾|SY|Syria|叙利亚" "塔吉克斯坦 (TI)|🇹🇯|TI|Tajikistan|塔吉克斯坦" "泰国 (TH)|🇹🇭|TH|Thailand|泰国" "突尼斯 (TS)|🇹🇳|TS|Tunisia|突尼斯" "土耳其 (TU)|🇹🇷|TU|Turkey|土耳其" "土库曼斯坦 (TX)|🇹🇲|TX|Turkmenistan|土库曼斯坦" "乌克兰 (UP)|🇺🇦|UP|Ukraine|乌克兰" "阿联酋 (AE)|🇦🇪|AE|United Arab Emirates|UAE|阿联酋" "英国 (UK)|🇬🇧|UK|United Kingdom|Britain|英国" "美国 (US)|🇺🇸|US|United States|USA|America|美国" "乌拉圭 (UY)|🇺🇾|UY|Uruguay|乌拉圭" "乌兹别克斯坦 (UZ)|🇺🇿|UZ|Uzbekistan|乌兹别克斯坦" "委内瑞拉 (VE)|🇻🇪|VE|Venezuela|委内瑞拉" "越南 (VM)|🇻🇳|VM|Vietnam|越南"
+    )
+    FOUND_REGEXS=()
+    echo -e "----------------------------------------"
+    echo -e "${GREEN}检测到以下地区的节点：${PLAIN}"
+    idx=1
+    for item in "${REGION_DATA[@]}"; do
+        NAME="${item%%|*}"
+        KEYWORDS="${item#*|}"
+        if echo "$NODE_TAGS" | grep -Eqi "$KEYWORDS"; then
+            COUNT=$(echo "$NODE_TAGS" | grep -Ei "$KEYWORDS" | wc -l)
+            echo -e "${GREEN}[$idx]${PLAIN} $NAME - ${YELLOW}$COUNT${PLAIN} 个节点"
+            FOUND_REGEXS+=("$KEYWORDS")
+            ((idx++))
+        fi
+    done
+    echo -e "----------------------------------------"
+    echo -e "${GREEN}[0]${PLAIN} 保留所有节点 (默认)"
+    echo -e ""
+    read -p "选择: " USER_CHOICE
+    FINAL_REGEX=""
+    if [[ -n "$USER_CHOICE" && "$USER_CHOICE" != "0" ]]; then
+        REGEX_PARTS=()
+        for i in $USER_CHOICE; do
+            REAL_IDX=$((i-1))
+            if [[ -n "${FOUND_REGEXS[$REAL_IDX]}" ]]; then REGEX_PARTS+=("(${FOUND_REGEXS[$REAL_IDX]})"); fi
+        done
+        FINAL_REGEX=$(IFS="|"; echo "${REGEX_PARTS[*]}")
+    fi
+
+    # 5. 安装 Sing-box
+    echo -e "${GREEN}步骤 3/7: 部署 Sing-box...${PLAIN}"
     ARCH=$(uname -m)
     case $ARCH in
         x86_64) singbox_arch="amd64" ;;
@@ -118,7 +150,6 @@ install_singbox() {
     rm -rf sing-box*
     mkdir -p /etc/sing-box
     
-    # WebUI
     WEBUI_DIR="/etc/sing-box/ui"
     mkdir -p "$WEBUI_DIR"
     wget -q -O webui.zip https://github.com/MetaCubeX/Yacd-meta/archive/gh-pages.zip
@@ -126,81 +157,78 @@ install_singbox() {
     mv Yacd-meta-gh-pages/* "$WEBUI_DIR"
     rm -rf Yacd-meta-gh-pages webui.zip
 
-    # 5. 生成 Monitor 脚本 (含 iptables 逻辑)
-    echo -e "${GREEN}步骤 3/6: 配置 TProxy 规则脚本...${PLAIN}"
+    # 6. 生成 Monitor 脚本
+    echo -e "${GREEN}步骤 4/7: 配置安全防火墙规则...${PLAIN}"
     cat > "$MONITOR_SCRIPT" <<EOF
 #!/bin/bash
 SUB_URL="$SUB_URL"
+FILTER_REGEX="$FINAL_REGEX"
 CONFIG_FILE="$CONFIG_FILE"
 LOG_FILE="$LOG_FILE"
 USE_CONVERSION=$USE_CONVERSION
 TPROXY_PORT=$TPROXY_PORT
 
-# 设置 iptables 规则 (核心逻辑)
 set_iptables() {
-    # 1. 清理旧规则
+    # 1. 彻底清理旧规则 (确保不重复)
     ip rule del fwmark 1 lookup 100 2>/dev/null
     ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null
-    iptables -t mangle -F SINGBOX_TPROXY 2>/dev/null
-    iptables -t mangle -X SINGBOX_TPROXY 2>/dev/null
-    iptables -t mangle -F SINGBOX_DIVERT 2>/dev/null
-    iptables -t mangle -X SINGBOX_DIVERT 2>/dev/null
+    iptables -t mangle -D OUTPUT -j SINGBOX_OUTPUT 2>/dev/null
+    iptables -t mangle -F SINGBOX_OUTPUT 2>/dev/null
+    iptables -t mangle -X SINGBOX_OUTPUT 2>/dev/null
+    # 删除入站劫持 (如果有)
+    iptables -t mangle -D PREROUTING -j SINGBOX_TPROXY 2>/dev/null
 
-    # 2. 策略路由
+    # 2. 建立策略路由 (让打标流量查表100)
     ip rule add fwmark 1 lookup 100
     ip route add local 0.0.0.0/0 dev lo table 100
 
-    # 3. 创建 DIVERT 链 (防止环路)
-    iptables -t mangle -N SINGBOX_DIVERT
-    iptables -t mangle -A SINGBOX_DIVERT -j MARK --set-mark 1
-    iptables -t mangle -A SINGBOX_DIVERT -j ACCEPT
+    # 3. 创建出口劫持链 SINGBOX_OUTPUT
+    iptables -t mangle -N SINGBOX_OUTPUT
+    
+    # === 关键保护规则 (防止SSH断连) ===
+    # 凡是源端口是 22 的流量 (VPS回应你的SSH包)，直接放行，不走代理！
+    iptables -t mangle -A SINGBOX_OUTPUT -p tcp --sport 22 -j RETURN
+    
+    # === 放行局域网和私有IP ===
+    iptables -t mangle -A SINGBOX_OUTPUT -d 0.0.0.0/8 -j RETURN
+    iptables -t mangle -A SINGBOX_OUTPUT -d 10.0.0.0/8 -j RETURN
+    iptables -t mangle -A SINGBOX_OUTPUT -d 127.0.0.0/8 -j RETURN
+    iptables -t mangle -A SINGBOX_OUTPUT -d 169.254.0.0/16 -j RETURN
+    iptables -t mangle -A SINGBOX_OUTPUT -d 172.16.0.0/12 -j RETURN
+    iptables -t mangle -A SINGBOX_OUTPUT -d 192.168.0.0/16 -j RETURN
+    iptables -t mangle -A SINGBOX_OUTPUT -d 224.0.0.0/4 -j RETURN
+    iptables -t mangle -A SINGBOX_OUTPUT -d 240.0.0.0/4 -j RETURN
 
-    # 4. 创建 TPROXY 链 (入站劫持)
-    iptables -t mangle -N SINGBOX_TPROXY
-    # 绕过保留地址
-    iptables -t mangle -A SINGBOX_TPROXY -d 0.0.0.0/8 -j RETURN
-    iptables -t mangle -A SINGBOX_TPROXY -d 10.0.0.0/8 -j RETURN
-    iptables -t mangle -A SINGBOX_TPROXY -d 127.0.0.0/8 -j RETURN
-    iptables -t mangle -A SINGBOX_TPROXY -d 169.254.0.0/16 -j RETURN
-    iptables -t mangle -A SINGBOX_TPROXY -d 172.16.0.0/12 -j RETURN
-    iptables -t mangle -A SINGBOX_TPROXY -d 192.168.0.0/16 -j RETURN
-    iptables -t mangle -A SINGBOX_TPROXY -d 224.0.0.0/4 -j RETURN
-    iptables -t mangle -A SINGBOX_TPROXY -d 240.0.0.0/4 -j RETURN
-    # 劫持 TCP/UDP 到 TProxy 端口
-    iptables -t mangle -A SINGBOX_TPROXY -p tcp -j TPROXY --on-port \$TPROXY_PORT --tproxy-mark 1
-    iptables -t mangle -A SINGBOX_TPROXY -p udp -j TPROXY --on-port \$TPROXY_PORT --tproxy-mark 1
+    # === 劫持剩余所有 TCP/UDP 流量 ===
+    # 给所有流量打上 Mark 1 -> 进 table 100 -> 进 TProxy
+    iptables -t mangle -A SINGBOX_OUTPUT -p tcp -j MARK --set-mark 1
+    iptables -t mangle -A SINGBOX_OUTPUT -p udp -j MARK --set-mark 1
 
-    # 5. 应用规则
-    # PREROUTING: 处理进入本机的流量 (如果本机当网关用)
-    iptables -t mangle -A PREROUTING -j SINGBOX_TPROXY
-    # OUTPUT: 处理本机发出的流量
-    iptables -t mangle -A OUTPUT -j SINGBOX_DIVERT
-}
-
-check_proxy() {
-    # 检测国内网是否通 (用百度) 
-    if curl -s --max-time 3 https://www.baidu.com >/dev/null; then
-        # 如果百度通，再测谷歌 (看代理通不通)
-        if curl -s --max-time 5 https://www.google.com/generate_204 >/dev/null; then return 0; fi
-    fi
-    # 如果都不通，或者只有百度通谷歌不通，返回失败
-    return 1
+    # 4. 挂载到 OUTPUT 链 (只代理本机发出的流量)
+    iptables -t mangle -A OUTPUT -j SINGBOX_OUTPUT
 }
 
 update_subscription() {
-    # 暂时清空规则以防无法下载
-    iptables -t mangle -F SINGBOX_TPROXY 2>/dev/null
-    iptables -t mangle -F SINGBOX_DIVERT 2>/dev/null
+    # 暂时清空 OUTPUT 规则，防止下载订阅本身被代理卡死
+    iptables -t mangle -F SINGBOX_OUTPUT 2>/dev/null
     
     if [[ "\$USE_CONVERSION" == "false" ]]; then
         wget --no-check-certificate -q -O /tmp/singbox_new.json "\$SUB_URL"
+        if [[ -n "\$FILTER_REGEX" ]] && [[ -s /tmp/singbox_new.json ]]; then
+             jq --arg re "\$FILTER_REGEX" '.outbounds |= map(select((.type | test("Selector|URLTest|Direct|Block"; "i")) or (.tag | test(\$re; "i"))))' /tmp/singbox_new.json > /tmp/singbox_filtered.json
+             mv /tmp/singbox_filtered.json /tmp/singbox_new.json
+        fi
     else
         ENCODED_URL=\$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "\$SUB_URL")
-        API_URL="https://api.v1.mk/sub?target=sing-box&url=\${ENCODED_URL}&insert=false&config=https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Json/config.json"
+        INCLUDE_PARAM=""
+        if [[ -n "\$FILTER_REGEX" ]]; then
+            ENCODED_REGEX=\$(python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "\$FILTER_REGEX")
+            INCLUDE_PARAM="&include=\${ENCODED_REGEX}"
+        fi
+        API_URL="https://api.v1.mk/sub?target=sing-box&url=\${ENCODED_URL}&insert=false&config=https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Json/config.json\${INCLUDE_PARAM}"
         wget -q -O /tmp/singbox_new.json "\$API_URL"
     fi
     
-    # TProxy 专用配置
     TPROXY_CONFIG='{
       "log": { "level": "info", "timestamp": true },
       "inbounds": [
@@ -252,8 +280,8 @@ EOF
     crontab /tmp/cron_bk
     rm /tmp/cron_bk
 
-    # 6. 服务文件
-    echo -e "${GREEN}步骤 4/6: 注册服务...${PLAIN}"
+    # 7. 服务文件
+    echo -e "${GREEN}步骤 5/7: 注册服务...${PLAIN}"
     cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
 Description=sing-box
@@ -270,24 +298,24 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
 
-    echo -e "${GREEN}步骤 5/6: 启动 TProxy 服务...${PLAIN}"
+    echo -e "${GREEN}步骤 6/7: 启动服务...${PLAIN}"
     bash "$MONITOR_SCRIPT" force
     
     echo -e ""
     if systemctl is-active --quiet sing-box; then
-        echo -e "${GREEN}✅ Sing-box TProxy 模式运行中！${PLAIN}"
+        echo -e "${GREEN}✅ 安全启动！(仅代理出口，SSH 已保护)${PLAIN}"
         echo -e "WebUI: http://$(curl -s4m5 ip.sb):9090/ui/"
-        echo -e "${YELLOW}正在测试连通性...${PLAIN}"
+        echo -e "${YELLOW}连通性测试 (Google):${PLAIN}"
         curl -I https://www.google.com/generate_204
     else
-        echo -e "${RED}❌ 启动失败。请检查系统是否支持 xt_TPROXY 模块。${PLAIN}"
+        echo -e "${RED}❌ 启动失败。${PLAIN}"
     fi
 }
 
 # 菜单
 clear
-echo -e "${BLUE}Sing-box TProxy 透明代理安装脚本${PLAIN}"
-echo -e "1. ${GREEN}安装 (TProxy 全局代理)${PLAIN}"
+echo -e "${BLUE}Sing-box 出口流量代理脚本 (SSH保护版)${PLAIN}"
+echo -e "1. ${GREEN}安装 / 更新${PLAIN}"
 echo -e "2. ${RED}卸载${PLAIN}"
 echo -e "0. 退出"
 read -p "选择: " choice
