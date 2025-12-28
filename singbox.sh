@@ -12,6 +12,7 @@ PLAIN='\033[0m'
 MONITOR_SCRIPT="/etc/sing-box/monitor.sh"
 CONFIG_FILE="/etc/sing-box/config.json"
 LOG_FILE="/var/log/singbox_monitor.log"
+PROXY_PROFILE="/etc/profile.d/singbox_proxy.sh"
 
 # URL编码函数
 urlencode() {
@@ -19,26 +20,25 @@ urlencode() {
 }
 
 # ==========================================
-# 1. Root 检查与环境准备
+# 1. Root 检查
 # ==========================================
 if [[ $EUID -ne 0 ]]; then
    echo -e "${RED}错误: 必须使用 root 用户运行此脚本！${PLAIN}"
    exit 1
 fi
 
-# 停止旧服务，防止干扰
+# 停止旧服务
 systemctl stop sing-box >/dev/null 2>&1
 
 clear
 echo -e "${BLUE}#############################################################${PLAIN}"
 echo -e "${BLUE}#                                                           #${PLAIN}"
-echo -e "${BLUE}#   Sing-box 修复版 (纯 Mixed 模式 + 环境变量代理)          #${PLAIN}"
+echo -e "${BLUE}#   Sing-box 终极版 (自动重载 Shell - 立即生效)             #${PLAIN}"
 echo -e "${BLUE}#                                                           #${PLAIN}"
 echo -e "${BLUE}#############################################################${PLAIN}"
 echo -e ""
 
 echo -e "${GREEN}步骤 1/5: 初始化环境与同步时间...${PLAIN}"
-# 强制同步时间，防止节点连接失败
 if [ -f /etc/debian_version ]; then
     apt-get update -y >/dev/null 2>&1
     apt-get install -y curl wget tar unzip jq python3 cron ntpdate >/dev/null 2>&1
@@ -47,7 +47,6 @@ elif [ -f /etc/redhat-release ]; then
 fi
 ntpdate pool.ntp.org >/dev/null 2>&1
 echo -e "${GREEN}系统时间已校准。${PLAIN}"
-
 echo -e ""
 
 # ==========================================
@@ -72,7 +71,6 @@ else
     
     wget --no-check-certificate -q -O /tmp/singbox_raw.json "$SUB_URL"
     
-    # 简单的格式检查
     if [[ -s /tmp/singbox_raw.json ]] && jq -e '.outbounds' /tmp/singbox_raw.json >/dev/null 2>&1; then
         echo -e "${GREEN}检测到链接已经是 Sing-box 格式，跳过第三方转换。${PLAIN}"
         cp /tmp/singbox_raw.json /tmp/singbox_pre.json
@@ -171,7 +169,7 @@ mv Yacd-meta-gh-pages/* "$WEBUI_DIR"
 rm -rf Yacd-meta-gh-pages webui.zip
 
 # ==========================================
-# 5. 生成 Monitor 脚本 (纯 Mixed 模式)
+# 5. 生成 Monitor 脚本 (修正版)
 # ==========================================
 echo -e "${GREEN}步骤 4/5: 生成自动化脚本...${PLAIN}"
 
@@ -183,6 +181,7 @@ SUB_URL="$SUB_URL"
 FILTER_REGEX="$FINAL_REGEX"
 CONFIG_FILE="$CONFIG_FILE"
 LOG_FILE="$LOG_FILE"
+PROXY_PROFILE="$PROXY_PROFILE"
 PROXY_PORT=2080
 MAX_RETRIES=3
 USE_CONVERSION=$USE_CONVERSION
@@ -190,24 +189,25 @@ USE_CONVERSION=$USE_CONVERSION
 timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
 urlencode() { python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "\$1"; }
 
-# 核心：设置全局环境变量（替代 TUN）
+# 核心：设置全局环境变量
 enable_proxy_env() {
-    export http_proxy="http://127.0.0.1:\$PROXY_PORT"
-    export https_proxy="http://127.0.0.1:\$PROXY_PORT"
-    export all_proxy="socks5://127.0.0.1:\$PROXY_PORT"
-    # 写入到 profile 让其他 session 也生效 (可选)
-    echo "export http_proxy=\"http://127.0.0.1:\$PROXY_PORT\"" > /etc/profile.d/singbox_proxy.sh
-    echo "export https_proxy=\"http://127.0.0.1:\$PROXY_PORT\"" >> /etc/profile.d/singbox_proxy.sh
-    echo "export all_proxy=\"socks5://127.0.0.1:\$PROXY_PORT\"" >> /etc/profile.d/singbox_proxy.sh
+    # 只修改 profile.d
+    echo "export http_proxy=\"http://127.0.0.1:\$PROXY_PORT\"" > "\$PROXY_PROFILE"
+    echo "export https_proxy=\"http://127.0.0.1:\$PROXY_PORT\"" >> "\$PROXY_PROFILE"
+    echo "export all_proxy=\"socks5://127.0.0.1:\$PROXY_PORT\"" >> "\$PROXY_PROFILE"
+    
+    # 确保 bashrc 加载
+    if ! grep -q "singbox_proxy.sh" ~/.bashrc; then
+        echo "[ -f \$PROXY_PROFILE ] && source \$PROXY_PROFILE" >> ~/.bashrc
+    fi
 }
 
 disable_proxy_env() {
-    unset http_proxy https_proxy all_proxy
-    rm -f /etc/profile.d/singbox_proxy.sh
+    rm -f "\$PROXY_PROFILE"
+    sed -i '/singbox_proxy.sh/d' ~/.bashrc
 }
 
 check_proxy() {
-    # 明确指定使用 localhost 的代理端口进行测试
     http_code=\$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 --proxy http://127.0.0.1:\$PROXY_PORT https://www.google.com/generate_204)
     if [[ "\$http_code" == "204" ]]; then return 0; else return 1; fi
 }
@@ -215,7 +215,7 @@ check_proxy() {
 update_subscription() {
     echo "\$(timestamp) - 停止服务，准备更新..." >> "\$LOG_FILE"
     systemctl stop sing-box
-    disable_proxy_env # 关闭代理环境，确保 wget 走直连
+    disable_proxy_env 
     
     if [[ "\$USE_CONVERSION" == "false" ]]; then
         wget --no-check-certificate -q -O /tmp/singbox_new.json "\$SUB_URL"
@@ -344,12 +344,21 @@ if systemctl is-active --quiet sing-box; then
     HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 --proxy http://127.0.0.1:2080 https://www.google.com/generate_204)
     if [[ "$HTTP_CODE" == "204" ]]; then
          echo -e "${GREEN}连接测试:       成功 (204)${PLAIN}"
-         echo -e "全局代理:       通过环境变量设置 (http_proxy)"
+         echo -e "WebUI:          http://$(curl -s4m5 ip.sb):9090/ui/"
+         echo -e "${GREEN}=========================================${PLAIN}"
+         echo -e ""
+         echo -e "${YELLOW}>>> 正在自动加载代理环境，请稍候... <<<${PLAIN}"
+         echo -e "${YELLOW}>>> 你的 Shell 将自动刷新，代理即将生效！ <<<${PLAIN}"
+         
+         # === 终极魔法：替换当前 Shell 为加载了 Profile 的 Login Shell ===
+         # 这会让环境变量立即对用户可见，无需手动 source
+         sleep 2
+         exec bash -l
     else
          echo -e "${RED}连接测试:       失败 (请检查节点是否有效)${PLAIN}"
+         echo -e "${GREEN}=========================================${PLAIN}"
     fi
 else
     echo -e "${RED}状态:           Sing-box 未启动 (可能无可用节点)${PLAIN}"
+    echo -e "${GREEN}=========================================${PLAIN}"
 fi
-echo -e "WebUI:          http://$(curl -s4m5 ip.sb):9090/ui/"
-echo -e "${GREEN}=========================================${PLAIN}"
