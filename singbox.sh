@@ -1,11 +1,8 @@
 #!/bin/bash
 
 # =================================================================
-# Sing-box 终极完整版
-# 特性：
-# 1. 完整全球国家库 (Emoji + 200+地区)
-# 2. DNS 防污染/防抢答修复 (DoH)
-# 3. 端口代理模式 (2080)
+# Sing-box 终极完整版 (CLI支持 + 全球库 + DoH修复)
+# 用法: bash singbox.sh --sub "你的订阅链接"
 # =================================================================
 
 # 颜色定义
@@ -15,21 +12,37 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# ==========================================
+# 1. 命令行参数解析 (修复点)
+# ==========================================
+SUB_URL=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --sub)
+            SUB_URL="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
 # 检查权限
 if [ "$EUID" -ne 0 ]; then echo -e "${RED}请使用 root 权限运行 (sudo su)${NC}"; exit 1; fi
 
 echo -e "${BLUE}==============================================${NC}"
-echo -e "${BLUE}   Sing-box 完整版安装 (含 DNS 修复)          ${NC}"
+echo -e "${BLUE}   Sing-box 全能安装脚本                      ${NC}"
 echo -e "${BLUE}==============================================${NC}"
 
-# 1. 依赖安装
+# 2. 依赖安装
 echo -e "${BLUE}>>> [1/7] 检查依赖...${NC}"
 if command -v apt-get >/dev/null; then apt-get update -q && apt-get install -y -q curl jq tar
 elif command -v yum >/dev/null; then yum install -y -q curl jq tar
 elif command -v apk >/dev/null; then apk add -q curl jq tar
 else echo -e "${RED}未知系统，请手动安装 curl jq tar${NC}"; exit 1; fi
 
-# 2. 架构识别
+# 3. 架构识别
 echo -e "${BLUE}>>> [2/7] 识别架构...${NC}"
 ARCH=$(uname -m)
 case $ARCH in
@@ -39,7 +52,7 @@ case $ARCH in
     *) echo -e "${RED}不支持: $ARCH${NC}"; exit 1 ;;
 esac
 
-# 3. 安装 Sing-box
+# 4. 安装 Sing-box
 echo -e "${BLUE}>>> [3/7] 安装 Sing-box...${NC}"
 API_URL="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
 DOWNLOAD_URL=$(curl -s "$API_URL" | jq -r ".assets[] | select(.name | contains(\"linux-$SING_ARCH\")) | select(.name | contains(\".tar.gz\")) | .browser_download_url" | head -n 1)
@@ -55,22 +68,26 @@ cp "$DIR_NAME/sing-box" /usr/local/bin/
 chmod +x /usr/local/bin/sing-box
 rm -rf sing-box.tar.gz "$DIR_NAME"
 
-# 4. 下载订阅
+# 5. 下载订阅
 echo -e "${BLUE}>>> [4/7] 下载订阅配置...${NC}"
 CONFIG_DIR="/etc/sing-box"
 mkdir -p "$CONFIG_DIR"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 
-read -p "请输入订阅链接: " SUB_URL
+# 如果命令行没给参数，则交互式询问
+if [ -z "$SUB_URL" ]; then 
+    read -p "请输入订阅链接: " SUB_URL
+fi
+
 if [ -z "$SUB_URL" ]; then echo -e "${RED}链接为空${NC}"; exit 1; fi
 
-echo -e "正在下载配置..."
+echo -e "正在下载配置: $SUB_URL"
 curl -L -A "Mozilla/5.0" -o "$CONFIG_FILE" "$SUB_URL"
 if ! jq -e . "$CONFIG_FILE" >/dev/null 2>&1; then
     echo -e "${RED}下载失败或非 JSON 格式。${NC}"; exit 1
 fi
 
-# 5. 智能识别 (完整库)
+# 6. 智能识别 (完整库)
 echo -e "${BLUE}>>> [5/7] 正在扫描全量节点库...${NC}"
 
 # 提取所有实际可用节点
@@ -112,7 +129,7 @@ for item in "${REGIONS_DB[@]}"; do
     fi
 done
 
-# 6. 用户选择菜单
+# 7. 用户选择菜单
 echo -e "${GREEN}==============================================${NC}"
 echo -e "${GREEN}      检测到以下地区节点 (Total: $TOTAL_NODES_COUNT)${NC}"
 echo -e "${GREEN}==============================================${NC}"
@@ -125,7 +142,6 @@ done
 
 echo -e "${YELLOW}------------------------------------------------${NC}"
 echo -e "${YELLOW}请选择一个选项 (输入数字):${NC}"
-echo -e "${YELLOW}说明：已内置 DNS 修复，解决节点无法连接问题${NC}"
 
 read -p "选择: " SELECT_INDEX
 
@@ -136,17 +152,12 @@ if [[ "$SELECT_INDEX" =~ ^[0-9]+$ ]] && [ "$SELECT_INDEX" -lt "${#AVAILABLE_REGI
     echo -e "${GREEN}你选择了: $SELECTED_REGION_NAME${NC}"
     echo -e "${BLUE}正在重构配置 (应用 DNS 修复 + 强制 2080 端口)...${NC}"
     
-    # 7. 重构配置文件 (应用所有修复)
-    
-    # 7.1 提取选中节点
+    # 8. 重构配置文件 (应用所有修复)
     FILTERED_TAGS_JSON=$(echo "$RAW_TAGS" | grep -E -i "$MATCH_KEY" | jq -R . | jq -s .)
     
     cp "$CONFIG_FILE" "$CONFIG_FILE.bak"
     
-    # 7.2 核心重构逻辑：
-    # - 注入 DoH DNS (https://1.1.1.1/dns-query) 解决 UDP 53 问题
-    # - 强制入站 mixed 2080
-    # - 强制路由所有流量到 Auto Group
+    # DoH DNS 注入 + Mixed Port 2080 + Auto Route
     jq -n \
         --argjson original_outbounds "$(jq '.outbounds' $CONFIG_FILE.bak)" \
         --argjson selected_tags "$FILTERED_TAGS_JSON" \
@@ -199,7 +210,7 @@ else
     echo -e "${RED}无效选择，退出脚本。${NC}"; exit 1
 fi
 
-# 8. 启动服务
+# 9. 启动服务
 echo -e "${BLUE}>>> [7/7] 启动 Sing-box...${NC}"
 cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
@@ -229,7 +240,7 @@ sleep 3
 if systemctl is-active --quiet sing-box; then
     echo -e "${GREEN}启动成功！${NC}"
     echo -e "==================================================="
-    echo -e " Sing-box 运行中 (DoH DNS 已启用)"
+    echo -e " Sing-box 运行中"
     echo -e " 监听端口: ${YELLOW}2080${NC}"
     echo -e "---------------------------------------------------"
     echo -e "测试命令:"
@@ -247,7 +258,7 @@ if systemctl is-active --quiet sing-box; then
         echo -e "${GREEN}🎉 恭喜！网络通了！${NC}"
         echo "$RESULT"
     else
-        echo -e "${RED}⚠️  注意：自动测试响应较慢，但服务已启动。请手动尝试。${NC}"
+        echo -e "${RED}⚠️  自动测试超时，请手动尝试。${NC}"
     fi
 else
     echo -e "${RED}启动失败${NC}"; journalctl -u sing-box -n 20 --no-pager
