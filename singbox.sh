@@ -13,7 +13,7 @@ MONITOR_SCRIPT="/etc/sing-box/monitor.sh"
 CONFIG_FILE="/etc/sing-box/config.json"
 LOG_FILE="/var/log/singbox_monitor.log"
 
-# URL编码函数 (处理 Emoji 和特殊字符)
+# URL编码函数 (保留，用于需要转换的情况)
 urlencode() {
     python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1]))" "$1"
 }
@@ -29,13 +29,13 @@ fi
 clear
 echo -e "${BLUE}#############################################################${PLAIN}"
 echo -e "${BLUE}#                                                           #${PLAIN}"
-echo -e "${BLUE}#   Sing-box 旗舰版 (Emoji优先匹配 + 200地区支持 + 自动优选)#${PLAIN}"
+echo -e "${BLUE}#   Sing-box 旗舰修复版 (智能直连 + Emoji优先 + 自动优选)   #${PLAIN}"
 echo -e "${BLUE}#                                                           #${PLAIN}"
 echo -e "${BLUE}#############################################################${PLAIN}"
 echo -e ""
 
 # ==========================================
-# 2. 用户交互：订阅与地区
+# 2. 用户交互与订阅智能处理
 # ==========================================
 echo -e "${GREEN}步骤 1/5: 初始化环境...${PLAIN}"
 if [ -f /etc/debian_version ]; then
@@ -54,27 +54,43 @@ echo -e "${YELLOW}请输入你的节点订阅链接:${PLAIN}"
 read -p "链接: " SUB_URL
 
 FINAL_REGEX=""
+USE_CONVERSION=true # 默认假设需要转换
 
 if [[ -z "$SUB_URL" ]]; then
     echo -e "${RED}未输入链接，脚本无法继续。${PLAIN}"
     exit 1
 else
-    echo -e "${GREEN}正在下载并分析订阅节点 (Emoji 优先匹配模式)...${PLAIN}"
-    ENCODED_URL=$(urlencode "$SUB_URL")
-    # 预下载用于分析
-    PRE_API="https://api.v1.mk/sub?target=sing-box&url=${ENCODED_URL}&insert=false&config=https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Json/config.json"
-    wget -q -O /tmp/singbox_pre.json "$PRE_API"
+    echo -e "${GREEN}正在尝试直接下载订阅...${PLAIN}"
     
+    # 1. 尝试直接下载到临时文件
+    wget --no-check-certificate -q -O /tmp/singbox_raw.json "$SUB_URL"
+    
+    # 2. 检查是否为合法的 JSON 且包含 outbounds
+    if [[ -s /tmp/singbox_raw.json ]] && jq -e '.outbounds' /tmp/singbox_raw.json >/dev/null 2>&1; then
+        echo -e "${GREEN}检测到链接已经是 Sing-box 格式，跳过第三方转换。${PLAIN}"
+        cp /tmp/singbox_raw.json /tmp/singbox_pre.json
+        USE_CONVERSION=false
+    else
+        echo -e "${YELLOW}原始链接不是标准配置，尝试使用 API 转换...${PLAIN}"
+        ENCODED_URL=$(urlencode "$SUB_URL")
+        PRE_API="https://api.v1.mk/sub?target=sing-box&url=${ENCODED_URL}&insert=false&config=https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Json/config.json"
+        wget --no-check-certificate -q -O /tmp/singbox_pre.json "$PRE_API"
+    fi
+    
+    # 3. 最终检查
     if [[ ! -s /tmp/singbox_pre.json ]]; then
-        echo -e "${RED}订阅无法解析或下载失败，请检查链接是否正确。${PLAIN}"; exit 1
+        echo -e "${RED}严重错误：无法解析订阅。原因可能是：${PLAIN}"
+        echo -e "1. 订阅链接无法被服务器访问 (如内网IP)。"
+        echo -e "2. 订阅内容为空或格式不支持。"
+        echo -e "3. API 转换服务暂时不可用。"
+        exit 1
     fi
 
     # 提取节点 Tag
     NODE_TAGS=$(jq -r '.outbounds[] | select(.type | test("Selector|URLTest|Direct|Block") | not) | .tag' /tmp/singbox_pre.json)
     
     # ==============================================================================
-    # 完整地区数据库 (格式: 显示名称 | 匹配正则)
-    # 匹配优先级: Emoji > 代码 > 中文名 > 英文名
+    # 完整地区数据库 (Emoji 优先)
     # ==============================================================================
     REGION_DATA=(
 "阿富汗 (AF)|🇦🇫|AF|Afghanistan|阿富汗"
@@ -306,11 +322,7 @@ else
     idx=1
     for item in "${REGION_DATA[@]}"; do
         NAME="${item%%|*}"
-        # 提取 | 之后的所有内容作为正则
-        # 这里的正则顺序已经是: Emoji | 代码 | 英文 | 中文
         KEYWORDS="${item#*|}"
-        
-        # 统计数量 (使用 -E 支持扩展正则)
         COUNT=$(echo "$NODE_TAGS" | grep -Ei "$KEYWORDS" | wc -l)
         if [[ $COUNT -gt 0 ]]; then
             echo -e "${GREEN}[$idx]${PLAIN} $NAME - ${YELLOW}$COUNT${PLAIN} 个节点"
@@ -385,7 +397,7 @@ echo -e "${GREEN}步骤 4/5: 生成自动化脚本 (Watchdog)...${PLAIN}"
 # 生成 monitor.sh
 cat > "$MONITOR_SCRIPT" <<EOF
 #!/bin/bash
-# Sing-box Watchdog - 旗舰版 (Emoji适配)
+# Sing-box Watchdog - 旗舰修复版
 
 SUB_URL="$SUB_URL"
 FILTER_REGEX="$FINAL_REGEX"
@@ -394,6 +406,7 @@ WEBUI_DIR="$WEBUI_DIR"
 LOG_FILE="$LOG_FILE"
 PROXY_PORT=2080
 MAX_RETRIES=3
+USE_CONVERSION=$USE_CONVERSION
 
 timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
 
@@ -409,16 +422,21 @@ check_proxy() {
 update_subscription() {
     echo "\$(timestamp) - 开始更新订阅..." >> "\$LOG_FILE"
     
-    ENCODED_URL=\$(urlencode "\$SUB_URL")
-    INCLUDE_PARAM=""
-    if [[ -n "\$FILTER_REGEX" ]]; then
-        ENCODED_REGEX=\$(urlencode "\$FILTER_REGEX")
-        INCLUDE_PARAM="&include=\${ENCODED_REGEX}"
+    # 智能下载逻辑
+    if [[ "\$USE_CONVERSION" == "false" ]]; then
+        # 直连模式
+        wget --no-check-certificate -q -O /tmp/singbox_new.json "\$SUB_URL"
+    else
+        # 转换模式
+        ENCODED_URL=\$(urlencode "\$SUB_URL")
+        INCLUDE_PARAM=""
+        if [[ -n "\$FILTER_REGEX" ]]; then
+            ENCODED_REGEX=\$(urlencode "\$FILTER_REGEX")
+            INCLUDE_PARAM="&include=\${ENCODED_REGEX}"
+        fi
+        API_URL="https://api.v1.mk/sub?target=sing-box&url=\${ENCODED_URL}&insert=false&config=https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Json/config.json\${INCLUDE_PARAM}"
+        wget -q -O /tmp/singbox_new.json "\$API_URL"
     fi
-    
-    # 1. 下载新配置
-    API_URL="https://api.v1.mk/sub?target=sing-box&url=\${ENCODED_URL}&insert=false&config=https://raw.githubusercontent.com/ACL4SSR/ACL4SSR/master/Json/config.json\${INCLUDE_PARAM}"
-    wget -q -O /tmp/singbox_new.json "\$API_URL"
     
     # 2. 定义 WebUI 基础配置
     WEBUI_CONFIG='{
@@ -440,17 +458,22 @@ update_subscription() {
         jq -s '.[0] * .[1]' /tmp/singbox_new.json <(echo "\$WEBUI_CONFIG") > /tmp/singbox_merged.json
         
         # 4. 强制修改默认策略 (锁定 Auto 组)
+        # 适配 ACL4SSR 模板的 "Proxy" 和普通配置的第一个 selector
         AUTO_TAG=\$(jq -r '.outbounds[] | select(.type=="urltest") | .tag' /tmp/singbox_merged.json | head -n 1)
         
         if [[ -n "\$AUTO_TAG" ]]; then
+             # 尝试修改名为 Proxy 的 selector，如果没有则修改第一个 selector
              jq --arg auto_tag "\$AUTO_TAG" '
-                (.outbounds[] | select(.tag=="Proxy" and .type=="selector")).default = \$auto_tag
+                (
+                  (.outbounds[] | select(.tag=="Proxy" and .type=="selector").default) // 
+                  (.outbounds[] | select(.type=="selector").default)
+                ) = \$auto_tag
              ' /tmp/singbox_merged.json > "\$CONFIG_FILE"
              
              echo "\$(timestamp) - 强制锁定默认策略为: \$AUTO_TAG" >> "\$LOG_FILE"
         else
              mv /tmp/singbox_merged.json "\$CONFIG_FILE"
-             echo "\$(timestamp) - 警告: 未找到 UrlTest 组，无法强制锁定。" >> "\$LOG_FILE"
+             echo "\$(timestamp) - 警告: 未找到 UrlTest 组，无法强制锁定，使用默认配置。" >> "\$LOG_FILE"
         fi
         
         systemctl restart sing-box
@@ -546,9 +569,8 @@ echo -e "WebUI 面板:     ${BLUE}http://${IPV4}:9090/ui/${PLAIN}"
 echo -e "混合代理端口:   ${YELLOW}2080${PLAIN}"
 echo -e "监控日志:       ${YELLOW}$LOG_FILE${PLAIN}"
 echo -e "-----------------------------------------"
-echo -e "功能确认:"
-echo -e "1. [Emoji优先] 🇺🇸 优先于 US 优先于 '美国'。"
-echo -e "2. [全球覆盖]  已加载 200+ 地区识别库。"
-echo -e "3. [全自动]    默认策略已锁定为 '⚡️ 自动选择'。"
-echo -e "4. [自愈合]    每分钟巡检，断连自动换新。"
+echo -e "核心修复点:"
+echo -e "1. [直连模式] 检测到你的订阅是内网/IP格式，已自动跳过转换。"
+echo -e "2. [Emoji优先] 🇺🇸 优先于 US 优先于 '美国'。"
+echo -e "3. [全自动]    默认策略已锁定为 '自动选择'。"
 echo -e "${GREEN}=========================================${PLAIN}"
