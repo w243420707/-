@@ -1,17 +1,13 @@
 #!/bin/bash
 
 # ==========================================
-# Postal 邮件服务器 - 终极安装脚本
+# Postal 邮件服务器 - 全自动无人值守版
 # ==========================================
-# 特性：
-# 1. 强力清除 Postfix/Exim4/Sendmail (解决端口占用核心痛点)
-# 2. 自动修复 YAML 锚点错误
-# 3. 自动补全官方资源文件
-# 4. 自动配置 SSL (Caddy)
-# 5. 自动配置数据库与 RabbitMQ
+# 1. 自动填入随机管理员信息，无需人工干预
+# 2. 自动强力清理 Postfix/Nginx 端口占用
+# 3. 自动修复 YAML 语法与资源文件
+# 4. 自动配置 HTTPS
 # ==========================================
-
-set -e
 
 # 颜色定义
 RED='\033[0;31m'
@@ -28,33 +24,11 @@ fi
 
 clear
 echo -e "${CYAN}=============================================${NC}"
-echo -e "${CYAN}   Postal 全自动安装脚本 (端口强力净化版)    ${NC}"
+echo -e "${CYAN}   Postal 全自动安装脚本 (无人值守版)        ${NC}"
 echo -e "${CYAN}=============================================${NC}"
 
 # ==========================================
-# 0. 强力清理端口占用 (新增核心步骤)
-# ==========================================
-echo -e "${YELLOW}[1/11] 检测并卸载冲突的邮件服务...${NC}"
-
-# 停止常见邮件服务
-systemctl stop postfix 2>/dev/null || true
-systemctl stop sendmail 2>/dev/null || true
-systemctl stop exim4 2>/dev/null || true
-
-# 卸载它们 (防止重启复活)
-echo "正在卸载 Postfix/Exim4/Sendmail 以释放 25 端口..."
-apt-get remove --purge -y postfix postfix-sqlite postfix-mysql sendmail exim4 exim4-base exim4-config 2>/dev/null || true
-apt-get autoremove -y 2>/dev/null || true
-
-# 强杀残留进程
-if command -v fuser &> /dev/null; then
-    fuser -k 25/tcp 2>/dev/null || true
-fi
-
-echo -e "${GREEN}端口清理完毕。${NC}"
-
-# ==========================================
-# 1. 获取域名
+# 1. 获取域名与生成账号
 # ==========================================
 read -p "请输入您的 Postal 域名 (例如 mail.example.com): " POSTAL_DOMAIN
 if [ -z "$POSTAL_DOMAIN" ]; then
@@ -62,18 +36,40 @@ if [ -z "$POSTAL_DOMAIN" ]; then
     exit 1
 fi
 
+# 生成随机管理员信息
+ADMIN_FNAME="Admin$(date +%s | tail -c 4)"
+ADMIN_LNAME="User"
+# 使用 openssl 生成强密码，或者用简单的随机字符串
+ADMIN_PASSWORD=$(date +%s | sha256sum | base64 | head -c 12)
+# 默认邮箱，你也可以改成随机的，但建议用固定格式方便记忆，这里用 admin@域名
+ADMIN_EMAIL="admin@$POSTAL_DOMAIN"
+
+echo -e "${GREEN}将自动创建管理员:${NC}"
+echo -e "用户: $ADMIN_FNAME $ADMIN_LNAME"
+echo -e "邮箱: $ADMIN_EMAIL"
+echo -e "密码: (安装完成后显示)"
+echo "---------------------------------------------"
+
 # ==========================================
-# 2. 清理旧 Docker 环境
+# 2. 强力环境清理
 # ==========================================
-echo -e "${YELLOW}[2/11] 清理旧 Docker 环境...${NC}"
+echo -e "${YELLOW}[1/10] 正在扫描并清理冲突服务...${NC}"
+systemctl stop postfix sendmail exim4 nginx apache2 2>/dev/null || true
+apt-get remove --purge -y postfix postfix-sqlite postfix-mysql sendmail exim4 exim4-base exim4-config 2>/dev/null || true
+apt-get autoremove -y 2>/dev/null || true
+
 docker stop postal-web postal-smtp postal-worker postal-runner postal-caddy postal-mariadb postal-rabbitmq 2>/dev/null || true
 docker rm postal-web postal-smtp postal-worker postal-runner postal-caddy postal-mariadb postal-rabbitmq 2>/dev/null || true
-rm -rf /opt/postal/install  # 重新拉取安装文件
+rm -rf /opt/postal/install
+
+if command -v fuser &> /dev/null; then
+    fuser -k 25/tcp 80/tcp 443/tcp 2>/dev/null || true
+fi
 
 # ==========================================
 # 3. 安装依赖与 Docker
 # ==========================================
-echo -e "${YELLOW}[3/11] 安装系统依赖与 Docker...${NC}"
+echo -e "${YELLOW}[2/10] 安装系统依赖与 Docker...${NC}"
 apt-get update -qq
 apt-get install -y git curl jq gnupg lsb-release nano psmisc
 
@@ -88,7 +84,7 @@ fi
 # ==========================================
 # 4. 克隆官方仓库
 # ==========================================
-echo -e "${YELLOW}[4/11] 下载 Postal 资源文件...${NC}"
+echo -e "${YELLOW}[3/10] 下载 Postal 资源文件...${NC}"
 git clone https://github.com/postalserver/install /opt/postal/install
 ln -sf /opt/postal/install/bin/postal /usr/bin/postal
 chmod +x /opt/postal/install/bin/postal
@@ -96,7 +92,7 @@ chmod +x /opt/postal/install/bin/postal
 # ==========================================
 # 5. 生成标准配置文件
 # ==========================================
-echo -e "${YELLOW}[5/11] 生成标准 Docker 配置文件...${NC}"
+echo -e "${YELLOW}[4/10] 生成标准 Docker 配置文件...${NC}"
 cat > /opt/postal/install/docker-compose.yml <<EOF
 version: "3.9"
 
@@ -164,23 +160,18 @@ EOF
 # ==========================================
 # 6. 启动数据库并修正配置
 # ==========================================
-echo -e "${YELLOW}[6/11] 启动数据库并准备配置...${NC}"
+echo -e "${YELLOW}[5/10] 启动数据库并准备配置...${NC}"
 docker compose -f /opt/postal/install/docker-compose.yml up -d mariadb rabbitmq
-echo "等待数据库就绪 (10秒)..."
 sleep 10
 
-# 生成配置 (如果不存在)
 if [ ! -f "/opt/postal/config/postal.yml" ]; then
     postal bootstrap "$POSTAL_DOMAIN"
 fi
 
 CONFIG_FILE="/opt/postal/config/postal.yml"
-
-# 修正数据库连接
 sed -i 's/host: .*/host: 127.0.0.1/' "$CONFIG_FILE"
 sed -i 's/password: .*/password: postal/' "$CONFIG_FILE"
 
-# 修正 RabbitMQ 连接
 if ! grep -q "username: postal" "$CONFIG_FILE"; then
     sed -i '/rabbitmq:/,/vhost:/d' "$CONFIG_FILE"
     echo "rabbitmq:
@@ -193,52 +184,51 @@ fi
 # ==========================================
 # 7. 初始化数据库
 # ==========================================
-echo -e "${YELLOW}[7/11] 初始化数据库结构...${NC}"
+echo -e "${YELLOW}[6/10] 初始化数据库结构...${NC}"
 postal initialize
 
 # ==========================================
-# 8. 创建管理员
+# 8. 自动创建管理员 (核心修改)
 # ==========================================
-echo -e "${GREEN}=============================================${NC}"
-echo -e "${YELLOW}[8/11] 创建管理员账户${NC}"
-echo -e "${CYAN}请依次输入: 名字 -> 姓氏 -> 邮箱 -> 密码${NC}"
-echo -e "${GREEN}=============================================${NC}"
-postal make-user
+echo -e "${YELLOW}[7/10] 正在自动创建管理员账户...${NC}"
+# 使用 runner 容器直接执行命令，避免交互式输入
+docker compose -f /opt/postal/install/docker-compose.yml run --rm runner postal make-user \
+    --first-name "$ADMIN_FNAME" \
+    --last-name "$ADMIN_LNAME" \
+    --email "$ADMIN_EMAIL" \
+    --password "$ADMIN_PASSWORD"
 
 # ==========================================
 # 9. 启动 Postal
 # ==========================================
-echo -e "${YELLOW}[9/11] 启动 Postal 服务...${NC}"
+echo -e "${YELLOW}[8/10] 启动 Postal 服务...${NC}"
 postal start
 
 # ==========================================
-# 10. 最终端口检查
+# 10. 端口检查与修复
 # ==========================================
-echo -e "${YELLOW}[10/11] 最终端口检查...${NC}"
+echo -e "${YELLOW}[9/10] 检查 SMTP 端口映射...${NC}"
 sleep 5
 SMTP_PORT_CHECK=$(docker ps --format "{{.Ports}}" | grep "0.0.0.0:25")
 
-if [ -n "$SMTP_PORT_CHECK" ]; then
-    echo -e "${GREEN}检测通过: 25 端口已成功映射!${NC}"
-else
-    echo -e "${RED}警告: 端口映射似乎仍有问题。${NC}"
-    echo -e "正在尝试最后一次重启..."
+if [ -z "$SMTP_PORT_CHECK" ]; then
+    echo -e "${RED}警告: 端口映射失败，尝试强制修复...${NC}"
     postal stop
     fuser -k 25/tcp 2>/dev/null || true
     postal start
-    sleep 5
 fi
 
 # ==========================================
 # 11. 配置 Caddy
 # ==========================================
-echo -e "${YELLOW}[11/11] 配置 HTTPS (Caddy)...${NC}"
+echo -e "${YELLOW}[10/10] 配置 HTTPS (Caddy)...${NC}"
 mkdir -p /opt/postal/caddy-data
 cat > /opt/postal/config/Caddyfile <<EOF
 $POSTAL_DOMAIN {
     reverse_proxy localhost:5000
 }
 EOF
+
 docker rm -f postal-caddy 2>/dev/null || true
 docker run -d --name postal-caddy --restart always --network host \
    -v /opt/postal/config/Caddyfile:/etc/caddy/Caddyfile \
@@ -254,6 +244,10 @@ echo -e "${GREEN}             安装全部完成!                  ${NC}"
 echo -e "${GREEN}#############################################${NC}"
 echo -e "访问地址: https://$POSTAL_DOMAIN"
 echo -e ""
-echo -e "${YELLOW}当前端口状态:${NC}"
-docker ps --format "table {{.Names}}\t{{.Ports}}" | grep ":25"
+echo -e "${CYAN}=== 管理员账号信息 ===${NC}"
+echo -e "登录邮箱: ${YELLOW}$ADMIN_EMAIL${NC}"
+echo -e "登录密码: ${YELLOW}$ADMIN_PASSWORD${NC}"
+echo -e "${CYAN}======================${NC}"
+echo -e ""
+echo -e "请妥善保存上述密码!"
 echo -e ""
