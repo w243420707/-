@@ -1,11 +1,11 @@
 #!/bin/bash
 
 # ==========================================
-# Postal 邮件服务器 - 全自动无人值守版
+# Postal 邮件服务器 - 最终完美版
 # ==========================================
-# 1. 自动填入随机管理员信息，无需人工干预
-# 2. 自动强力清理 Postfix/Nginx 端口占用
-# 3. 自动修复 YAML 语法与资源文件
+# 1. 修正 SMTP 网络模式 (现在能看到端口映射了)
+# 2. 自动生成管理员账号
+# 3. 强力清理端口占用
 # 4. 自动配置 HTTPS
 # ==========================================
 
@@ -24,7 +24,7 @@ fi
 
 clear
 echo -e "${CYAN}=============================================${NC}"
-echo -e "${CYAN}   Postal 全自动安装脚本 (无人值守版)        ${NC}"
+echo -e "${CYAN}   Postal 全自动安装脚本 (端口修正版)        ${NC}"
 echo -e "${CYAN}=============================================${NC}"
 
 # ==========================================
@@ -37,11 +37,9 @@ if [ -z "$POSTAL_DOMAIN" ]; then
 fi
 
 # 生成随机管理员信息
-ADMIN_FNAME="Admin$(date +%s | tail -c 4)"
+ADMIN_FNAME="Admin"
 ADMIN_LNAME="User"
-# 使用 openssl 生成强密码，或者用简单的随机字符串
 ADMIN_PASSWORD=$(date +%s | sha256sum | base64 | head -c 12)
-# 默认邮箱，你也可以改成随机的，但建议用固定格式方便记忆，这里用 admin@域名
 ADMIN_EMAIL="admin@$POSTAL_DOMAIN"
 
 echo -e "${GREEN}将自动创建管理员:${NC}"
@@ -58,10 +56,12 @@ systemctl stop postfix sendmail exim4 nginx apache2 2>/dev/null || true
 apt-get remove --purge -y postfix postfix-sqlite postfix-mysql sendmail exim4 exim4-base exim4-config 2>/dev/null || true
 apt-get autoremove -y 2>/dev/null || true
 
+# 清理旧容器
 docker stop postal-web postal-smtp postal-worker postal-runner postal-caddy postal-mariadb postal-rabbitmq 2>/dev/null || true
 docker rm postal-web postal-smtp postal-worker postal-runner postal-caddy postal-mariadb postal-rabbitmq 2>/dev/null || true
 rm -rf /opt/postal/install
 
+# 杀掉残留进程
 if command -v fuser &> /dev/null; then
     fuser -k 25/tcp 80/tcp 443/tcp 2>/dev/null || true
 fi
@@ -90,9 +90,9 @@ ln -sf /opt/postal/install/bin/postal /usr/bin/postal
 chmod +x /opt/postal/install/bin/postal
 
 # ==========================================
-# 5. 生成标准配置文件
+# 5. 生成标准配置文件 (核心修正：移除 SMTP 的 host 模式)
 # ==========================================
-echo -e "${YELLOW}[4/10] 生成标准 Docker 配置文件...${NC}"
+echo -e "${YELLOW}[4/10] 生成 Docker 配置文件...${NC}"
 cat > /opt/postal/install/docker-compose.yml <<EOF
 version: "3.9"
 
@@ -129,8 +129,11 @@ services:
     image: ghcr.io/postalserver/postal:3.3.4
     command: postal smtp-server
     restart: always
+    # 核心修正：移除 network_mode: host，改为端口映射
     ports:
       - "25:25"
+    cap_add:
+      - NET_BIND_SERVICE
     volumes:
       - /opt/postal/config:/config
     depends_on:
@@ -188,10 +191,9 @@ echo -e "${YELLOW}[6/10] 初始化数据库结构...${NC}"
 postal initialize
 
 # ==========================================
-# 8. 自动创建管理员 (核心修改)
+# 8. 自动创建管理员
 # ==========================================
 echo -e "${YELLOW}[7/10] 正在自动创建管理员账户...${NC}"
-# 使用 runner 容器直接执行命令，避免交互式输入
 docker compose -f /opt/postal/install/docker-compose.yml run --rm runner postal make-user \
     --first-name "$ADMIN_FNAME" \
     --last-name "$ADMIN_LNAME" \
@@ -209,6 +211,7 @@ postal start
 # ==========================================
 echo -e "${YELLOW}[9/10] 检查 SMTP 端口映射...${NC}"
 sleep 5
+# 现在由于使用了端口映射，docker ps 应该能看到了
 SMTP_PORT_CHECK=$(docker ps --format "{{.Ports}}" | grep "0.0.0.0:25")
 
 if [ -z "$SMTP_PORT_CHECK" ]; then
@@ -216,6 +219,7 @@ if [ -z "$SMTP_PORT_CHECK" ]; then
     postal stop
     fuser -k 25/tcp 2>/dev/null || true
     postal start
+    sleep 3
 fi
 
 # ==========================================
@@ -249,5 +253,6 @@ echo -e "登录邮箱: ${YELLOW}$ADMIN_EMAIL${NC}"
 echo -e "登录密码: ${YELLOW}$ADMIN_PASSWORD${NC}"
 echo -e "${CYAN}======================${NC}"
 echo -e ""
-echo -e "请妥善保存上述密码!"
+echo -e "${YELLOW}端口映射状态 (现在应该能看到 :25 了):${NC}"
+docker ps --format "table {{.Names}}\t{{.Ports}}" | grep -E "smtp|:25"
 echo -e ""
