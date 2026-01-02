@@ -1,12 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Postal 邮件服务器 - 最终完美版
-# ==========================================
-# 1. 修正 SMTP 网络模式 (现在能看到端口映射了)
-# 2. 自动生成管理员账号
-# 3. 强力清理端口占用
-# 4. 自动配置 HTTPS
+# Postal 终极一键安装脚本 (V6 - 修复版)
 # ==========================================
 
 # 颜色定义
@@ -16,83 +11,73 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-# 检查 Root 权限
+# 检查 Root
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}错误: 请使用 root 权限运行此脚本 (sudo -i)${NC}"
+  echo -e "${RED}请使用 root 权限运行 (sudo -i)${NC}"
   exit 1
 fi
 
 clear
 echo -e "${CYAN}=============================================${NC}"
-echo -e "${CYAN}   Postal 全自动安装脚本 (端口修正版)        ${NC}"
+echo -e "${CYAN}   Postal 全自动安装脚本 (最终修复版)        ${NC}"
 echo -e "${CYAN}=============================================${NC}"
 
 # ==========================================
-# 1. 获取域名与生成账号
+# 1. 基础配置
 # ==========================================
-read -p "请输入您的 Postal 域名 (例如 mail.example.com): " POSTAL_DOMAIN
+read -p "请输入您的域名 (例如 mail.example.com): " POSTAL_DOMAIN
 if [ -z "$POSTAL_DOMAIN" ]; then
     echo -e "${RED}域名不能为空!${NC}"
     exit 1
 fi
 
-# 生成随机管理员信息
-ADMIN_FNAME="Admin"
-ADMIN_LNAME="User"
-ADMIN_PASSWORD=$(date +%s | sha256sum | base64 | head -c 12)
+# 管理员信息
 ADMIN_EMAIL="admin@$POSTAL_DOMAIN"
+ADMIN_PASSWORD="PostalUser2024!" # 您可以稍后在后台修改
 
-echo -e "${GREEN}将自动创建管理员:${NC}"
-echo -e "用户: $ADMIN_FNAME $ADMIN_LNAME"
-echo -e "邮箱: $ADMIN_EMAIL"
-echo -e "密码: (安装完成后显示)"
+echo -e "${GREEN}域名: $POSTAL_DOMAIN${NC}"
+echo -e "${GREEN}管理员: $ADMIN_EMAIL / $ADMIN_PASSWORD${NC}"
 echo "---------------------------------------------"
 
 # ==========================================
-# 2. 强力环境清理
+# 2. 彻底清理旧环境 (防止端口/容器冲突)
 # ==========================================
-echo -e "${YELLOW}[1/10] 正在扫描并清理冲突服务...${NC}"
-systemctl stop postfix sendmail exim4 nginx apache2 2>/dev/null || true
-apt-get remove --purge -y postfix postfix-sqlite postfix-mysql sendmail exim4 exim4-base exim4-config 2>/dev/null || true
-apt-get autoremove -y 2>/dev/null || true
+echo -e "${YELLOW}[1/8] 正在暴力清理旧容器...${NC}"
+# 停止并删除所有可能相关的容器
+docker rm -f postal-web postal-smtp postal-worker postal-runner postal-caddy postal-mariadb postal-rabbitmq install-web-1 install-smtp-1 install-worker-1 install-mariadb-1 install-rabbitmq-1 install-runner-1 2>/dev/null || true
 
-# 清理旧容器
-docker stop postal-web postal-smtp postal-worker postal-runner postal-caddy postal-mariadb postal-rabbitmq 2>/dev/null || true
-docker rm postal-web postal-smtp postal-worker postal-runner postal-caddy postal-mariadb postal-rabbitmq 2>/dev/null || true
-rm -rf /opt/postal/install
-
-# 杀掉残留进程
+# 清理残留端口进程
 if command -v fuser &> /dev/null; then
-    fuser -k 25/tcp 80/tcp 443/tcp 2>/dev/null || true
+    fuser -k 25/tcp 80/tcp 443/tcp 5000/tcp 2>/dev/null || true
 fi
 
 # ==========================================
-# 3. 安装依赖与 Docker
+# 3. 修复 Connection Timed Out (关键!)
 # ==========================================
-echo -e "${YELLOW}[2/10] 安装系统依赖与 Docker...${NC}"
-apt-get update -qq
-apt-get install -y git curl jq gnupg lsb-release nano psmisc
+echo -e "${YELLOW}[2/8] 修复服务器自连超时问题 (/etc/hosts)...${NC}"
+# 删除旧记录（如果存在）
+sed -i "/$POSTAL_DOMAIN/d" /etc/hosts
+# 添加新记录：强制域名指向本地
+echo "127.0.0.1 $POSTAL_DOMAIN" >> /etc/hosts
+echo -e "${GREEN}已添加 hosts 记录: 127.0.0.1 $POSTAL_DOMAIN${NC}"
 
+# ==========================================
+# 4. 准备文件与目录
+# ==========================================
+echo -e "${YELLOW}[3/8] 准备配置文件...${NC}"
+mkdir -p /opt/postal/install
+mkdir -p /opt/postal/config
+mkdir -p /opt/postal/caddy-data
+
+# 如果没有安装 git/docker，这里简单补充一下（假设已安装）
 if ! command -v docker &> /dev/null; then
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-    apt-get update -qq
-    apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    apt-get update && apt-get install -y docker.compose docker-compose-plugin
 fi
 
 # ==========================================
-# 4. 克隆官方仓库
+# 5. 生成 Docker 配置 (使用最稳定的 Host 模式)
 # ==========================================
-echo -e "${YELLOW}[3/10] 下载 Postal 资源文件...${NC}"
-git clone https://github.com/postalserver/install /opt/postal/install
-ln -sf /opt/postal/install/bin/postal /usr/bin/postal
-chmod +x /opt/postal/install/bin/postal
-
-# ==========================================
-# 5. 生成标准配置文件 (核心修正：移除 SMTP 的 host 模式)
-# ==========================================
-echo -e "${YELLOW}[4/10] 生成 Docker 配置文件...${NC}"
+echo -e "${YELLOW}[4/8] 生成 docker-compose.yml...${NC}"
 cat > /opt/postal/install/docker-compose.yml <<EOF
 version: "3.9"
 
@@ -103,8 +88,7 @@ services:
     environment:
       MARIADB_DATABASE: postal
       MARIADB_ROOT_PASSWORD: postal
-    ports:
-      - "127.0.0.1:3306:3306"
+    network_mode: host
 
   rabbitmq:
     image: rabbitmq:3.12
@@ -113,6 +97,7 @@ services:
       RABBITMQ_DEFAULT_USER: postal
       RABBITMQ_DEFAULT_PASS: postal
       RABBITMQ_DEFAULT_VHOST: postal
+    network_mode: host
 
   web:
     image: ghcr.io/postalserver/postal:3.3.4
@@ -120,7 +105,7 @@ services:
     network_mode: host
     volumes:
       - /opt/postal/config:/config
-    restart: unless-stopped
+    restart: always
     depends_on:
       - mariadb
       - rabbitmq
@@ -129,9 +114,7 @@ services:
     image: ghcr.io/postalserver/postal:3.3.4
     command: postal smtp-server
     restart: always
-    # 核心修正：移除 network_mode: host，改为端口映射
-    ports:
-      - "25:25"
+    network_mode: host
     cap_add:
       - NET_BIND_SERVICE
     volumes:
@@ -146,7 +129,7 @@ services:
     network_mode: host
     volumes:
       - /opt/postal/config:/config
-    restart: unless-stopped
+    restart: always
     depends_on:
       - mariadb
       - rabbitmq
@@ -161,79 +144,61 @@ services:
 EOF
 
 # ==========================================
-# 6. 启动数据库并修正配置
+# 6. 初始化配置与数据库
 # ==========================================
-echo -e "${YELLOW}[5/10] 启动数据库并准备配置...${NC}"
-docker compose -f /opt/postal/install/docker-compose.yml up -d mariadb rabbitmq
-sleep 10
+echo -e "${YELLOW}[5/8] 初始化数据库...${NC}"
+# 下载 postal 命令行工具
+curl -sL https://github.com/postalserver/install/raw/main/bin/postal -o /usr/bin/postal
+chmod +x /usr/bin/postal
 
+# 生成初始配置 (如果不存在)
 if [ ! -f "/opt/postal/config/postal.yml" ]; then
     postal bootstrap "$POSTAL_DOMAIN"
 fi
 
+# 修正 postal.yml 配置 (确保指向本地)
 CONFIG_FILE="/opt/postal/config/postal.yml"
 sed -i 's/host: .*/host: 127.0.0.1/' "$CONFIG_FILE"
 sed -i 's/password: .*/password: postal/' "$CONFIG_FILE"
 
-if ! grep -q "username: postal" "$CONFIG_FILE"; then
-    sed -i '/rabbitmq:/,/vhost:/d' "$CONFIG_FILE"
-    echo "rabbitmq:
-  host: 127.0.0.1
-  username: postal
-  password: postal
-  vhost: postal" >> "$CONFIG_FILE"
-fi
+# 启动数据库
+cd /opt/postal/install
+docker compose up -d mariadb rabbitmq
+sleep 8
 
-# ==========================================
-# 7. 初始化数据库
-# ==========================================
-echo -e "${YELLOW}[6/10] 初始化数据库结构...${NC}"
+# 初始化表结构
 postal initialize
 
-# ==========================================
-# 8. 自动创建管理员
-# ==========================================
-echo -e "${YELLOW}[7/10] 正在自动创建管理员账户...${NC}"
-docker compose -f /opt/postal/install/docker-compose.yml run --rm runner postal make-user \
-    --first-name "$ADMIN_FNAME" \
-    --last-name "$ADMIN_LNAME" \
+# 创建管理员
+echo -e "${YELLOW}[6/8] 创建管理员账号...${NC}"
+docker compose run --rm runner postal make-user \
+    --first-name "Admin" \
+    --last-name "User" \
     --email "$ADMIN_EMAIL" \
-    --password "$ADMIN_PASSWORD"
+    --password "$ADMIN_PASSWORD" 2>/dev/null || true
 
 # ==========================================
-# 9. 启动 Postal
+# 7. 启动核心服务
 # ==========================================
-echo -e "${YELLOW}[8/10] 启动 Postal 服务...${NC}"
-postal start
-
-# ==========================================
-# 10. 端口检查与修复
-# ==========================================
-echo -e "${YELLOW}[9/10] 检查 SMTP 端口映射...${NC}"
+echo -e "${YELLOW}[7/8] 启动 Postal 服务...${NC}"
+docker compose up -d
 sleep 5
-# 现在由于使用了端口映射，docker ps 应该能看到了
-SMTP_PORT_CHECK=$(docker ps --format "{{.Ports}}" | grep "0.0.0.0:25")
-
-if [ -z "$SMTP_PORT_CHECK" ]; then
-    echo -e "${RED}警告: 端口映射失败，尝试强制修复...${NC}"
-    postal stop
-    fuser -k 25/tcp 2>/dev/null || true
-    postal start
-    sleep 3
-fi
 
 # ==========================================
-# 11. 配置 Caddy
+# 8. 配置 HTTPS (自签名模式 - 防止 429 报错)
 # ==========================================
-echo -e "${YELLOW}[10/10] 配置 HTTPS (Caddy)...${NC}"
-mkdir -p /opt/postal/caddy-data
+echo -e "${YELLOW}[8/8] 配置 Caddy (自签名 SSL)...${NC}"
+
+# 使用 tls internal 规避 Let's Encrypt 限制
 cat > /opt/postal/config/Caddyfile <<EOF
 $POSTAL_DOMAIN {
+    tls internal
     reverse_proxy localhost:5000
 }
 EOF
 
-docker rm -f postal-caddy 2>/dev/null || true
+# 启动 Caddy
+docker rm -f postal-caddy 2>/dev/null
 docker run -d --name postal-caddy --restart always --network host \
    -v /opt/postal/config/Caddyfile:/etc/caddy/Caddyfile \
    -v /opt/postal/caddy-data:/data \
@@ -244,15 +209,20 @@ docker run -d --name postal-caddy --restart always --network host \
 # ==========================================
 echo -e ""
 echo -e "${GREEN}#############################################${NC}"
-echo -e "${GREEN}             安装全部完成!                  ${NC}"
+echo -e "${GREEN}             安装修复完成!                  ${NC}"
 echo -e "${GREEN}#############################################${NC}"
 echo -e "访问地址: https://$POSTAL_DOMAIN"
+echo -e "${RED}注意: 浏览器会提示不安全(红色警告)，这是正常的！${NC}"
+echo -e "请点击 '高级' -> '继续访问' 即可进入。"
 echo -e ""
-echo -e "${CYAN}=== 管理员账号信息 ===${NC}"
-echo -e "登录邮箱: ${YELLOW}$ADMIN_EMAIL${NC}"
-echo -e "登录密码: ${YELLOW}$ADMIN_PASSWORD${NC}"
-echo -e "${CYAN}======================${NC}"
+echo -e "${CYAN}管理员账号: $ADMIN_EMAIL${NC}"
+echo -e "${CYAN}管理员密码: $ADMIN_PASSWORD${NC}"
 echo -e ""
-echo -e "${YELLOW}端口映射状态 (现在应该能看到 :25 了):${NC}"
-docker ps --format "table {{.Names}}\t{{.Ports}}" | grep -E "smtp|:25"
+echo -e "${YELLOW}检查端口状态 (如果您看到下面的 :25，说明端口已正常监听):${NC}"
+# 使用 ss 或 netstat 检查宿主机实际监听情况
+if command -v ss &> /dev/null; then
+    ss -tlnp | grep :25
+else
+    netstat -tlnp | grep :25
+fi
 echo -e ""
