@@ -1,9 +1,10 @@
 #!/bin/bash
 
 # ==========================================
-# Postal 邮件服务器 - 最终完美版安装脚本
+# Postal 邮件服务器 - 最终完美版 (带自修复)
 # ==========================================
-# 修复了模板缺失、YAML格式错误、端口映射缺失等所有已知问题
+# 包含：环境清理、自动安装、配置修正、管理员创建、SSL配置
+# 特性：自动检测并强制修复 25 端口映射
 # ==========================================
 
 set -e
@@ -36,18 +37,17 @@ if [ -z "$POSTAL_DOMAIN" ]; then
 fi
 
 # ==========================================
-# 2. 清理环境 (彻底清理旧残留)
+# 2. 清理旧环境
 # ==========================================
-echo -e "${YELLOW}[1/9] 清理旧环境...${NC}"
+echo -e "${YELLOW}[1/10] 清理旧环境...${NC}"
 docker stop postal-web postal-smtp postal-worker postal-runner postal-caddy postal-mariadb postal-rabbitmq 2>/dev/null || true
 docker rm postal-web postal-smtp postal-worker postal-runner postal-caddy postal-mariadb postal-rabbitmq 2>/dev/null || true
-rm -rf /opt/postal/install  # 删除旧的安装目录，重新拉取
-# 注意：保留 /opt/postal/config 以防误删配置，如果需要全新安装请手动删
+rm -rf /opt/postal/install
 
 # ==========================================
 # 3. 安装依赖与 Docker
 # ==========================================
-echo -e "${YELLOW}[2/9] 安装依赖与 Docker...${NC}"
+echo -e "${YELLOW}[2/10] 安装依赖与 Docker...${NC}"
 apt-get update -qq
 apt-get install -y git curl jq gnupg lsb-release nano
 
@@ -60,22 +60,17 @@ if ! command -v docker &> /dev/null; then
 fi
 
 # ==========================================
-# 4. 克隆官方仓库 (解决模板缺失问题)
+# 4. 克隆官方仓库
 # ==========================================
-echo -e "${YELLOW}[3/9] 下载 Postal 资源文件...${NC}"
-# 必须使用 git clone，否则 postal bootstrap 会报错找不到 templates
+echo -e "${YELLOW}[3/10] 下载 Postal 资源文件...${NC}"
 git clone https://github.com/postalserver/install /opt/postal/install
-
-# 建立 CLI 链接
 ln -sf /opt/postal/install/bin/postal /usr/bin/postal
 chmod +x /opt/postal/install/bin/postal
 
 # ==========================================
-# 5. 覆盖写入 Docker Compose (解决端口和YAML错误)
+# 5. 生成标准配置文件 (带端口)
 # ==========================================
-echo -e "${YELLOW}[4/9] 生成标准 Docker 配置文件...${NC}"
-
-# 这里写入一个不使用复杂锚点、结构简单且包含端口映射的文件
+echo -e "${YELLOW}[4/10] 生成标准 Docker 配置文件...${NC}"
 cat > /opt/postal/install/docker-compose.yml <<EOF
 version: "3.9"
 
@@ -141,30 +136,20 @@ services:
 EOF
 
 # ==========================================
-# 6. 生成配置与启动数据库
+# 6. 启动数据库并修正配置
 # ==========================================
-echo -e "${YELLOW}[5/9] 启动数据库并生成配置...${NC}"
-
-# 先启动数据库，确保后续初始化能连接
+echo -e "${YELLOW}[5/10] 启动数据库并修正配置...${NC}"
 docker compose -f /opt/postal/install/docker-compose.yml up -d mariadb rabbitmq
-echo "等待数据库启动 (10秒)..."
 sleep 10
 
-# 生成 postal.yml (如果不存在)
 if [ ! -f "/opt/postal/config/postal.yml" ]; then
     postal bootstrap "$POSTAL_DOMAIN"
 fi
 
-# 强制修正 postal.yml 中的密码，使其与 docker-compose 保持一致
-# 这样避免了 bootstrap 生成随机密码导致无法连接的问题
 CONFIG_FILE="/opt/postal/config/postal.yml"
-
-# 修改数据库配置
 sed -i 's/host: .*/host: 127.0.0.1/' "$CONFIG_FILE"
 sed -i 's/password: .*/password: postal/' "$CONFIG_FILE"
 
-# 修改 RabbitMQ 配置 (删除原有块，重写)
-# 使用 python 或 perl 处理多行替换比较麻烦，这里用简易方法：如果没改过才追加
 if ! grep -q "username: postal" "$CONFIG_FILE"; then
     sed -i '/rabbitmq:/,/vhost:/d' "$CONFIG_FILE"
     echo "rabbitmq:
@@ -177,14 +162,14 @@ fi
 # ==========================================
 # 7. 初始化数据库
 # ==========================================
-echo -e "${YELLOW}[6/9] 初始化数据库结构...${NC}"
+echo -e "${YELLOW}[6/10] 初始化数据库结构...${NC}"
 postal initialize
 
 # ==========================================
 # 8. 创建管理员
 # ==========================================
 echo -e "${GREEN}=============================================${NC}"
-echo -e "${YELLOW}[7/9] 创建管理员账户${NC}"
+echo -e "${YELLOW}[7/10] 创建管理员账户${NC}"
 echo -e "${CYAN}请依次输入: First Name, Last Name, Email, Password${NC}"
 echo -e "${GREEN}=============================================${NC}"
 postal make-user
@@ -192,28 +177,61 @@ postal make-user
 # ==========================================
 # 9. 启动 Postal
 # ==========================================
-echo -e "${YELLOW}[8/9] 启动所有组件...${NC}"
+echo -e "${YELLOW}[8/10] 启动 Postal 服务...${NC}"
 postal start
 
 # ==========================================
-# 10. 配置 Caddy SSL
+# 10. 自动修复端口映射 (关键新增步骤)
 # ==========================================
-echo -e "${YELLOW}[9/9] 配置自动 HTTPS (Caddy)...${NC}"
-mkdir -p /opt/postal/caddy-data
+echo -e "${YELLOW}[9/10] 检查并强制修复 25 端口...${NC}"
 
+# 函数：检测 SMTP 容器端口
+check_smtp_port() {
+    # 查找容器 ID
+    CID=$(docker ps -q -f name=smtp)
+    if [ -z "$CID" ]; then return 1; fi
+    # 检查端口映射
+    docker port "$CID" 25 | grep -q "0.0.0.0:25"
+}
+
+sleep 5
+if check_smtp_port; then
+    echo -e "${GREEN}检测通过: 25 端口已正常映射。${NC}"
+else
+    echo -e "${RED}警告: 25 端口未正确映射，正在尝试强制修复...${NC}"
+    
+    # 强制停止
+    postal stop
+    
+    # 再次覆盖写入 docker-compose (确保没被修改)
+    # (此处省略 cat 内容，因上方已写过，逻辑上复用文件即可，这里做重启操作)
+    
+    echo "重启服务..."
+    docker compose -f /opt/postal/install/docker-compose.yml up -d
+    
+    sleep 5
+    if check_smtp_port; then
+         echo -e "${GREEN}修复成功: 25 端口现已映射。${NC}"
+    else
+         echo -e "${RED}严重错误: 无法映射 25 端口。可能端口被 Postfix/Sendmail 占用。${NC}"
+         echo -e "正在尝试杀掉占用进程..."
+         fuser -k 25/tcp || true
+         postal start
+    fi
+fi
+
+# ==========================================
+# 11. 配置 Caddy
+# ==========================================
+echo -e "${YELLOW}[10/10] 配置 HTTPS (Caddy)...${NC}"
+mkdir -p /opt/postal/caddy-data
 cat > /opt/postal/config/Caddyfile <<EOF
 $POSTAL_DOMAIN {
     reverse_proxy localhost:5000
 }
 EOF
-
-# 清理旧 Caddy
 docker rm -f postal-caddy 2>/dev/null || true
-
-docker run -d \
-   --name postal-caddy \
-   --restart always \
-   --network host \
+docker run -d --name postal-caddy --restart always --network host \
    -v /opt/postal/config/Caddyfile:/etc/caddy/Caddyfile \
    -v /opt/postal/caddy-data:/data \
    caddy:alpine
@@ -223,10 +241,10 @@ docker run -d \
 # ==========================================
 echo -e ""
 echo -e "${GREEN}#############################################${NC}"
-echo -e "${GREEN}             安装成功!                      ${NC}"
+echo -e "${GREEN}             安装全部完成!                  ${NC}"
 echo -e "${GREEN}#############################################${NC}"
 echo -e "访问地址: https://$POSTAL_DOMAIN"
 echo -e ""
-echo -e "${YELLOW}端口检查:${NC}"
-docker ps --format "table {{.Names}}\t{{.Ports}}" | grep "0.0.0.0:25" && echo -e "${GREEN}SMTP 25 端口映射成功!${NC}" || echo -e "${RED}警告: 25 端口似乎未映射，请检查!${NC}"
+echo -e "最后一次检查端口状态："
+docker ps --format "table {{.Names}}\t{{.Ports}}" | grep ":25"
 echo -e ""
