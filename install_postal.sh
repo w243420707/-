@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Postal 终极安装脚本 (V9 - 修复Docker与依赖)
+# Postal 终极安装脚本 (V10 - 纯净写入版)
 # ==========================================
 
 # 颜色定义
@@ -19,7 +19,8 @@ fi
 
 clear
 echo -e "${CYAN}=============================================${NC}"
-echo -e "${CYAN}   Postal 全自动安装脚本 (V9 修复版)          ${NC}"
+echo -e "${CYAN}   Postal 全自动安装脚本 (V10 无依赖版)       ${NC}"
+echo -e "${CYAN}   核心升级: 直接写入配置，不再依赖工具生成    ${NC}"
 echo -e "${CYAN}=============================================${NC}"
 
 # ==========================================
@@ -30,6 +31,10 @@ if [ -z "$POSTAL_DOMAIN" ]; then
     echo -e "${RED}域名不能为空!${NC}"
     exit 1
 fi
+
+# 自动生成随机密钥 (模拟 openssl rand -hex 16)
+SIGNING_KEY=$(openssl rand -hex 16)
+SECRET_KEY=$(openssl rand -hex 16)
 
 # 管理员信息
 ADMIN_EMAIL="admin@$POSTAL_DOMAIN"
@@ -42,10 +47,8 @@ echo "---------------------------------------------"
 # ==========================================
 # 2. 彻底清理环境
 # ==========================================
-echo -e "${YELLOW}[1/11] 正在清理旧环境...${NC}"
-# 尝试停止所有容器
+echo -e "${YELLOW}[1/10] 正在清理旧环境...${NC}"
 docker rm -f $(docker ps -a -q) 2>/dev/null || true
-# 清理端口
 if command -v fuser &> /dev/null; then
     fuser -k 25/tcp 80/tcp 443/tcp 5000/tcp 3306/tcp 5672/tcp 2>/dev/null || true
 fi
@@ -53,56 +56,48 @@ fi
 # ==========================================
 # 3. 修复 Connection Timed Out
 # ==========================================
-echo -e "${YELLOW}[2/11] 配置本地回环 (/etc/hosts)...${NC}"
+echo -e "${YELLOW}[2/10] 配置本地回环 (/etc/hosts)...${NC}"
 sed -i "/$POSTAL_DOMAIN/d" /etc/hosts
 echo "127.0.0.1 $POSTAL_DOMAIN" >> /etc/hosts
 
 # ==========================================
-# 4. 安装基础依赖 (修复 jq 缺失问题)
+# 4. 安装基础依赖
 # ==========================================
-echo -e "${YELLOW}[3/11] 安装系统依赖 (jq, curl, git)...${NC}"
+echo -e "${YELLOW}[3/10] 安装系统依赖 (curl, git)...${NC}"
 apt-get update -qq
-apt-get install -y jq curl git gnupg lsb-release ca-certificates
+apt-get install -y curl git gnupg lsb-release ca-certificates openssl
 
 # ==========================================
-# 5. 手动安装 Docker (避开脚本报错)
+# 5. 手动安装 Docker
 # ==========================================
-echo -e "${YELLOW}[4/11] 检查并安装 Docker...${NC}"
+echo -e "${YELLOW}[4/10] 检查并安装 Docker...${NC}"
 
 if ! command -v docker &> /dev/null; then
     echo "正在安装 Docker (使用 apt 源方式)..."
-    
-    # 添加 Docker 官方 GPG Key
     mkdir -p /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg --yes
-    
-    # 设置稳定版仓库
     echo \
       "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-      $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-      
+      $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null 
     apt-get update -qq
-    # 这里只安装核心组件，避开那个报错的 docker-model-plugin
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 else
     echo "Docker 已安装，跳过。"
 fi
-
-# 启动 Docker
 systemctl start docker
 systemctl enable docker
 
 # ==========================================
-# 6. 生成 Docker 配置
+# 6. 准备目录与生成 Docker Compose
 # ==========================================
-echo -e "${YELLOW}[5/11] 准备目录与配置...${NC}"
+echo -e "${YELLOW}[5/10] 准备目录...${NC}"
 mkdir -p /opt/postal/install
 mkdir -p /opt/postal/config
 mkdir -p /opt/postal/caddy-data
 
+echo -e "${YELLOW}[6/10] 生成 docker-compose.yml...${NC}"
 cat > /opt/postal/install/docker-compose.yml <<EOF
 version: "3.9"
-
 services:
   mariadb:
     image: mariadb:10.6
@@ -166,31 +161,86 @@ services:
 EOF
 
 # ==========================================
-# 7. 初始化配置文件
+# 7. 直接写入 Postal 配置文件 (绕过生成器)
 # ==========================================
-echo -e "${YELLOW}[6/11] 生成 Postal 配置...${NC}"
+echo -e "${YELLOW}[7/10] 直接写入 postal.yml 配置...${NC}"
+
+# 这里是 Postal 标准配置模板，直接写入，防止任何生成错误
+cat > /opt/postal/config/postal.yml <<EOF
+web:
+  host: $POSTAL_DOMAIN
+  protocol: https
+
+web_server:
+  bind_address: 127.0.0.1
+  port: 5000
+  max_threads: 5
+
+main_db:
+  host: 127.0.0.1
+  username: root
+  password: postal
+  database: postal
+
+message_db:
+  host: 127.0.0.1
+  username: root
+  password: postal
+  prefix: postal
+
+rabbitmq:
+  host: 127.0.0.1
+  username: postal
+  password: postal
+  vhost: postal
+
+dns:
+  mx_records:
+    - mx.$POSTAL_DOMAIN
+  smtp_server_hostname: $POSTAL_DOMAIN
+  spf_include: spf.$POSTAL_DOMAIN
+  return_path: rp.$POSTAL_DOMAIN
+  route_domain: routes.$POSTAL_DOMAIN
+  track_domain: track.$POSTAL_DOMAIN
+
+smtp:
+  host: 127.0.0.1
+  port: 2525
+  tls_enabled: false
+  tls_certificate_path:
+  tls_private_key_path:
+
+smtp_server:
+  port: 25
+  tls_enabled: false # 由 Caddy 或外部处理 SSL
+  tls_certificate_path:
+  tls_private_key_path:
+  proxy_protocol: false
+  log_connect: true
+  strip_received_headers: false
+  max_message_size: 10 # MB
+
+rails:
+  environment: production
+  secret_key: $SECRET_KEY
+
+general:
+  use_ip_pools: false
+
+logging:
+  stdout: true
+EOF
+
+echo "配置已成功写入。"
+
+# 下载 postal 二进制文件以便后续调用
 curl -sL https://github.com/postalserver/install/raw/main/bin/postal -o /usr/bin/postal
 chmod +x /usr/bin/postal
-
-# 确保 config 目录是空的或者只有正确的文件，防止覆盖错误
-if [ ! -f "/opt/postal/config/postal.yml" ]; then
-    postal bootstrap "$POSTAL_DOMAIN"
-fi
-
-CONFIG_FILE="/opt/postal/config/postal.yml"
-# 再次检查文件是否存在 (防止 jq 还是没装上导致的问题)
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo -e "${RED}错误: postal.yml 生成失败! 请检查 jq 是否安装成功。${NC}"
-    exit 1
-fi
-
-sed -i 's/host: .*/host: 127.0.0.1/' "$CONFIG_FILE"
-sed -i 's/password: .*/password: postal/' "$CONFIG_FILE"
 
 # ==========================================
 # 8. 启动数据库并等待
 # ==========================================
-echo -e "${YELLOW}[7/11] 启动数据库...${NC}"
+echo -e "${YELLOW}[8/10] 启动数据库...${NC}"
 cd /opt/postal/install
 docker compose up -d mariadb rabbitmq
 
@@ -204,26 +254,23 @@ echo -e "\n数据库已就绪。"
 # ==========================================
 # 9. 初始化表结构与用户
 # ==========================================
-echo -e "${YELLOW}[8/11] 初始化数据表...${NC}"
+echo -e "${YELLOW}[9/10] 初始化数据表...${NC}"
 docker compose run --rm runner postal initialize
 
-echo -e "${YELLOW}[9/11] 注册管理员账号...${NC}"
+echo -e "${YELLOW}[10/10] 注册管理员账号...${NC}"
 docker compose run --rm runner postal make-user \
     --first-name "Admin" \
     --last-name "User" \
     --email "$ADMIN_EMAIL" \
     --password "$ADMIN_PASSWORD" 2>/dev/null || true
 
-# ==========================================
-# 10. 启动核心服务
-# ==========================================
-echo -e "${YELLOW}[10/11] 启动 Postal 核心服务...${NC}"
+# 启动核心服务
 docker compose up -d
 
 # ==========================================
-# 11. 智能配置 SSL
+# 10. 智能 SSL
 # ==========================================
-echo -e "${YELLOW}[11/11] 配置 SSL 证书...${NC}"
+echo -e "${YELLOW}[+] 配置 SSL 证书...${NC}"
 
 # 先尝试正版配置
 cat > /opt/postal/config/Caddyfile <<EOF
@@ -262,7 +309,7 @@ fi
 # ==========================================
 echo -e ""
 echo -e "${GREEN}#############################################${NC}"
-echo -e "${GREEN}             安装完成 (V9)                  ${NC}"
+echo -e "${GREEN}             安装完成 (V10)                 ${NC}"
 echo -e "${GREEN}#############################################${NC}"
 echo -e "访问地址: https://$POSTAL_DOMAIN"
 echo -e "管理员账号: $ADMIN_EMAIL"
