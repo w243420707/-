@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Postal 完整安装脚本 (修复版)
+# Postal Pro 安装脚本 (自动映射端口 + SSL)
 # ==========================================
 
 set -e
@@ -10,20 +10,21 @@ set -e
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 # 检查 Root 权限
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}请使用 root 权限运行此脚本 (sudo -i)${NC}"
+  echo -e "${RED}错误: 请使用 root 权限运行此脚本 (sudo -i)${NC}"
   exit 1
 fi
 
-echo -e "${GREEN}=============================================${NC}"
-echo -e "${GREEN}      Postal 安装脚本 (修复交互版)          ${NC}"
-echo -e "${GREEN}=============================================${NC}"
+echo -e "${CYAN}=============================================${NC}"
+echo -e "${CYAN}      Postal 邮件服务器全自动安装脚本       ${NC}"
+echo -e "${CYAN}=============================================${NC}"
 
 # ==========================================
-# 1. 获取域名 (仅需输入一次)
+# 1. 获取基本信息
 # ==========================================
 read -p "请输入您的 Postal 域名 (例如 mail.example.com): " POSTAL_DOMAIN
 if [ -z "$POSTAL_DOMAIN" ]; then
@@ -32,50 +33,53 @@ if [ -z "$POSTAL_DOMAIN" ]; then
 fi
 
 # ==========================================
-# 2. 安装基础依赖
+# 2. 安装基础环境
 # ==========================================
-echo -e "${YELLOW}[1/8] 安装系统依赖...${NC}"
-apt-get update
-apt-get install -y git curl jq gnupg lsb-release
+echo -e "${YELLOW}[1/9] 安装系统基础依赖...${NC}"
+apt-get update -qq
+apt-get install -y git curl jq gnupg lsb-release nano
 
 # ==========================================
-# 3. 安装 Docker
+# 3. 安装 Docker 环境
 # ==========================================
-echo -e "${YELLOW}[2/8] 检查 Docker 环境...${NC}"
+echo -e "${YELLOW}[2/9] 检查 Docker 环境...${NC}"
 if ! command -v docker &> /dev/null; then
-    echo "正在安装 Docker..."
+    echo "Docker 未安装，正在安装..."
     mkdir -p /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     echo \
       "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
       $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-    apt-get update
+    apt-get update -qq
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 else
     echo "Docker 已安装。"
 fi
 
 # ==========================================
-# 4. 安装 Postal CLI
+# 4. 准备 Postal 目录
 # ==========================================
-echo -e "${YELLOW}[3/8] 配置 Postal CLI...${NC}"
+echo -e "${YELLOW}[3/9] 下载 Postal 配置文件...${NC}"
 if [ ! -d "/opt/postal/install" ]; then
     git clone https://github.com/postalserver/install /opt/postal/install
 else
-    # 如果目录存在，确保 git 配置也是新的，或者忽略更新直接使用
-    echo "Postal 目录已存在，跳过克隆。"
+    echo "目录已存在，更新中..."
+    cd /opt/postal/install && git pull
 fi
 
+# 建立 CLI 软链接
 if [ ! -L "/usr/bin/postal" ]; then
     ln -s /opt/postal/install/bin/postal /usr/bin/postal
 fi
 
 # ==========================================
-# 5. 启动 MariaDB
+# 5. 启动 MariaDB 数据库
 # ==========================================
-echo -e "${YELLOW}[4/8] 启动数据库...${NC}"
-# 清理可能存在的旧数据库容器
+echo -e "${YELLOW}[4/9] 启动数据库服务...${NC}"
+
+# 清理旧数据库容器(防止密码冲突)
 if [ "$(docker ps -aq -f name=postal-mariadb)" ]; then
+    echo "检测到旧数据库容器，正在重启..."
     docker rm -f postal-mariadb
 fi
 
@@ -91,47 +95,61 @@ echo "等待数据库初始化 (10秒)..."
 sleep 10
 
 # ==========================================
-# 6. 配置 Postal
+# 6. 生成并修正配置
 # ==========================================
-echo -e "${YELLOW}[5/8] 生成配置并初始化...${NC}"
+echo -e "${YELLOW}[5/9] 生成并修正配置文件...${NC}"
 
-# 运行 Bootstrap (会覆盖旧配置)
+# 运行初始化生成配置
 postal bootstrap "$POSTAL_DOMAIN"
 
 CONFIG_FILE="/opt/postal/config/postal.yml"
-# 修正数据库密码为 'postal'
+COMPOSE_FILE="/opt/postal/install/docker-compose.yml"
+
+# 1. 修正数据库密码和Host
 sed -i 's/password: .*/password: postal/' "$CONFIG_FILE"
 sed -i 's/host: .*/host: 127.0.0.1/' "$CONFIG_FILE"
 
-# 初始化数据库结构
+# 2. 关键步骤：自动注入 25 端口映射到 docker-compose.yml
+# 我们使用 grep 检查是否已经存在 ports 映射，如果没有则添加
+if ! grep -q "25:25" "$COMPOSE_FILE"; then
+    echo "正在添加 SMTP 25 端口映射..."
+    # 使用 sed 在 'smtp:' 服务定义的 image 行下面插入 ports 配置
+    # 注意：这里匹配 image: .../postal... 行，并在其后追加 ports 配置
+    sed -i '/image: ghcr.io\/postalserver\/postal/a \    ports:\n      - "25:25"' "$COMPOSE_FILE"
+else
+    echo "端口映射已存在，跳过。"
+fi
+
+# ==========================================
+# 7. 初始化数据库
+# ==========================================
+echo -e "${YELLOW}[6/9] 初始化数据库结构...${NC}"
 postal initialize
 
 # ==========================================
-# 7. 创建管理员 (交互式)
+# 8. 创建管理员
 # ==========================================
 echo -e "${GREEN}=============================================${NC}"
-echo -e "${YELLOW}[6/8] 创建管理员账户 (重要!)${NC}"
-echo -e "${GREEN}请在下方直接输入管理员信息:${NC}"
-echo -e "注意: First Name 和 Last Name 可以随意填"
+echo -e "${YELLOW}[7/9] 创建管理员账户${NC}"
+echo -e "${CYAN}请跟随提示输入: 名字 -> 姓氏 -> 邮箱 -> 密码${NC}"
 echo -e "${GREEN}=============================================${NC}"
 
-# 直接调用交互式命令，不再使用 pipe，避免 TTY 错误
+# 交互式创建
 postal make-user
 
-echo -e "${GREEN}管理员创建步骤结束。${NC}"
-
 # ==========================================
-# 8. 启动 Postal
+# 9. 启动服务
 # ==========================================
-echo -e "${YELLOW}[7/8] 启动 Postal 服务...${NC}"
+echo -e "${YELLOW}[8/9] 启动 Postal 所有组件...${NC}"
 postal start
 
 # ==========================================
-# 9. 配置 Caddy
+# 10. 配置 Caddy (SSL/反向代理)
 # ==========================================
-echo -e "${YELLOW}[8/8] 配置 Caddy (SSL 反向代理)...${NC}"
+echo -e "${YELLOW}[9/9] 配置 Caddy 自动 HTTPS...${NC}"
 
 # 写入 Caddyfile
+mkdir -p /opt/postal/caddy-data
 cat > /opt/postal/config/Caddyfile <<EOF
 $POSTAL_DOMAIN {
     reverse_proxy localhost:5000
@@ -153,13 +171,26 @@ docker run -d \
    caddy:alpine
 
 # ==========================================
-# 完成
+# 完成检查
 # ==========================================
 echo -e ""
 echo -e "${GREEN}#############################################${NC}"
 echo -e "${GREEN}             安装全部完成!                  ${NC}"
 echo -e "${GREEN}#############################################${NC}"
-echo -e "管理后台地址: https://$POSTAL_DOMAIN"
-echo -e "DNS 设置提示:"
-echo -e "请确保您的域名 $POSTAL_DOMAIN 解析到了本机 IP: $(curl -s ifconfig.me)"
+echo -e "管理后台: https://$POSTAL_DOMAIN"
+echo -e ""
+echo -e "${YELLOW}检查端口状态:${NC}"
+
+# 简单的检查函数
+check_port() {
+    if docker ps | grep -q "$1"; then
+        echo -e "  - $2: ${GREEN}运行中 (已映射)${NC}"
+    else
+        echo -e "  - $2: ${RED}未检测到 (请检查日志)${NC}"
+    fi
+}
+
+check_port "0.0.0.0:25->25" "SMTP (25端口)"
+check_port "postal-web" "Web 面板"
+check_port "postal-caddy" "Caddy (SSL代理)"
 echo -e ""
