@@ -136,10 +136,12 @@ def send_telegram(msg):
 class RelayHandler:
     async def handle_DATA(self, server, session, envelope):
         cfg = load_config()
-        pool = cfg.get('downstream_pool', [])
+        all_pool = cfg.get('downstream_pool', [])
+        # Filter enabled nodes (default True)
+        pool = [n for n in all_pool if n.get('enabled', True)]
         
         if not pool:
-            logger.warning("❌ No downstream nodes available")
+            logger.warning("❌ No enabled downstream nodes available")
             return '451 Temporary failure: No nodes'
         
         # Load Balancing: Randomly assign a node at reception
@@ -274,9 +276,17 @@ def api_save():
 def api_queue_stats():
     with get_db() as conn:
         # Total stats
-        total = dict(conn.execute("SELECT status, COUNT(*) as c FROM queue GROUP BY status").fetchall())
-        # Per node pending
-        nodes = dict(conn.execute("SELECT assigned_node, COUNT(*) as c FROM queue WHERE status='pending' GROUP BY assigned_node").fetchall())
+        rows = conn.execute("SELECT status, COUNT(*) as c FROM queue GROUP BY status").fetchall()
+        total = {r['status']: r['c'] for r in rows}
+        
+        # Node stats
+        rows = conn.execute("SELECT assigned_node, status, COUNT(*) as c FROM queue GROUP BY assigned_node, status").fetchall()
+        nodes = {}
+        for r in rows:
+            n = r['assigned_node']
+            if n not in nodes: nodes[n] = {}
+            nodes[n][r['status']] = r['c']
+            
     return jsonify({"total": total, "nodes": nodes})
 
 @app.route('/api/queue/list')
@@ -327,6 +337,8 @@ EOF
         .btn-del { position: absolute; top: 10px; right: 10px; z-index: 10; }
         .section-title { font-size: 0.9rem; font-weight: bold; color: #6c757d; margin-bottom: 10px; text-transform: uppercase; letter-spacing: 1px; }
         .nav-tabs .nav-link { cursor: pointer; }
+        .status-dot { height: 10px; width: 10px; background-color: #bbb; border-radius: 50%; display: inline-block; margin-right: 5px; }
+        .status-dot.active { background-color: #198754; }
     </style>
 </head>
 <body class="bg-light">
@@ -349,9 +361,71 @@ EOF
         </div>
 
         <ul class="nav nav-tabs mb-4">
-            <li class="nav-item"><a class="nav-link" :class="{active: tab=='settings'}" @click="tab='settings'">⚙️ 配置管理</a></li>
             <li class="nav-item"><a class="nav-link" :class="{active: tab=='queue'}" @click="tab='queue'">📨 邮件队列</a></li>
+            <li class="nav-item"><a class="nav-link" :class="{active: tab=='settings'}" @click="tab='settings'">⚙️ 配置管理</a></li>
         </ul>
+
+        <!-- Queue Tab -->
+        <div v-show="tab=='queue'">
+            <div class="row mb-3 g-3">
+                <div class="col-md-3"><div class="card bg-warning text-dark h-100"><div class="card-body text-center"><h3>[[ qStats.total.pending || 0 ]]</h3><small>待发送 (Pending)</small></div></div></div>
+                <div class="col-md-3"><div class="card bg-info text-white h-100"><div class="card-body text-center"><h3>[[ qStats.total.processing || 0 ]]</h3><small>发送中 (Processing)</small></div></div></div>
+                <div class="col-md-3"><div class="card bg-success text-white h-100"><div class="card-body text-center"><h3>[[ qStats.total.sent || 0 ]]</h3><small>已成功 (Sent)</small></div></div></div>
+                <div class="col-md-3"><div class="card bg-danger text-white h-100"><div class="card-body text-center"><h3>[[ qStats.total.failed || 0 ]]</h3><small>已失败 (Failed)</small></div></div></div>
+            </div>
+
+            <!-- Node Stats Table -->
+            <div class="card mb-4 shadow-sm">
+                <div class="card-header bg-light fw-bold">📊 节点发送统计</div>
+                <div class="card-body p-0">
+                    <div class="table-responsive">
+                        <table class="table table-sm table-striped mb-0 text-center">
+                            <thead><tr><th class="text-start ps-3">节点名称</th><th>待发送</th><th>已成功</th><th>已失败</th></tr></thead>
+                            <tbody>
+                                <tr v-for="(s, name) in qStats.nodes" :key="name">
+                                    <td class="text-start ps-3 fw-bold">[[ name ]]</td>
+                                    <td><span class="badge bg-warning text-dark">[[ s.pending || 0 ]]</span></td>
+                                    <td><span class="badge bg-success">[[ s.sent || 0 ]]</span></td>
+                                    <td><span class="badge bg-danger">[[ s.failed || 0 ]]</span></td>
+                                </tr>
+                                <tr v-if="Object.keys(qStats.nodes).length === 0"><td colspan="4" class="text-muted py-2">暂无节点数据</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="d-flex justify-content-between mb-2">
+                <button class="btn btn-sm btn-primary" @click="fetchQueue">🔄 刷新列表</button>
+                <button class="btn btn-sm btn-outline-danger" @click="clearQueue">🗑️ 清理已完成/失败记录</button>
+            </div>
+
+            <div class="table-responsive bg-white shadow-sm rounded">
+                <table class="table table-hover mb-0">
+                    <thead class="table-light"><tr><th>ID</th><th>From / To</th><th>Node</th><th>Status</th><th>Retry</th><th>Time</th></tr></thead>
+                    <tbody>
+                        <tr v-for="m in qList" :key="m.id">
+                            <td>#[[ m.id ]]</td>
+                            <td>
+                                <div class="small fw-bold">[[ m.mail_from ]]</div>
+                                <div class="small text-muted text-truncate" style="max-width:200px">[[ m.rcpt_tos ]]</div>
+                            </td>
+                            <td><span class="badge bg-secondary">[[ m.assigned_node ]]</span></td>
+                            <td>
+                                <span v-if="m.status=='pending'" class="badge bg-warning text-dark">Pending</span>
+                                <span v-else-if="m.status=='processing'" class="badge bg-info">Sending</span>
+                                <span v-else-if="m.status=='sent'" class="badge bg-success">Sent</span>
+                                <span v-else class="badge bg-danger">Failed</span>
+                                <div v-if="m.last_error" class="text-danger small mt-1" style="font-size:0.75rem">[[ m.last_error ]]</div>
+                            </td>
+                            <td>[[ m.retry_count ]]</td>
+                            <td><small class="text-muted">[[ m.created_at ]]</small></td>
+                        </tr>
+                        <tr v-if="qList.length===0"><td colspan="6" class="text-center py-4 text-muted">暂无数据</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
 
         <!-- Settings Tab -->
         <div v-show="tab=='settings'">
@@ -389,13 +463,21 @@ EOF
                 <div class="card-body bg-light">
                     <div v-if="config.downstream_pool.length === 0" class="text-center text-muted py-5">暂无转发节点</div>
                     
-                    <div v-for="(n, i) in config.downstream_pool" :key="i" class="pool-item shadow-sm">
+                    <div v-for="(n, i) in config.downstream_pool" :key="i" class="pool-item shadow-sm" :class="{'opacity-50': n.enabled === false}">
                         <button class="btn btn-danger btn-sm btn-del" @click="delNode(i)">删除</button>
                         <div class="row g-3">
-                            <div class="col-12 d-flex align-items-center">
-                                <div class="section-title mb-0 me-3">连接信息</div>
-                                <span v-if="qStats.nodes && qStats.nodes[n.name]" class="badge bg-warning text-dark">
-                                    待发送: [[ qStats.nodes[n.name].c ]]
+                            <div class="col-12 d-flex align-items-center justify-content-between">
+                                <div class="d-flex align-items-center">
+                                    <div class="section-title mb-0 me-3">连接信息</div>
+                                    <div class="form-check form-switch">
+                                        <input class="form-check-input" type="checkbox" :id="'sw'+i" v-model="n.enabled">
+                                        <label class="form-check-label small fw-bold" :for="'sw'+i" :class="n.enabled!==false?'text-success':'text-muted'">
+                                            [[ n.enabled!==false ? '🟢 已启用' : '⚪ 已暂停' ]]
+                                        </label>
+                                    </div>
+                                </div>
+                                <span v-if="qStats.nodes && qStats.nodes[n.name] && qStats.nodes[n.name].pending" class="badge bg-warning text-dark">
+                                    待发送: [[ qStats.nodes[n.name].pending ]]
                                 </span>
                             </div>
                             <div class="col-md-3"><label class="small text-muted">备注名 (唯一)</label><input v-model="n.name" class="form-control"></div>
@@ -421,47 +503,6 @@ EOF
             </div>
         </div>
 
-        <!-- Queue Tab -->
-        <div v-show="tab=='queue'">
-            <div class="row mb-3 g-3">
-                <div class="col-md-3"><div class="card bg-warning text-dark h-100"><div class="card-body text-center"><h3>[[ (qStats.total && qStats.total.pending && qStats.total.pending.c) || 0 ]]</h3><small>待发送 (Pending)</small></div></div></div>
-                <div class="col-md-3"><div class="card bg-info text-white h-100"><div class="card-body text-center"><h3>[[ (qStats.total && qStats.total.processing && qStats.total.processing.c) || 0 ]]</h3><small>发送中 (Processing)</small></div></div></div>
-                <div class="col-md-3"><div class="card bg-success text-white h-100"><div class="card-body text-center"><h3>[[ (qStats.total && qStats.total.sent && qStats.total.sent.c) || 0 ]]</h3><small>已成功 (Sent)</small></div></div></div>
-                <div class="col-md-3"><div class="card bg-danger text-white h-100"><div class="card-body text-center"><h3>[[ (qStats.total && qStats.total.failed && qStats.total.failed.c) || 0 ]]</h3><small>已失败 (Failed)</small></div></div></div>
-            </div>
-            
-            <div class="d-flex justify-content-between mb-2">
-                <button class="btn btn-sm btn-primary" @click="fetchQueue">🔄 刷新列表</button>
-                <button class="btn btn-sm btn-outline-danger" @click="clearQueue">🗑️ 清理已完成/失败记录</button>
-            </div>
-
-            <div class="table-responsive bg-white shadow-sm rounded">
-                <table class="table table-hover mb-0">
-                    <thead class="table-light"><tr><th>ID</th><th>From / To</th><th>Node</th><th>Status</th><th>Retry</th><th>Time</th></tr></thead>
-                    <tbody>
-                        <tr v-for="m in qList" :key="m.id">
-                            <td>#[[ m.id ]]</td>
-                            <td>
-                                <div class="small fw-bold">[[ m.mail_from ]]</div>
-                                <div class="small text-muted text-truncate" style="max-width:200px">[[ m.rcpt_tos ]]</div>
-                            </td>
-                            <td><span class="badge bg-secondary">[[ m.assigned_node ]]</span></td>
-                            <td>
-                                <span v-if="m.status=='pending'" class="badge bg-warning text-dark">Pending</span>
-                                <span v-else-if="m.status=='processing'" class="badge bg-info">Sending</span>
-                                <span v-else-if="m.status=='sent'" class="badge bg-success">Sent</span>
-                                <span v-else class="badge bg-danger">Failed</span>
-                                <div v-if="m.last_error" class="text-danger small mt-1" style="font-size:0.75rem">[[ m.last_error ]]</div>
-                            </td>
-                            <td>[[ m.retry_count ]]</td>
-                            <td><small class="text-muted">[[ m.created_at ]]</small></td>
-                        </tr>
-                        <tr v-if="qList.length===0"><td colspan="6" class="text-center py-4 text-muted">暂无数据</td></tr>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-
     </div>
     <script>
         const { createApp } = Vue;
@@ -471,17 +512,19 @@ EOF
                 config: {{ config|tojson }}, 
                 saving: false, 
                 showPwd: false,
-                tab: 'settings',
+                tab: 'queue',
                 qStats: { total: {}, nodes: {} },
                 qList: []
             }},
             mounted() {
+                // Ensure enabled property exists
+                this.config.downstream_pool.forEach(n => { if(n.enabled === undefined) n.enabled = true; });
                 this.fetchQueue();
                 setInterval(this.fetchQueue, 5000); // Auto refresh every 5s
             },
             methods: {
                 addNode() { 
-                    this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '' }); 
+                    this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true }); 
                 },
                 delNode(i) { if(confirm('确定删除?')) this.config.downstream_pool.splice(i, 1); },
                 async save() {
