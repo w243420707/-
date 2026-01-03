@@ -890,9 +890,20 @@ EOF
             mounted() {
                 if(!this.config.limit_config) this.config.limit_config = { max_per_hour: 0, min_interval: 1, max_interval: 5 };
                 this.config.downstream_pool.forEach(n => { if(n.enabled === undefined) n.enabled = true; });
+                
+                // Auto-load draft
+                const draft = localStorage.getItem('smtp_draft');
+                if(draft) { try { this.bulk = JSON.parse(draft); } catch(e){} }
+
                 this.fetchQueue();
                 this.fetchContactCount();
                 setInterval(this.fetchQueue, 5000);
+            },
+            watch: {
+                bulk: {
+                    handler(v) { localStorage.setItem('smtp_draft', JSON.stringify(v)); },
+                    deep: true
+                }
             },
             methods: {
                 getStatusColor(status) {
