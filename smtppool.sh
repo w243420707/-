@@ -428,32 +428,35 @@ def api_send_bulk():
 
         count = 0
         charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        tasks = []
         
+        for rcpt in recipients:
+            # Randomize
+            rand_sub = ''.join(random.choices(charset, k=6))
+            rand_body = ''.join(random.choices(charset, k=12))
+            
+            footer = "<div style='clear:both;margin-top:20px;text-align:left;'><hr><span style='color:#999;font-size:12px;'>如需退订此邮件，请到官网联系在线客服即可。</span></div>"
+            final_subject = f"{subject} {rand_sub}"
+            final_body = f"{body}{footer}<div style='display:none;opacity:0;font-size:0'>{rand_body}</div>"
+
+            msg = MIMEText(final_body, 'html', 'utf-8')
+            msg['Subject'] = final_subject
+            msg['From'] = '' # Placeholder, worker will fill
+            msg['To'] = rcpt
+            msg['Date'] = formatdate(localtime=True)
+            msg['Message-ID'] = make_msgid()
+
+            node = random.choice(pool)
+            node_name = node.get('name', 'Unknown')
+            
+            tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk'))
+            count += 1
+            
         with get_db() as conn:
-            for rcpt in recipients:
-                # Randomize
-                rand_sub = ''.join(random.choices(charset, k=6))
-                rand_body = ''.join(random.choices(charset, k=12))
-                
-                footer = "<div style='clear:both;width:100%;display:block;margin-top:20px;text-align:center;'><hr><span style='color:#999;font-size:12px;'>如需退订此邮件，请到官网联系在线客服即可。</span></div>"
-                final_subject = f"{subject} {rand_sub}"
-                final_body = f"{body}{footer}<div style='display:none;opacity:0;font-size:0'>{rand_body}</div>"
-
-                msg = MIMEText(final_body, 'html', 'utf-8')
-                msg['Subject'] = final_subject
-                msg['From'] = '' # Placeholder, worker will fill
-                msg['To'] = rcpt
-                msg['Date'] = formatdate(localtime=True)
-                msg['Message-ID'] = make_msgid()
-
-                node = random.choice(pool)
-                node_name = node.get('name', 'Unknown')
-                
-                conn.execute(
-                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source) VALUES (?, ?, ?, ?, ?, ?)",
-                    ('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk')
-                )
-                count += 1
+            conn.executemany(
+                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source) VALUES (?, ?, ?, ?, ?, ?)",
+                tasks
+            )
                 
         return jsonify({"status": "ok", "count": count})
     except Exception as e:
