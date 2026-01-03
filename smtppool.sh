@@ -435,372 +435,307 @@ EOF
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>SMTP Relay Manager</title>
+    <title>SMTP Relay Pro</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <style>
-        :root { --primary-color: #4361ee; --bg-color: #f3f4f6; }
-        body { background-color: var(--bg-color); font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; color: #374151; }
-        .navbar { background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.05); padding: 0.75rem 0; }
-        .navbar-brand { font-weight: 700; color: var(--primary-color); font-size: 1.25rem; }
-        .card { border: none; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.03); transition: transform 0.2s; }
-        .card:hover { transform: translateY(-2px); }
-        .stat-card { border-left: 4px solid transparent; }
-        .stat-card.pending { border-color: #f59e0b; }
-        .stat-card.processing { border-color: #3b82f6; }
-        .stat-card.sent { border-color: #10b981; }
-        .stat-card.failed { border-color: #ef4444; }
-        .stat-value { font-size: 2rem; font-weight: 700; line-height: 1; margin-bottom: 0.5rem; }
-        .stat-label { color: #6b7280; font-size: 0.875rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }
-        .nav-pills .nav-link { border-radius: 8px; color: #4b5563; font-weight: 500; padding: 0.75rem 1.5rem; transition: all 0.2s; }
-        .nav-pills .nav-link.active { background-color: var(--primary-color); color: #fff; box-shadow: 0 4px 6px -1px rgba(67, 97, 238, 0.4); }
-        .table thead th { background-color: #f9fafb; color: #6b7280; font-weight: 600; text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.05em; border-bottom: 1px solid #e5e7eb; }
-        .badge { padding: 0.5em 0.75em; font-weight: 600; border-radius: 6px; }
-        .badge-soft-warning { background-color: #fffbeb; color: #b45309; }
-        .badge-soft-info { background-color: #eff6ff; color: #1d4ed8; }
-        .badge-soft-success { background-color: #ecfdf5; color: #047857; }
-        .badge-soft-danger { background-color: #fef2f2; color: #b91c1c; }
-        .badge-soft-secondary { background-color: #f3f4f6; color: #4b5563; }
-        .node-card { border: 1px solid #e5e7eb; }
-        .node-card.disabled { opacity: 0.6; background-color: #f9fafb; }
-        .form-label { font-size: 0.875rem; font-weight: 500; color: #374151; margin-bottom: 0.4rem; }
-        .form-control, .form-select { border-radius: 8px; border-color: #d1d5db; padding: 0.6rem 0.8rem; font-size: 0.9rem; }
-        .form-control:focus { border-color: var(--primary-color); box-shadow: 0 0 0 3px rgba(67, 97, 238, 0.15); }
-        .btn { border-radius: 8px; font-weight: 500; padding: 0.5rem 1rem; transition: all 0.2s; }
-        .btn-primary { background-color: var(--primary-color); border-color: var(--primary-color); }
-        .btn-primary:hover { background-color: #3651d4; }
-        .fade-enter-active, .fade-leave-active { transition: opacity 0.2s ease; }
-        .fade-enter-from, .fade-leave-to { opacity: 0; }
+        :root { --primary-bg: #f8f9fa; }
+        body { background-color: var(--primary-bg); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+        .main-card { border: none; box-shadow: 0 0.5rem 1rem rgba(0, 0, 0, 0.05); border-radius: 1rem; overflow: hidden; }
+        .nav-tabs .nav-link { border: none; color: #6c757d; padding: 1rem 1.5rem; font-weight: 500; }
+        .nav-tabs .nav-link.active { color: #0d6efd; border-bottom: 3px solid #0d6efd; background: transparent; }
+        .nav-tabs .nav-link:hover { color: #0d6efd; }
+        .stat-card { transition: transform 0.2s; border: none; border-radius: 1rem; }
+        .stat-card:hover { transform: translateY(-3px); }
+        .table-custom th { background-color: #f8f9fa; font-weight: 600; text-transform: uppercase; font-size: 0.8rem; letter-spacing: 0.5px; }
+        .status-badge { font-size: 0.75rem; padding: 0.35em 0.65em; }
+        .btn-icon { display: inline-flex; align-items: center; gap: 0.5rem; }
     </style>
 </head>
 <body>
-    <div id="app">
-        <!-- Navbar -->
-        <nav class="navbar navbar-expand-lg sticky-top mb-4">
-            <div class="container">
-                <a class="navbar-brand" href="#"><i class="bi bi-send-check-fill me-2"></i>SMTP Relay Manager</a>
-                <div class="d-flex align-items-center">
-                    <button class="btn btn-light text-secondary me-2 btn-sm" @click="showPwd = !showPwd" title="修改密码"><i class="bi bi-key"></i></button>
-                    <div class="btn-group">
-                        <button class="btn btn-primary" @click="save" :disabled="saving">
-                            <span v-if="saving" class="spinner-border spinner-border-sm me-1"></span>
-                            <i v-else class="bi bi-save me-1"></i> 保存配置
-                        </button>
-                        <button class="btn btn-danger" @click="saveAndRestart" :disabled="saving" title="保存并重启服务">
-                            <i class="bi bi-power"></i>
-                        </button>
-                    </div>
+    <div id="app" class="container py-4">
+        <!-- Header -->
+        <header class="d-flex justify-content-between align-items-center mb-4">
+            <div class="d-flex align-items-center">
+                <div class="bg-primary text-white rounded-circle p-2 me-3 d-flex align-items-center justify-content-center" style="width: 48px; height: 48px;">
+                    <i class="bi bi-send-fill fs-4"></i>
+                </div>
+                <div>
+                    <h4 class="mb-0 fw-bold">SMTP Relay Manager</h4>
+                    <small class="text-muted">高性能邮件中继系统</small>
                 </div>
             </div>
-        </nav>
+            <div class="d-flex gap-2">
+                <button class="btn btn-light text-primary" @click="showPwd = !showPwd">
+                    <i class="bi bi-key-fill"></i> <span class="d-none d-md-inline">改密</span>
+                </button>
+                <button class="btn btn-primary btn-icon" @click="save" :disabled="saving">
+                    <span v-if="saving" class="spinner-border spinner-border-sm"></span>
+                    <i v-else class="bi bi-save"></i> <span>保存配置</span>
+                </button>
+                <button class="btn btn-danger btn-icon" @click="saveAndRestart" :disabled="saving">
+                    <i class="bi bi-power"></i> <span>重启服务</span>
+                </button>
+            </div>
+        </header>
 
-        <div class="container pb-5">
-            <!-- Password Modal (Inline) -->
-            <transition name="fade">
-                <div v-if="showPwd" class="alert alert-warning shadow-sm d-flex align-items-center mb-4" role="alert">
-                    <i class="bi bi-exclamation-triangle-fill me-2 fs-4"></i>
-                    <div class="flex-grow-1">
-                        <div class="fw-bold">修改 Web 面板登录密码</div>
-                        <div class="d-flex mt-2">
-                            <input type="text" v-model="config.web_config.admin_password" class="form-control form-control-sm me-2" style="max-width: 200px;" placeholder="输入新密码">
-                            <button class="btn btn-sm btn-success" @click="save">保存</button>
+        <!-- Password Change Alert -->
+        <div v-if="showPwd" class="alert alert-light border shadow-sm mb-4">
+            <div class="d-flex align-items-center justify-content-between">
+                <div class="d-flex align-items-center gap-3">
+                    <i class="bi bi-shield-lock fs-3 text-warning"></i>
+                    <div>
+                        <h6 class="mb-1">修改管理员密码</h6>
+                        <div class="input-group input-group-sm">
+                            <input type="text" v-model="config.web_config.admin_password" class="form-control" placeholder="新密码">
+                            <button class="btn btn-success" @click="save">确认修改</button>
                         </div>
                     </div>
-                    <button type="button" class="btn-close" @click="showPwd = false"></button>
                 </div>
-            </transition>
+                <button type="button" class="btn-close" @click="showPwd = false"></button>
+            </div>
+        </div>
 
-            <!-- Navigation Pills -->
-            <ul class="nav nav-pills mb-4 justify-content-center">
+        <!-- Main Content -->
+        <div class="main-card bg-white">
+            <!-- Tabs -->
+            <ul class="nav nav-tabs px-4 pt-2">
                 <li class="nav-item">
-                    <a class="nav-link" :class="{active: tab=='queue'}" @click="tab='queue'" href="#"><i class="bi bi-envelope-paper me-2"></i>邮件队列监控</a>
+                    <a class="nav-link" :class="{active: tab=='queue'}" href="#" @click.prevent="tab='queue'">
+                        <i class="bi bi-activity me-2"></i>运行监控
+                    </a>
                 </li>
-                <li class="nav-item ms-2">
-                    <a class="nav-link" :class="{active: tab=='settings'}" @click="tab='settings'" href="#"><i class="bi bi-sliders me-2"></i>系统配置管理</a>
+                <li class="nav-item">
+                    <a class="nav-link" :class="{active: tab=='send'}" href="#" @click.prevent="tab='send'">
+                        <i class="bi bi-envelope-plus me-2"></i>邮件群发
+                    </a>
                 </li>
-                <li class="nav-item ms-2">
-                    <a class="nav-link" :class="{active: tab=='send'}" @click="tab='send'" href="#"><i class="bi bi-send-plus me-2"></i>邮件群发</a>
+                <li class="nav-item">
+                    <a class="nav-link" :class="{active: tab=='settings'}" href="#" @click.prevent="tab='settings'">
+                        <i class="bi bi-gear me-2"></i>系统设置
+                    </a>
                 </li>
             </ul>
 
-            <!-- Send Tab -->
-            <div v-if="tab=='send'">
-                <div class="card shadow-sm">
-                    <div class="card-header bg-white py-3 fw-bold text-primary"><i class="bi bi-send-plus me-2"></i>新建群发任务</div>
-                    <div class="card-body">
-                        <div class="row g-3">
-                            <div class="col-md-6">
-                                <label class="form-label">发件人 (From)</label>
-                                <input v-model="bulk.sender" class="form-control" placeholder="例如: marketing@example.com">
-                            </div>
-                            <div class="col-md-6">
-                                <label class="form-label">邮件主题 (Subject)</label>
-                                <input v-model="bulk.subject" class="form-control" placeholder="请输入邮件标题">
-                            </div>
-                            <div class="col-12">
-                                <label class="form-label">收件人列表 (每行一个邮箱)</label>
-                                <div class="d-flex justify-content-between align-items-center mb-2">
-                                    <small class="text-muted">当前输入框: [[ recipientCount ]] 个</small>
-                                    <div class="btn-group btn-group-sm">
-                                        <button class="btn btn-outline-secondary" @click="saveContacts" title="将输入框的邮箱保存到数据库(去重)">
-                                            <i class="bi bi-person-plus-fill"></i> 保存到通讯录
-                                        </button>
-                                        <button class="btn btn-outline-secondary" @click="loadContacts" title="从数据库加载所有邮箱到输入框">
-                                            <i class="bi bi-box-arrow-in-down"></i> 加载通讯录 ([[ contactCount ]])
-                                        </button>
-                                        <button class="btn btn-outline-danger" @click="clearContacts" title="清空数据库中的通讯录">
-                                            <i class="bi bi-trash"></i>
-                                        </button>
+            <div class="p-4">
+                <!-- Queue Tab -->
+                <div v-if="tab=='queue'" class="fade-in">
+                    <!-- Stats Grid -->
+                    <div class="row g-4 mb-4">
+                        <div class="col-md-3 col-6" v-for="(label, key) in {'pending': '待发送', 'processing': '发送中', 'sent': '已成功', 'failed': '已失败'}" :key="key">
+                            <div class="stat-card p-3 h-100" :class="'bg-'+getStatusColor(key)+'-subtle'">
+                                <div class="d-flex justify-content-between">
+                                    <div>
+                                        <div class="text-muted small fw-bold text-uppercase">[[ label ]]</div>
+                                        <div class="fs-2 fw-bold" :class="'text-'+getStatusColor(key)">[[ qStats.total[key] || 0 ]]</div>
                                     </div>
+                                    <i :class="'bi bi-'+getStatusIcon(key)+' fs-1 text-'+getStatusColor(key)+' opacity-50'"></i>
                                 </div>
-                                <textarea v-model="bulk.recipients" class="form-control" rows="6" placeholder="user1@example.com&#10;user2@example.com"></textarea>
-                            </div>
-                            <div class="col-12">
-                                <label class="form-label">邮件内容 (支持 HTML)</label>
-                                <textarea v-model="bulk.body" class="form-control font-monospace" rows="10" placeholder="<h1>Hello</h1><p>This is a test email.</p>"></textarea>
-                            </div>
-                            <div class="col-12">
-                                <button class="btn btn-primary px-4" @click="sendBulk" :disabled="sending || recipientCount === 0">
-                                    <span v-if="sending" class="spinner-border spinner-border-sm me-2"></span>
-                                    <i v-else class="bi bi-rocket-takeoff me-2"></i>
-                                    [[ sending ? '正在提交任务...' : '开始群发' ]]
-                                </button>
                             </div>
                         </div>
                     </div>
-                </div>
-            </div>
 
-            <!-- Queue View -->
-            <div v-if="tab=='queue'">
-                <!-- Stats Cards -->
-                <div class="row g-3 mb-4">
-                    <div class="col-md-3 col-6">
-                        <div class="card stat-card pending h-100 p-3">
-                            <div class="d-flex justify-content-between align-items-start">
-                                <div>
-                                    <div class="stat-label">待发送 (Pending)</div>
-                                    <div class="stat-value text-warning">[[ qStats.total.pending || 0 ]]</div>
-                                </div>
-                                <div class="bg-warning bg-opacity-10 p-2 rounded text-warning"><i class="bi bi-hourglass-split fs-4"></i></div>
-                            </div>
+                    <!-- Node Status -->
+                    <div class="card border mb-4">
+                        <div class="card-header bg-white py-3">
+                            <h6 class="mb-0 fw-bold">节点实时状态</h6>
+                        </div>
+                        <div class="table-responsive">
+                            <table class="table table-custom table-hover mb-0 align-middle">
+                                <thead><tr><th>节点名称</th><th class="text-center">队列堆积</th><th class="text-center">成功数</th><th class="text-center">失败数</th></tr></thead>
+                                <tbody>
+                                    <tr v-for="(s, name) in qStats.nodes" :key="name">
+                                        <td class="fw-medium">[[ name ]]</td>
+                                        <td class="text-center"><span class="badge bg-warning text-dark">[[ s.pending || 0 ]]</span></td>
+                                        <td class="text-center text-success">[[ s.sent || 0 ]]</td>
+                                        <td class="text-center text-danger">[[ s.failed || 0 ]]</td>
+                                    </tr>
+                                    <tr v-if="Object.keys(qStats.nodes).length === 0"><td colspan="4" class="text-center text-muted py-3">暂无活动数据</td></tr>
+                                </tbody>
+                            </table>
                         </div>
                     </div>
-                    <div class="col-md-3 col-6">
-                        <div class="card stat-card processing h-100 p-3">
-                            <div class="d-flex justify-content-between align-items-start">
-                                <div>
-                                    <div class="stat-label">发送中 (Sending)</div>
-                                    <div class="stat-value text-primary">[[ qStats.total.processing || 0 ]]</div>
-                                </div>
-                                <div class="bg-primary bg-opacity-10 p-2 rounded text-primary"><i class="bi bi-send fs-4"></i></div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="col-md-3 col-6">
-                        <div class="card stat-card sent h-100 p-3">
-                            <div class="d-flex justify-content-between align-items-start">
-                                <div>
-                                    <div class="stat-label">已成功 (Sent)</div>
-                                    <div class="stat-value text-success">[[ qStats.total.sent || 0 ]]</div>
-                                </div>
-                                <div class="bg-success bg-opacity-10 p-2 rounded text-success"><i class="bi bi-check-circle fs-4"></i></div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="col-md-3 col-6">
-                        <div class="card stat-card failed h-100 p-3">
-                            <div class="d-flex justify-content-between align-items-start">
-                                <div>
-                                    <div class="stat-label">已失败 (Failed)</div>
-                                    <div class="stat-value text-danger">[[ qStats.total.failed || 0 ]]</div>
-                                </div>
-                                <div class="bg-danger bg-opacity-10 p-2 rounded text-danger"><i class="bi bi-x-circle fs-4"></i></div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
 
-                <!-- Node Performance -->
-                <div class="card mb-4">
-                    <div class="card-header bg-white py-3">
-                        <h6 class="mb-0 fw-bold"><i class="bi bi-bar-chart-fill me-2 text-primary"></i>节点性能统计</h6>
-                    </div>
-                    <div class="table-responsive">
-                        <table class="table table-hover align-middle mb-0">
-                            <thead><tr><th class="ps-4">节点名称</th><th class="text-center">待发送</th><th class="text-center">成功</th><th class="text-center">失败</th><th class="text-end pe-4">状态</th></tr></thead>
-                            <tbody>
-                                <tr v-for="(s, name) in qStats.nodes" :key="name">
-                                    <td class="ps-4 fw-bold text-dark">[[ name ]]</td>
-                                    <td class="text-center"><span class="badge badge-soft-warning">[[ s.pending || 0 ]]</span></td>
-                                    <td class="text-center"><span class="badge badge-soft-success">[[ s.sent || 0 ]]</span></td>
-                                    <td class="text-center"><span class="badge badge-soft-danger">[[ s.failed || 0 ]]</span></td>
-                                    <td class="text-end pe-4">
-                                        <span class="badge badge-soft-secondary">Active</span>
-                                    </td>
-                                </tr>
-                                <tr v-if="Object.keys(qStats.nodes).length === 0"><td colspan="5" class="text-center py-4 text-muted">暂无节点活动数据</td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-
-                <!-- Queue List -->
-                <div class="card">
-                    <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center">
-                        <h6 class="mb-0 fw-bold"><i class="bi bi-list-task me-2 text-primary"></i>最近邮件记录</h6>
-                        <div>
-                            <button class="btn btn-sm btn-outline-primary me-2" @click="fetchQueue"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
+                    <!-- Recent Logs -->
+                    <div class="d-flex justify-content-between align-items-center mb-3">
+                        <h5 class="mb-0 fw-bold">最近投递记录</h5>
+                        <div class="btn-group">
+                            <button class="btn btn-sm btn-outline-secondary" @click="fetchQueue"><i class="bi bi-arrow-clockwise"></i> 刷新</button>
                             <button class="btn btn-sm btn-outline-danger" @click="clearQueue"><i class="bi bi-trash"></i> 清理历史</button>
                         </div>
                     </div>
-                    <div class="table-responsive">
-                        <table class="table table-hover align-middle mb-0">
-                            <thead><tr><th class="ps-4">ID</th><th>发件人 / 收件人</th><th>分发节点</th><th>状态</th><th>重试</th><th class="text-end pe-4">时间</th></tr></thead>
+                    <div class="table-responsive border rounded">
+                        <table class="table table-custom table-hover mb-0 align-middle">
+                            <thead><tr><th class="ps-3">ID</th><th>发件人 / 收件人</th><th>节点</th><th>状态</th><th>时间</th></tr></thead>
                             <tbody>
                                 <tr v-for="m in qList" :key="m.id">
-                                    <td class="ps-4 text-muted small">#[[ m.id ]]</td>
+                                    <td class="ps-3 text-muted">#[[ m.id ]]</td>
                                     <td>
-                                        <div class="fw-bold text-dark">[[ m.mail_from ]]</div>
-                                        <div class="text-muted small text-truncate" style="max-width: 250px;">[[ m.rcpt_tos ]]</div>
+                                        <div class="fw-bold">[[ m.mail_from ]]</div>
+                                        <div class="text-muted small text-truncate" style="max-width: 300px;">[[ m.rcpt_tos ]]</div>
                                     </td>
-                                    <td><span class="badge badge-soft-secondary"><i class="bi bi-hdd-network me-1"></i>[[ m.assigned_node ]]</span></td>
+                                    <td><span class="badge bg-light text-dark border">[[ m.assigned_node ]]</span></td>
                                     <td>
-                                        <span v-if="m.status=='pending'" class="badge badge-soft-warning">Pending</span>
-                                        <span v-else-if="m.status=='processing'" class="badge badge-soft-info">Sending</span>
-                                        <span v-else-if="m.status=='sent'" class="badge badge-soft-success">Sent</span>
-                                        <span v-else class="badge badge-soft-danger">Failed</span>
-                                        <div v-if="m.last_error" class="text-danger small mt-1" style="font-size: 0.75rem;"><i class="bi bi-exclamation-circle me-1"></i>[[ m.last_error ]]</div>
+                                        <span class="badge status-badge" :class="'bg-'+getStatusColor(m.status)">[[ m.status ]]</span>
+                                        <div v-if="m.last_error" class="text-danger small mt-1" style="font-size: 0.75rem;">[[ m.last_error ]]</div>
                                     </td>
-                                    <td><span class="text-muted small">[[ m.retry_count ]]</span></td>
-                                    <td class="text-end pe-4 text-muted small">[[ m.created_at ]]</td>
+                                    <td class="text-muted small">[[ m.created_at ]]</td>
                                 </tr>
-                                <tr v-if="qList.length===0"><td colspan="6" class="text-center py-5 text-muted">
-                                    <i class="bi bi-inbox fs-1 d-block mb-2"></i>
-                                    暂无邮件记录
-                                </td></tr>
+                                <tr v-if="qList.length===0"><td colspan="5" class="text-center py-5 text-muted">暂无记录</td></tr>
                             </tbody>
                         </table>
                     </div>
                 </div>
-            </div>
 
-            <!-- Settings View -->
-            <div v-if="tab=='settings'">
-                <div class="row g-4 mb-4">
-                    <div class="col-md-6">
-                        <div class="card h-100">
-                            <div class="card-header bg-white py-3 fw-bold text-primary"><i class="bi bi-hdd-rack me-2"></i>监听设置</div>
-                            <div class="card-body">
-                                <div class="mb-3">
-                                    <label class="form-label">服务端口 <span class="badge bg-light text-dark border ms-1">重启生效</span></label>
-                                    <input type="number" v-model.number="config.server_config.port" class="form-control">
-                                </div>
-                                <div class="mb-3">
-                                    <label class="form-label">认证账号</label>
-                                    <input v-model="config.server_config.username" class="form-control">
-                                </div>
-                                <div class="mb-3">
-                                    <label class="form-label">认证密码</label>
-                                    <input v-model="config.server_config.password" class="form-control">
+                <!-- Send Tab -->
+                <div v-if="tab=='send'" class="fade-in">
+                    <div class="row g-4">
+                        <div class="col-lg-8">
+                            <div class="card border h-100">
+                                <div class="card-body">
+                                    <h6 class="card-title fw-bold mb-3">邮件内容编辑</h6>
+                                    <div class="mb-3">
+                                        <label class="form-label text-muted small">发件人 (From)</label>
+                                        <input v-model="bulk.sender" class="form-control" placeholder="sender@yourdomain.com">
+                                    </div>
+                                    <div class="mb-3">
+                                        <label class="form-label text-muted small">主题 (Subject)</label>
+                                        <input v-model="bulk.subject" class="form-control" placeholder="邮件主题...">
+                                    </div>
+                                    <div class="mb-3">
+                                        <label class="form-label text-muted small">正文 (HTML支持)</label>
+                                        <textarea v-model="bulk.body" class="form-control font-monospace" rows="12" placeholder="<html>...</html>"></textarea>
+                                    </div>
                                 </div>
                             </div>
                         </div>
-                    </div>
-                    <div class="col-md-6">
-                        <div class="card h-100">
-                            <div class="card-header bg-white py-3 fw-bold text-info"><i class="bi bi-bell me-2"></i>通知与日志</div>
-                            <div class="card-body">
-                                <div class="row g-3">
-                                    <div class="col-12">
-                                        <label class="form-label">Telegram Bot Token</label>
-                                        <input v-model="config.telegram_config.bot_token" class="form-control" placeholder="123456:ABC-DEF...">
+                        <div class="col-lg-4">
+                            <div class="card border h-100">
+                                <div class="card-body d-flex flex-column">
+                                    <h6 class="card-title fw-bold mb-3">收件人管理</h6>
+                                    <div class="mb-2 d-flex gap-2">
+                                        <button class="btn btn-sm btn-outline-primary flex-grow-1" @click="loadContacts">
+                                            <i class="bi bi-database-down"></i> 加载全部 ([[ contactCount ]])
+                                        </button>
+                                        <button class="btn btn-sm btn-outline-success flex-grow-1" @click="saveContacts">
+                                            <i class="bi bi-person-plus"></i> 保存当前
+                                        </button>
                                     </div>
-                                    <div class="col-12">
-                                        <label class="form-label">Chat ID</label>
-                                        <input v-model="config.telegram_config.admin_id" class="form-control" placeholder="12345678">
+                                    <textarea v-model="bulk.recipients" class="form-control flex-grow-1 mb-3" placeholder="每行一个邮箱地址..." style="min-height: 200px;"></textarea>
+                                    <div class="d-flex justify-content-between align-items-center mb-3">
+                                        <span class="text-muted small">共 [[ recipientCount ]] 人</span>
+                                        <button class="btn btn-sm btn-outline-danger" @click="clearContacts"><i class="bi bi-trash"></i> 清空库</button>
                                     </div>
-                                    <div class="col-6">
-                                        <label class="form-label">日志大小 (MB)</label>
-                                        <input type="number" v-model.number="config.log_config.max_mb" class="form-control">
-                                    </div>
-                                    <div class="col-6">
-                                        <label class="form-label">保留份数</label>
-                                        <input type="number" v-model.number="config.log_config.backups" class="form-control">
-                                    </div>
+                                    <button class="btn btn-primary w-100 py-2" @click="sendBulk" :disabled="sending || recipientCount === 0">
+                                        <span v-if="sending" class="spinner-border spinner-border-sm me-2"></span>
+                                        <i v-else class="bi bi-send-fill me-2"></i>
+                                        [[ sending ? '发送中...' : '确认发送' ]]
+                                    </button>
                                 </div>
                             </div>
                         </div>
                     </div>
                 </div>
 
-                <div class="card">
-                    <div class="card-header bg-white py-3 d-flex justify-content-between align-items-center">
-                        <h6 class="mb-0 fw-bold"><i class="bi bi-diagram-3 me-2 text-primary"></i>下游节点池 (Load Balancing)</h6>
-                        <button class="btn btn-sm btn-primary" @click="addNode"><i class="bi bi-plus-lg me-1"></i>添加节点</button>
-                    </div>
-                    <div class="card-body bg-light">
-                        <div v-if="config.downstream_pool.length === 0" class="text-center py-5 text-muted">
-                            <i class="bi bi-cloud-slash fs-1 d-block mb-2"></i>
-                            暂无转发节点，请点击右上角添加
-                        </div>
-                        
-                        <div v-for="(n, i) in config.downstream_pool" :key="i" class="card node-card mb-3 shadow-sm" :class="{'disabled': n.enabled === false}">
-                            <div class="card-body">
-                                <div class="d-flex justify-content-between align-items-center mb-3 border-bottom pb-2">
-                                    <div class="d-flex align-items-center">
-                                        <div class="form-check form-switch me-3">
-                                            <input class="form-check-input" type="checkbox" :id="'sw'+i" v-model="n.enabled" style="width: 3em; height: 1.5em;">
-                                        </div>
-                                        <div>
-                                            <h6 class="mb-0 fw-bold">[[ n.name ]]</h6>
-                                            <small :class="n.enabled!==false?'text-success':'text-muted'">
-                                                <i class="bi" :class="n.enabled!==false?'bi-check-circle-fill':'bi-pause-circle-fill'"></i>
-                                                [[ n.enabled!==false ? '运行中' : '已暂停' ]]
-                                            </small>
-                                        </div>
+                <!-- Settings Tab -->
+                <div v-if="tab=='settings'" class="fade-in">
+                    <div class="row g-4">
+                        <!-- Basic Config -->
+                        <div class="col-md-6">
+                            <div class="card border h-100">
+                                <div class="card-header bg-white fw-bold">基础监听配置</div>
+                                <div class="card-body">
+                                    <div class="mb-3">
+                                        <label class="form-label small text-muted">监听端口 (重启生效)</label>
+                                        <input type="number" v-model.number="config.server_config.port" class="form-control">
                                     </div>
-                                    <div class="d-flex align-items-center">
-                                        <span v-if="qStats.nodes && qStats.nodes[n.name] && qStats.nodes[n.name].pending" class="badge bg-warning text-dark me-3">
-                                            <i class="bi bi-hourglass-split me-1"></i>待发: [[ qStats.nodes[n.name].pending ]]
-                                        </span>
-                                        <button class="btn btn-outline-danger btn-sm" @click="delNode(i)"><i class="bi bi-trash"></i></button>
+                                    <div class="row g-3">
+                                        <div class="col-6">
+                                            <label class="form-label small text-muted">认证账号</label>
+                                            <input v-model="config.server_config.username" class="form-control">
+                                        </div>
+                                        <div class="col-6">
+                                            <label class="form-label small text-muted">认证密码</label>
+                                            <input v-model="config.server_config.password" class="form-control">
+                                        </div>
                                     </div>
                                 </div>
-
-                                <div class="row g-3">
-                                    <div class="col-md-3">
-                                        <label class="form-label text-muted small">备注名称</label>
-                                        <input v-model="n.name" class="form-control form-control-sm">
+                            </div>
+                        </div>
+                        <!-- Notification -->
+                        <div class="col-md-6">
+                            <div class="card border h-100">
+                                <div class="card-header bg-white fw-bold">通知与日志</div>
+                                <div class="card-body">
+                                    <div class="row g-3 mb-3">
+                                        <div class="col-8">
+                                            <label class="form-label small text-muted">TG Bot Token</label>
+                                            <input v-model="config.telegram_config.bot_token" class="form-control form-control-sm">
+                                        </div>
+                                        <div class="col-4">
+                                            <label class="form-label small text-muted">Chat ID</label>
+                                            <input v-model="config.telegram_config.admin_id" class="form-control form-control-sm">
+                                        </div>
                                     </div>
-                                    <div class="col-md-4">
-                                        <label class="form-label text-muted small">SMTP Host</label>
-                                        <input v-model="n.host" class="form-control form-control-sm" placeholder="smtp.example.com">
+                                    <div class="row g-3">
+                                        <div class="col-6">
+                                            <label class="form-label small text-muted">日志大小(MB)</label>
+                                            <input type="number" v-model.number="config.log_config.max_mb" class="form-control form-control-sm">
+                                        </div>
+                                        <div class="col-6">
+                                            <label class="form-label small text-muted">保留份数</label>
+                                            <input type="number" v-model.number="config.log_config.backups" class="form-control form-control-sm">
+                                        </div>
                                     </div>
-                                    <div class="col-md-2">
-                                        <label class="form-label text-muted small">Port</label>
-                                        <input v-model.number="n.port" class="form-control form-control-sm">
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <!-- Node Pool -->
+                        <div class="col-12">
+                            <div class="card border">
+                                <div class="card-header bg-white d-flex justify-content-between align-items-center">
+                                    <span class="fw-bold">下游节点池 (Load Balancing)</span>
+                                    <button class="btn btn-sm btn-primary" @click="addNode"><i class="bi bi-plus-lg"></i> 添加节点</button>
+                                </div>
+                                <div class="card-body bg-light p-3">
+                                    <div v-if="config.downstream_pool.length === 0" class="text-center py-4 text-muted">
+                                        暂无节点，请添加
                                     </div>
-                                    <div class="col-md-3">
-                                        <label class="form-label text-muted small">加密方式</label>
-                                        <select v-model="n.encryption" class="form-select form-select-sm">
-                                            <option value="none">STARTTLS / 无</option>
-                                            <option value="tls">TLS</option>
-                                            <option value="ssl">SSL (465)</option>
-                                        </select>
-                                    </div>
-                                    <div class="col-md-4">
-                                        <label class="form-label text-muted small">SMTP 账号</label>
-                                        <input v-model="n.username" class="form-control form-control-sm">
-                                    </div>
-                                    <div class="col-md-4">
-                                        <label class="form-label text-muted small">SMTP 密码</label>
-                                        <input v-model="n.password" class="form-control form-control-sm" type="password">
-                                    </div>
-                                    <div class="col-md-4">
-                                        <label class="form-label text-primary small fw-bold">强制发件人 (Sender Rewrite)</label>
-                                        <input v-model="n.sender_email" class="form-control form-control-sm" placeholder="留空则不修改">
+                                    <div v-for="(n, i) in config.downstream_pool" :key="i" class="card mb-3 shadow-sm">
+                                        <div class="card-body">
+                                            <div class="d-flex justify-content-between align-items-center mb-3">
+                                                <div class="d-flex align-items-center gap-3">
+                                                    <div class="form-check form-switch">
+                                                        <input class="form-check-input" type="checkbox" v-model="n.enabled" style="width: 2.5em; height: 1.25em;">
+                                                    </div>
+                                                    <span class="fw-bold">[[ n.name ]]</span>
+                                                    <span class="badge" :class="n.enabled!==false?'bg-success':'bg-secondary'">[[ n.enabled!==false?'启用':'禁用' ]]</span>
+                                                </div>
+                                                <button class="btn btn-sm btn-outline-danger" @click="delNode(i)"><i class="bi bi-trash"></i></button>
+                                            </div>
+                                            <div class="row g-2">
+                                                <div class="col-md-2"><input v-model="n.name" class="form-control form-control-sm" placeholder="备注"></div>
+                                                <div class="col-md-3"><input v-model="n.host" class="form-control form-control-sm" placeholder="Host"></div>
+                                                <div class="col-md-1"><input v-model.number="n.port" class="form-control form-control-sm" placeholder="Port"></div>
+                                                <div class="col-md-2">
+                                                    <select v-model="n.encryption" class="form-select form-select-sm">
+                                                        <option value="none">None</option>
+                                                        <option value="tls">TLS</option>
+                                                        <option value="ssl">SSL</option>
+                                                    </select>
+                                                </div>
+                                                <div class="col-md-2"><input v-model="n.username" class="form-control form-control-sm" placeholder="User"></div>
+                                                <div class="col-md-2"><input v-model="n.password" type="password" class="form-control form-control-sm" placeholder="Pass"></div>
+                                                <div class="col-md-12 mt-2">
+                                                    <div class="input-group input-group-sm">
+                                                        <span class="input-group-text">Sender Rewrite</span>
+                                                        <input v-model="n.sender_email" class="form-control" placeholder="强制修改发件人地址 (留空不修改)">
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
                                     </div>
                                 </div>
                             </div>
@@ -817,7 +752,7 @@ EOF
             delimiters: ['[[', ']]'],
             data() {
                 return {
-                    tab: 'dashboard',
+                    tab: 'queue',
                     config: {{ config | tojson }},
                     saving: false,
                     showPwd: false,
@@ -838,6 +773,14 @@ EOF
                 setInterval(this.fetchQueue, 5000);
             },
             methods: {
+                getStatusColor(status) {
+                    const map = { 'pending': 'warning', 'processing': 'primary', 'sent': 'success', 'failed': 'danger' };
+                    return map[status] || 'secondary';
+                },
+                getStatusIcon(status) {
+                    const map = { 'pending': 'hourglass-split', 'processing': 'send', 'sent': 'check-circle', 'failed': 'x-circle' };
+                    return map[status] || 'question-circle';
+                },
                 async fetchContactCount() {
                     try {
                         const res = await fetch('/api/contacts/count');
@@ -848,7 +791,7 @@ EOF
                 async saveContacts() {
                     const emails = this.bulk.recipients.split('\n').filter(r => r.trim());
                     if(emails.length === 0) return alert('输入框为空');
-                    if(!confirm(`确定将这 ${emails.length} 个邮箱保存到通讯录吗？(会自动去重)`)) return;
+                    if(!confirm(`确定保存 ${emails.length} 个邮箱? (自动去重)`)) return;
                     try {
                         const res = await fetch('/api/contacts/import', {
                             method: 'POST',
@@ -856,47 +799,47 @@ EOF
                             body: JSON.stringify({emails: emails})
                         });
                         const data = await res.json();
-                        alert(`成功新增 ${data.added} 个联系人`);
+                        alert(`成功新增 ${data.added} 个`);
                         this.fetchContactCount();
-                    } catch(e) { alert('保存失败: ' + e); }
+                    } catch(e) { alert('失败: ' + e); }
                 },
                 async loadContacts() {
-                    if(this.bulk.recipients && !confirm('输入框已有内容，确定要覆盖吗？')) return;
+                    if(this.bulk.recipients && !confirm('覆盖当前输入框?')) return;
                     try {
                         const res = await fetch('/api/contacts/list');
                         const emails = await res.json();
                         this.bulk.recipients = emails.join('\n');
-                    } catch(e) { alert('加载失败: ' + e); }
+                    } catch(e) { alert('失败: ' + e); }
                 },
                 async clearContacts() {
-                    if(!confirm('⚠️ 确定清空所有已保存的通讯录吗？此操作不可恢复！')) return;
+                    if(!confirm('⚠️ 确定清空通讯录?')) return;
                     try {
                         await fetch('/api/contacts/clear', { method: 'POST' });
                         this.fetchContactCount();
-                        alert('通讯录已清空');
-                    } catch(e) { alert('清空失败: ' + e); }
+                        alert('已清空');
+                    } catch(e) { alert('失败: ' + e); }
                 },
                 addNode() { 
                     this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true }); 
                 },
-                delNode(i) { if(confirm('确定删除该节点吗?')) this.config.downstream_pool.splice(i, 1); },
+                delNode(i) { if(confirm('删除此节点?')) this.config.downstream_pool.splice(i, 1); },
                 async save() {
                     this.saving = true;
                     try {
                         await fetch('/api/save', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(this.config) });
-                        alert('保存成功！' + (this.showPwd ? '密码已修改。' : ''));
+                        alert('保存成功');
                         this.showPwd = false;
                     } catch(e) { alert('失败: ' + e); }
                     this.saving = false;
                 },
                 async saveAndRestart() {
-                    if(!confirm('确定保存配置并重启服务吗？\n重启期间服务将短暂不可用(约5-10秒)。')) return;
+                    if(!confirm('保存并重启服务?')) return;
                     this.saving = true;
                     try {
                         await fetch('/api/save', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(this.config) });
                         await fetch('/api/restart', { method: 'POST' });
-                        alert('正在重启...请稍后刷新页面。');
-                    } catch(e) { alert('操作失败: ' + e); }
+                        alert('正在重启...请稍后刷新');
+                    } catch(e) { alert('失败: ' + e); }
                     this.saving = false;
                 },
                 async fetchQueue() {
@@ -911,8 +854,7 @@ EOF
                 },
                 async sendBulk() {
                     if(!this.bulk.sender || !this.bulk.subject || !this.bulk.body) return alert('请填写完整信息');
-                    if(!confirm(`确认向 ${this.recipientCount} 个收件人发送邮件吗？`)) return;
-                    
+                    if(!confirm(`确认发送给 ${this.recipientCount} 人?`)) return;
                     this.sending = true;
                     try {
                         const res = await fetch('/api/send/bulk', {
@@ -922,18 +864,18 @@ EOF
                         });
                         const data = await res.json();
                         if(res.ok) {
-                            alert(`成功加入队列: ${data.count} 封邮件`);
+                            alert(`已加入队列: ${data.count} 封`);
                             this.bulk.recipients = ''; 
                             this.tab = 'queue';
                             this.fetchQueue();
                         } else {
                             alert('错误: ' + data.error);
                         }
-                    } catch(e) { alert('请求失败: ' + e); }
+                    } catch(e) { alert('失败: ' + e); }
                     this.sending = false;
                 },
                 async clearQueue() {
-                    if(!confirm('确定清理所有已完成和失败的记录吗？(Pending状态不会被清理)')) return;
+                    if(!confirm('清理历史记录? (保留Pending)')) return;
                     await fetch('/api/queue/clear', { method: 'POST' });
                     this.fetchQueue();
                 }
