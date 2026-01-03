@@ -187,6 +187,23 @@ def worker_thread():
                     conn.execute("UPDATE queue SET status='processing', updated_at=CURRENT_TIMESTAMP WHERE id=?", (row_id,))
                 
                 node = pool.get(node_name)
+
+                # Re-route if disabled
+                if node and not node.get('enabled', True):
+                    active_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
+                    if active_nodes:
+                        new_node = random.choice(active_nodes)
+                        logger.info(f"🔄 Re-routing ID:{row_id} from disabled '{node_name}' to '{new_node['name']}'")
+                        node = new_node
+                        node_name = node['name']
+                        with get_db() as conn:
+                            conn.execute("UPDATE queue SET assigned_node=? WHERE id=?", (node_name, row_id))
+                    else:
+                        with get_db() as conn:
+                            conn.execute("UPDATE queue SET status='pending' WHERE id=?", (row_id,))
+                        time.sleep(1)
+                        continue
+
                 error_msg = ""
                 success = False
                 
