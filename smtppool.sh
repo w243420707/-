@@ -288,6 +288,15 @@ def api_save():
     logger = setup_logging()
     return jsonify({"status": "ok"})
 
+@app.route('/api/restart', methods=['POST'])
+@login_required
+def api_restart():
+    def restart_server():
+        time.sleep(1)
+        os._exit(0)
+    threading.Thread(target=restart_server).start()
+    return jsonify({"status": "restarting"})
+
 @app.route('/api/queue/stats')
 @login_required
 def api_queue_stats():
@@ -365,6 +374,7 @@ EOF
             <div>
                 <button class="btn btn-outline-secondary me-2" @click="showPwd = !showPwd">修改密码</button>
                 <button class="btn btn-success" @click="save" :disabled="saving" v-text="saving ? '保存中...' : '保存配置'"></button>
+                <button class="btn btn-danger ms-2" @click="saveAndRestart" :disabled="saving">保存并重启</button>
             </div>
         </div>
 
@@ -551,6 +561,16 @@ EOF
                         alert('保存成功！' + (this.showPwd ? '密码已修改。' : ''));
                         this.showPwd = false;
                     } catch(e) { alert('失败: ' + e); }
+                    this.saving = false;
+                },
+                async saveAndRestart() {
+                    if(!confirm('确定保存配置并重启服务吗？\n重启期间服务将短暂不可用(约5-10秒)。')) return;
+                    this.saving = true;
+                    try {
+                        await fetch('/api/save', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(this.config) });
+                        await fetch('/api/restart', { method: 'POST' });
+                        alert('正在重启...请稍后刷新页面。');
+                    } catch(e) { alert('操作失败: ' + e); }
                     this.saving = false;
                 },
                 async fetchQueue() {
