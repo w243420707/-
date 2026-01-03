@@ -383,7 +383,7 @@ EOF
                             <div class="col-12 d-flex align-items-center">
                                 <div class="section-title mb-0 me-3">连接信息</div>
                                 <span v-if="qStats.nodes && qStats.nodes[n.name]" class="badge bg-warning text-dark">
-                                    待发送: {{ qStats.nodes[n.name].c }}
+                                    待发送: [[ qStats.nodes[n.name].c ]]
                                 </span>
                             </div>
                             <div class="col-md-3"><label class="small text-muted">备注名 (唯一)</label><input v-model="n.name" class="form-control"></div>
@@ -412,10 +412,10 @@ EOF
         <!-- Queue Tab -->
         <div v-show="tab=='queue'">
             <div class="row mb-3 g-3">
-                <div class="col-md-3"><div class="card bg-warning text-dark h-100"><div class="card-body text-center"><h3>{{ (qStats.total && qStats.total.pending && qStats.total.pending.c) || 0 }}</h3><small>待发送 (Pending)</small></div></div></div>
-                <div class="col-md-3"><div class="card bg-info text-white h-100"><div class="card-body text-center"><h3>{{ (qStats.total && qStats.total.processing && qStats.total.processing.c) || 0 }}</h3><small>发送中 (Processing)</small></div></div></div>
-                <div class="col-md-3"><div class="card bg-success text-white h-100"><div class="card-body text-center"><h3>{{ (qStats.total && qStats.total.sent && qStats.total.sent.c) || 0 }}</h3><small>已成功 (Sent)</small></div></div></div>
-                <div class="col-md-3"><div class="card bg-danger text-white h-100"><div class="card-body text-center"><h3>{{ (qStats.total && qStats.total.failed && qStats.total.failed.c) || 0 }}</h3><small>已失败 (Failed)</small></div></div></div>
+                <div class="col-md-3"><div class="card bg-warning text-dark h-100"><div class="card-body text-center"><h3>[[ (qStats.total && qStats.total.pending && qStats.total.pending.c) || 0 ]]</h3><small>待发送 (Pending)</small></div></div></div>
+                <div class="col-md-3"><div class="card bg-info text-white h-100"><div class="card-body text-center"><h3>[[ (qStats.total && qStats.total.processing && qStats.total.processing.c) || 0 ]]</h3><small>发送中 (Processing)</small></div></div></div>
+                <div class="col-md-3"><div class="card bg-success text-white h-100"><div class="card-body text-center"><h3>[[ (qStats.total && qStats.total.sent && qStats.total.sent.c) || 0 ]]</h3><small>已成功 (Sent)</small></div></div></div>
+                <div class="col-md-3"><div class="card bg-danger text-white h-100"><div class="card-body text-center"><h3>[[ (qStats.total && qStats.total.failed && qStats.total.failed.c) || 0 ]]</h3><small>已失败 (Failed)</small></div></div></div>
             </div>
             
             <div class="d-flex justify-content-between mb-2">
@@ -428,21 +428,21 @@ EOF
                     <thead class="table-light"><tr><th>ID</th><th>From / To</th><th>Node</th><th>Status</th><th>Retry</th><th>Time</th></tr></thead>
                     <tbody>
                         <tr v-for="m in qList" :key="m.id">
-                            <td>#{{ m.id }}</td>
+                            <td>#[[ m.id ]]</td>
                             <td>
-                                <div class="small fw-bold">{{ m.mail_from }}</div>
-                                <div class="small text-muted text-truncate" style="max-width:200px">{{ m.rcpt_tos }}</div>
+                                <div class="small fw-bold">[[ m.mail_from ]]</div>
+                                <div class="small text-muted text-truncate" style="max-width:200px">[[ m.rcpt_tos ]]</div>
                             </td>
-                            <td><span class="badge bg-secondary">{{ m.assigned_node }}</span></td>
+                            <td><span class="badge bg-secondary">[[ m.assigned_node ]]</span></td>
                             <td>
                                 <span v-if="m.status=='pending'" class="badge bg-warning text-dark">Pending</span>
                                 <span v-else-if="m.status=='processing'" class="badge bg-info">Sending</span>
                                 <span v-else-if="m.status=='sent'" class="badge bg-success">Sent</span>
                                 <span v-else class="badge bg-danger">Failed</span>
-                                <div v-if="m.last_error" class="text-danger small mt-1" style="font-size:0.75rem">{{ m.last_error }}</div>
+                                <div v-if="m.last_error" class="text-danger small mt-1" style="font-size:0.75rem">[[ m.last_error ]]</div>
                             </td>
-                            <td>{{ m.retry_count }}</td>
-                            <td><small class="text-muted">{{ m.created_at }}</small></td>
+                            <td>[[ m.retry_count ]]</td>
+                            <td><small class="text-muted">[[ m.created_at ]]</small></td>
                         </tr>
                         <tr v-if="qList.length===0"><td colspan="6" class="text-center py-4 text-muted">暂无数据</td></tr>
                     </tbody>
@@ -454,6 +454,7 @@ EOF
     <script>
         const { createApp } = Vue;
         createApp({
+            delimiters: ['[[', ']]'],
             data() { return { 
                 config: {{ config|tojson }}, 
                 saving: false, 
