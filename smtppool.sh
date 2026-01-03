@@ -504,21 +504,8 @@ EOF
                         <div class="fw-bold">修改 Web 面板登录密码</div>
                         <div class="d-flex mt-2">
                             <input type="text" v-model="config.web_config.admin_password" class="form-control form-control-sm me-2" style="max-width: 200px;" placeholder="输入新密码">
-                            <buttdiv class="d-flex justify-content-between align-items-center mb-2">
-                                    <small class="text-muted">当前输入框: [[ recipientCount ]] 个</small>
-                                    <div class="btn-group btn-group-sm">
-                                        <button class="btn btn-outline-secondary" @click="saveContacts" title="将输入框的邮箱保存到数据库(去重)">
-                                            <i class="bi bi-person-plus-fill"></i> 保存到通讯录
-                                        </button>
-                                        <button class="btn btn-outline-secondary" @click="loadContacts" title="从数据库加载所有邮箱到输入框">
-                                            <i class="bi bi-box-arrow-in-down"></i> 加载通讯录 ([[ contactCount ]])
-                                        </button>
-                                        <button class="btn btn-outline-danger" @click="clearContacts" title="清空数据库中的通讯录">
-                                            <i class="bi bi-trash"></i>
-                                        </button>
-                                    </div>
-                                </div>
-                                <textarea v-model="bulk.recipients" class="form-control" rows="6" placeholder="user1@example.com&#10;user2@example.com"></textarea
+                            <button class="btn btn-sm btn-success" @click="save">保存</button>
+                        </div>
                     </div>
                     <button type="button" class="btn-close" @click="showPwd = false"></button>
                 </div>
@@ -553,8 +540,21 @@ EOF
                             </div>
                             <div class="col-12">
                                 <label class="form-label">收件人列表 (每行一个邮箱)</label>
+                                <div class="d-flex justify-content-between align-items-center mb-2">
+                                    <small class="text-muted">当前输入框: [[ recipientCount ]] 个</small>
+                                    <div class="btn-group btn-group-sm">
+                                        <button class="btn btn-outline-secondary" @click="saveContacts" title="将输入框的邮箱保存到数据库(去重)">
+                                            <i class="bi bi-person-plus-fill"></i> 保存到通讯录
+                                        </button>
+                                        <button class="btn btn-outline-secondary" @click="loadContacts" title="从数据库加载所有邮箱到输入框">
+                                            <i class="bi bi-box-arrow-in-down"></i> 加载通讯录 ([[ contactCount ]])
+                                        </button>
+                                        <button class="btn btn-outline-danger" @click="clearContacts" title="清空数据库中的通讯录">
+                                            <i class="bi bi-trash"></i>
+                                        </button>
+                                    </div>
+                                </div>
                                 <textarea v-model="bulk.recipients" class="form-control" rows="6" placeholder="user1@example.com&#10;user2@example.com"></textarea>
-                                <div class="form-text text-end">共 [[ recipientCount ]] 个收件人</div>
                             </div>
                             <div class="col-12">
                                 <label class="form-label">邮件内容 (支持 HTML)</label>
