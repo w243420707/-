@@ -71,6 +71,8 @@ import time
 import base64
 from datetime import datetime
 from email import message_from_bytes
+from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 from logging.handlers import RotatingFileHandler
 from aiosmtpd.controller import Controller
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
@@ -100,6 +102,11 @@ def init_db():
             last_error TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+        conn.execute('''CREATE TABLE IF NOT EXISTS contacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
 
 # --- Config & Logging ---
@@ -323,6 +330,78 @@ def api_queue_list():
         rows = conn.execute(f"SELECT id, mail_from, rcpt_tos, assigned_node, status, retry_count, last_error, created_at FROM queue ORDER BY id DESC LIMIT {limit}").fetchall()
     return jsonify([dict(r) for r in rows])
 
+@app.route('/api/send/bulk', methods=['POST'])
+@login_required
+def api_send_bulk():
+    data = request.json
+    sender = data.get('sender', '')
+    subject = data.get('subject', '(No Subject)')
+    body = data.get('body', '')
+    recipients = [r.strip() for r in data.get('recipients', '').split('\n') if r.strip()]
+    
+    if not recipients: return jsonify({"error": "No recipients"}), 400
+    
+    cfg = load_config()
+    pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
+    if not pool: return jsonify({"error": "No enabled nodes available"}), 500
+
+    count = 0
+    with get_db() as conn:
+        for rcpt in recipients:
+            msg = MIMEText(body, 'html', 'utf-8')
+            msg['Subject'] = subject
+            msg['From'] = sender
+            msg['To'] = rcpt
+            msg['Date'] = formatdate(localtime=True)
+            msg['Message-ID'] = make_msgid()
+            
+            node = random.choice(pool)
+            node_name = node.get('name', 'Unknown')
+            
+            conn.execute(
+                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status) VALUES (?, ?, ?, ?, ?)",
+                (sender, json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending')
+            )
+            count += 1
+            
+    return jsonify({"status": "ok", "count": count})
+
+@app.route('/api/contacts/import', methods=['POST'])
+@login_required
+def api_contacts_import():
+    emails = request.json.get('emails', [])
+    emails = [e.strip() for e in emails if e.strip()]
+    added = 0
+    with get_db() as conn:
+        for e in emails:
+            try:
+                conn.execute("INSERT INTO contacts (email) VALUES (?)", (e,))
+                added += 1
+            except sqlite3.IntegrityError:
+                pass
+    return jsonify({"added": added})
+
+@app.route('/api/contacts/list')
+@login_required
+def api_contacts_list():
+    with get_db() as conn:
+        rows = conn.execute("SELECT email FROM contacts ORDER BY id DESC").fetchall()
+    return jsonify([r['email'] for r in rows])
+
+@app.route('/api/contacts/count')
+@login_required
+def api_contacts_count():
+    with get_db() as conn:
+        c = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+    return jsonify({"count": c})
+
+@app.route('/api/contacts/clear', methods=['POST'])
+@login_required
+def api_contacts_clear():
+    with get_db() as conn:
+        conn.execute("DELETE FROM contacts")
+    return jsonify({"status": "ok"})
+
 @app.route('/api/queue/clear', methods=['POST'])
 @login_required
 def api_queue_clear():
@@ -425,8 +504,21 @@ EOF
                         <div class="fw-bold">修改 Web 面板登录密码</div>
                         <div class="d-flex mt-2">
                             <input type="text" v-model="config.web_config.admin_password" class="form-control form-control-sm me-2" style="max-width: 200px;" placeholder="输入新密码">
-                            <button class="btn btn-warning btn-sm text-white" @click="save">确认修改</button>
-                        </div>
+                            <buttdiv class="d-flex justify-content-between align-items-center mb-2">
+                                    <small class="text-muted">当前输入框: [[ recipientCount ]] 个</small>
+                                    <div class="btn-group btn-group-sm">
+                                        <button class="btn btn-outline-secondary" @click="saveContacts" title="将输入框的邮箱保存到数据库(去重)">
+                                            <i class="bi bi-person-plus-fill"></i> 保存到通讯录
+                                        </button>
+                                        <button class="btn btn-outline-secondary" @click="loadContacts" title="从数据库加载所有邮箱到输入框">
+                                            <i class="bi bi-box-arrow-in-down"></i> 加载通讯录 ([[ contactCount ]])
+                                        </button>
+                                        <button class="btn btn-outline-danger" @click="clearContacts" title="清空数据库中的通讯录">
+                                            <i class="bi bi-trash"></i>
+                                        </button>
+                                    </div>
+                                </div>
+                                <textarea v-model="bulk.recipients" class="form-control" rows="6" placeholder="user1@example.com&#10;user2@example.com"></textarea
                     </div>
                     <button type="button" class="btn-close" @click="showPwd = false"></button>
                 </div>
@@ -440,7 +532,45 @@ EOF
                 <li class="nav-item ms-2">
                     <a class="nav-link" :class="{active: tab=='settings'}" @click="tab='settings'" href="#"><i class="bi bi-sliders me-2"></i>系统配置管理</a>
                 </li>
+                <li class="nav-item ms-2">
+                    <a class="nav-link" :class="{active: tab=='send'}" @click="tab='send'" href="#"><i class="bi bi-send-plus me-2"></i>邮件群发</a>
+                </li>
             </ul>
+
+            <!-- Send Tab -->
+            <div v-if="tab=='send'">
+                <div class="card shadow-sm">
+                    <div class="card-header bg-white py-3 fw-bold text-primary"><i class="bi bi-send-plus me-2"></i>新建群发任务</div>
+                    <div class="card-body">
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label class="form-label">发件人 (From)</label>
+                                <input v-model="bulk.sender" class="form-control" placeholder="例如: marketing@example.com">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label">邮件主题 (Subject)</label>
+                                <input v-model="bulk.subject" class="form-control" placeholder="请输入邮件标题">
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label">收件人列表 (每行一个邮箱)</label>
+                                <textarea v-model="bulk.recipients" class="form-control" rows="6" placeholder="user1@example.com&#10;user2@example.com"></textarea>
+                                <div class="form-text text-end">共 [[ recipientCount ]] 个收件人</div>
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label">邮件内容 (支持 HTML)</label>
+                                <textarea v-model="bulk.body" class="form-control font-monospace" rows="10" placeholder="<h1>Hello</h1><p>This is a test email.</p>"></textarea>
+                            </div>
+                            <div class="col-12">
+                                <button class="btn btn-primary px-4" @click="sendBulk" :disabled="sending || recipientCount === 0">
+                                    <span v-if="sending" class="spinner-border spinner-border-sm me-2"></span>
+                                    <i v-else class="bi bi-rocket-takeoff me-2"></i>
+                                    [[ sending ? '正在提交任务...' : '开始群发' ]]
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
 
             <!-- Queue View -->
             <div v-if="tab=='queue'">
@@ -679,19 +809,64 @@ EOF
                 </div>
             </div>
         </div>
-    </div>
-    <script>
-        const { createApp } = Vue;
-        createApp({
-            delimiters: ['[[', ']]'],
-            data() { return { 
-                config: {{ config|tojson }}, 
-                saving: false, 
-                showPwd: false,
-                tab: 'queue',
-                qStats: { total: {}, nodes: {} },
-                qList: []
+    </div>,
+                contactCount: 0
             }},
+            computed: {
+                recipientCount() { return this.bulk.recipients ? this.bulk.recipients.split('\n').filter(r => r.trim()).length : 0; }
+            },
+            mounted() {
+                this.config.downstream_pool.forEach(n => { if(n.enabled === undefined) n.enabled = true; });
+                this.fetchQueue();
+                this.fetchContactCount();
+                setInterval(this.fetchQueue, 5000);
+            },
+            methods: {
+                async fetchContactCount() {
+                    try {
+                        const res = await fetch('/api/contacts/count');
+                        const data = await res.json();
+                        this.contactCount = data.count;
+                    } catch(e) {}
+                },
+                async saveContacts() {
+                    const emails = this.bulk.recipients.split('\n').filter(r => r.trim());
+                    if(emails.length === 0) return alert('输入框为空');
+                    if(!confirm(`确定将这 ${emails.length} 个邮箱保存到通讯录吗？(会自动去重)`)) return;
+                    try {
+                        const res = await fetch('/api/contacts/import', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({emails: emails})
+                        });
+                        const data = await res.json();
+                        alert(`成功新增 ${data.added} 个联系人`);
+                        this.fetchContactCount();
+                    } catch(e) { alert('保存失败: ' + e); }
+                },
+                async loadContacts() {
+                    if(this.bulk.recipients && !confirm('输入框已有内容，确定要覆盖吗？')) return;
+                    try {
+                        const res = await fetch('/api/contacts/list');
+                        const emails = await res.json();
+                        this.bulk.recipients = emails.join('\n');
+                    } catch(e) { alert('加载失败: ' + e); }
+                },
+                async clearContacts() {
+                    if(!confirm('⚠️ 确定清空所有已保存的通讯录吗？此操作不可恢复！')) return;
+                    try {
+                        await fetch('/api/contacts/clear', { method: 'POST' });
+                        this.fetchContactCount();
+                        alert('通讯录已清空');
+                    } catch(e) { alert('清空失败: ' + e); }
+                },: { total: {}, nodes: {} },
+                qList: [],
+                bulk: { sender: '', subject: '', recipients: '', body: '' },
+                sending: false
+            }},
+            computed: {
+                recipientCount() { return this.bulk.recipients ? this.bulk.recipients.split('\n').filter(r => r.trim()).length : 0; }
+            },
             mounted() {
                 this.config.downstream_pool.forEach(n => { if(n.enabled === undefined) n.enabled = true; });
                 this.fetchQueue();
@@ -730,6 +905,29 @@ EOF
                             this.qList = await res2.json();
                         }
                     } catch(e) { console.error(e); }
+                },
+                async sendBulk() {
+                    if(!this.bulk.sender || !this.bulk.subject || !this.bulk.body) return alert('请填写完整信息');
+                    if(!confirm(`确认向 ${this.recipientCount} 个收件人发送邮件吗？`)) return;
+                    
+                    this.sending = true;
+                    try {
+                        const res = await fetch('/api/send/bulk', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify(this.bulk)
+                        });
+                        const data = await res.json();
+                        if(res.ok) {
+                            alert(`成功加入队列: ${data.count} 封邮件`);
+                            this.bulk.recipients = ''; 
+                            this.tab = 'queue';
+                            this.fetchQueue();
+                        } else {
+                            alert('错误: ' + data.error);
+                        }
+                    } catch(e) { alert('请求失败: ' + e); }
+                    this.sending = false;
                 },
                 async clearQueue() {
                     if(!confirm('确定清理所有已完成和失败的记录吗？(Pending状态不会被清理)')) return;
