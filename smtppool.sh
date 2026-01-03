@@ -997,6 +997,18 @@ EOF
                             </div>
                         </div>
                     </div>
+                    <div class="col-md-2 col-6">
+                        <div class="card stat-card h-100">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-start mb-2">
+                                    <div class="p-2 rounded bg-primary-subtle text-primary"><i class="bi bi-cursor-fill"></i></div>
+                                    <span class="badge rounded-pill border text-muted">Rate</span>
+                                </div>
+                                <h2 class="fw-bold mb-0">[[ clickRate ]]</h2>
+                                <div class="small text-muted">点击率</div>
+                            </div>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Node Status -->
@@ -1247,6 +1259,15 @@ EOF
                 }
             },
             computed: {
+                clickRate() {
+                    const sent = (this.qStats.total.sent || 0) + (this.qStats.total.failed || 0); // Use sent+failed or just sent? Usually sent.
+                    // Actually, click rate is usually Opens / Delivered.
+                    // But here 'sent' means delivered (or at least accepted by relay).
+                    // Let's use sent.
+                    const s = this.qStats.total.sent || 0;
+                    if(s === 0) return '0.00%';
+                    return (((this.qStats.total.opened || 0) / s) * 100).toFixed(2) + '%';
+                },
                 recipientCount() { return this.bulk.recipients ? this.bulk.recipients.split('\n').filter(r => r.trim()).length : 0; },
                 totalMails() {
                     const t = this.qStats.total;
