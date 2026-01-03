@@ -104,10 +104,16 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
+        
+        # Check and add source column safely
         try:
-            conn.execute("ALTER TABLE queue ADD COLUMN source TEXT DEFAULT 'relay'")
-        except:
-            pass
+            cursor = conn.execute("PRAGMA table_info(queue)")
+            cols = [c[1] for c in cursor.fetchall()]
+            if 'source' not in cols:
+                conn.execute("ALTER TABLE queue ADD COLUMN source TEXT DEFAULT 'relay'")
+        except Exception as e:
+            print(f"DB Init Warning: {e}")
+
         conn.execute('''CREATE TABLE IF NOT EXISTS contacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE,
@@ -401,48 +407,52 @@ def api_queue_list():
 @app.route('/api/send/bulk', methods=['POST'])
 @login_required
 def api_send_bulk():
-    data = request.json
-    # sender = data.get('sender', '') # Deprecated: Use node's sender
-    subject = data.get('subject', '(No Subject)')
-    body = data.get('body', '')
-    recipients = [r.strip() for r in data.get('recipients', '').split('\n') if r.strip()]
-    
-    if not recipients: return jsonify({"error": "No recipients"}), 400
-    
-    cfg = load_config()
-    pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
-    if not pool: return jsonify({"error": "No enabled nodes available"}), 500
+    try:
+        data = request.json
+        # sender = data.get('sender', '') # Deprecated: Use node's sender
+        subject = data.get('subject', '(No Subject)')
+        body = data.get('body', '')
+        recipients = [r.strip() for r in data.get('recipients', '').split('\n') if r.strip()]
+        
+        if not recipients: return jsonify({"error": "No recipients"}), 400
+        
+        cfg = load_config()
+        pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
+        if not pool: return jsonify({"error": "No enabled nodes available"}), 500
 
-    count = 0
-    charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-    
-    with get_db() as conn:
-        for rcpt in recipients:
-            # Randomize
-            rand_sub = ''.join(random.choices(charset, k=6))
-            rand_body = ''.join(random.choices(charset, k=12))
-            
-            footer = "<br><br><hr><p style='color:#999;font-size:12px;text-align:center;'>如需退订此邮件，请到官网联系在线客服即可。</p>"
-            final_subject = f"{subject} {rand_sub}"
-            final_body = f"{body}{footer}<div style='display:none;opacity:0;font-size:0'>{rand_body}</div>"
+        count = 0
+        charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        
+        with get_db() as conn:
+            for rcpt in recipients:
+                # Randomize
+                rand_sub = ''.join(random.choices(charset, k=6))
+                rand_body = ''.join(random.choices(charset, k=12))
+                
+                footer = "<br><br><hr><p style='color:#999;font-size:12px;text-align:center;'>如需退订此邮件，请到官网联系在线客服即可。</p>"
+                final_subject = f"{subject} {rand_sub}"
+                final_body = f"{body}{footer}<div style='display:none;opacity:0;font-size:0'>{rand_body}</div>"
 
-            msg = MIMEText(final_body, 'html', 'utf-8')
-            msg['Subject'] = final_subject
-            msg['From'] = '' # Placeholder, worker will fill
-            msg['To'] = rcpt
-            msg['Date'] = formatdate(localtime=True)
-            msg['Message-ID'] = make_msgid()
+                msg = MIMEText(final_body, 'html', 'utf-8')
+                msg['Subject'] = final_subject
+                msg['From'] = '' # Placeholder, worker will fill
+                msg['To'] = rcpt
+                msg['Date'] = formatdate(localtime=True)
+                msg['Message-ID'] = make_msgid()
 
-            node = random.choice(pool)
-            node_name = node.get('name', 'Unknown')
-            
-            conn.execute(
-                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source) VALUES (?, ?, ?, ?, ?, ?)",
-                ('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk')
-            )
-            count += 1
-            
-    return jsonify({"status": "ok", "count": count})
+                node = random.choice(pool)
+                node_name = node.get('name', 'Unknown')
+                
+                conn.execute(
+                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source) VALUES (?, ?, ?, ?, ?, ?)",
+                    ('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk')
+                )
+                count += 1
+                
+        return jsonify({"status": "ok", "count": count})
+    except Exception as e:
+        logger.error(f"Bulk send error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/contacts/import', methods=['POST'])
 @login_required
