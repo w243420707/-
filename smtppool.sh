@@ -435,7 +435,7 @@ def api_send_bulk():
                 rand_sub = ''.join(random.choices(charset, k=6))
                 rand_body = ''.join(random.choices(charset, k=12))
                 
-                footer = "<br><br><hr><p style='color:#999;font-size:12px;text-align:center;'>如需退订此邮件，请到官网联系在线客服即可。</p>"
+                footer = "<div style='clear:both;width:100%;display:block;margin-top:20px;text-align:center;'><hr><span style='color:#999;font-size:12px;'>如需退订此邮件，请到官网联系在线客服即可。</span></div>"
                 final_subject = f"{subject} {rand_sub}"
                 final_body = f"{body}{footer}<div style='display:none;opacity:0;font-size:0'>{rand_body}</div>"
 
@@ -676,22 +676,25 @@ EOF
                     <div class="card-body">
                         <div class="d-flex justify-content-between align-items-center">
                             <div class="d-flex align-items-center gap-3">
-                                <div class="p-2 rounded-circle" :class="bulkStatus=='running'?'bg-success-subtle text-success':'bg-warning-subtle text-warning'">
-                                    <i class="bi" :class="bulkStatus=='running'?'bi-lightning-charge-fill':'bi-pause-circle-fill'"></i>
+                                <div class="p-2 rounded-circle" :class="statusClass">
+                                    <i class="bi" :class="statusIcon"></i>
                                 </div>
                                 <div>
-                                    <h6 class="fw-bold mb-0">群发任务 [[ bulkStatus=='running' ? '进行中' : '已暂停' ]]</h6>
+                                    <h6 class="fw-bold mb-0">群发任务 [[ statusText ]]</h6>
                                     <div class="small text-muted">进度: [[ progressPercent ]]% ([[ qStats.total.sent || 0 ]] / [[ totalMails ]])</div>
                                 </div>
                             </div>
                             <div class="btn-group">
-                                <button v-if="bulkStatus=='running'" class="btn btn-warning text-white" @click="controlBulk('pause')"><i class="bi bi-pause-fill"></i> 暂停</button>
-                                <button v-else class="btn btn-success" @click="controlBulk('resume')"><i class="bi bi-play-fill"></i> 继续</button>
-                                <button class="btn btn-danger" @click="controlBulk('stop')"><i class="bi bi-stop-fill"></i> 停止</button>
+                                <template v-if="!isFinished">
+                                    <button v-if="bulkStatus=='running'" class="btn btn-warning text-white" @click="controlBulk('pause')"><i class="bi bi-pause-fill"></i> 暂停</button>
+                                    <button v-else class="btn btn-success" @click="controlBulk('resume')"><i class="bi bi-play-fill"></i> 继续</button>
+                                    <button class="btn btn-danger" @click="controlBulk('stop')"><i class="bi bi-stop-fill"></i> 停止</button>
+                                </template>
+                                <button v-else class="btn btn-outline-primary" @click="clearQueue"><i class="bi bi-check-all"></i> 完成并清理</button>
                             </div>
                         </div>
                         <div class="progress mt-3" style="height: 6px;">
-                            <div class="progress-bar bg-primary" :style="{width: progressPercent + '%'}"></div>
+                            <div class="progress-bar" :class="isFinished?'bg-success':'bg-primary'" :style="{width: progressPercent + '%'}"></div>
                         </div>
                     </div>
                 </div>
@@ -965,6 +968,25 @@ EOF
                 progressPercent() {
                     if(this.totalMails === 0) return 0;
                     return Math.round(((this.qStats.total.sent||0) / this.totalMails) * 100);
+                },
+                isFinished() {
+                    const t = this.qStats.total;
+                    return this.totalMails > 0 && (t.pending||0) === 0 && (t.processing||0) === 0;
+                },
+                statusText() {
+                    if(this.bulkStatus === 'paused') return '已暂停';
+                    if(this.isFinished) return '已完成';
+                    return '进行中';
+                },
+                statusClass() {
+                    if(this.bulkStatus === 'paused') return 'bg-warning-subtle text-warning';
+                    if(this.isFinished) return 'bg-success-subtle text-success';
+                    return 'bg-primary-subtle text-primary';
+                },
+                statusIcon() {
+                    if(this.bulkStatus === 'paused') return 'bi-pause-circle-fill';
+                    if(this.isFinished) return 'bi-check-circle-fill';
+                    return 'bi-lightning-charge-fill';
                 }
             },
             mounted() {
