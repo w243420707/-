@@ -49,7 +49,7 @@ install_smtp() {
         cat > "$CONFIG_FILE" << EOF
 {
     "server_config": { "host": "0.0.0.0", "port": 587, "username": "myapp", "password": "123" },
-    "web_config": { "admin_password": "admin" },
+    "web_config": { "admin_password": "admin", "public_domain": "" },
     "telegram_config": { "bot_token": "", "admin_id": "" },
     "log_config": { "max_mb": 50, "backups": 3 },
     "limit_config": { "max_per_hour": 0, "min_interval": 1, "max_interval": 5 },
@@ -71,6 +71,7 @@ import threading
 import sqlite3
 import time
 import base64
+import uuid
 from datetime import datetime
 from email import message_from_bytes
 from email.mime.text import MIMEText
@@ -112,6 +113,12 @@ def init_db():
             cols = [c[1] for c in cursor.fetchall()]
             if 'source' not in cols:
                 conn.execute("ALTER TABLE queue ADD COLUMN source TEXT DEFAULT 'relay'")
+            if 'tracking_id' not in cols:
+                conn.execute("ALTER TABLE queue ADD COLUMN tracking_id TEXT UNIQUE")
+            if 'opened_at' not in cols:
+                conn.execute("ALTER TABLE queue ADD COLUMN opened_at TIMESTAMP")
+            if 'open_count' not in cols:
+                conn.execute("ALTER TABLE queue ADD COLUMN open_count INTEGER DEFAULT 0")
         except Exception as e:
             print(f"DB Init Warning: {e}")
 
@@ -426,6 +433,12 @@ def api_queue_stats():
         rows = conn.execute("SELECT status, COUNT(*) as c FROM queue GROUP BY status").fetchall()
         total = {r['status']: r['c'] for r in rows}
         
+        # Open stats
+        try:
+            opened = conn.execute("SELECT COUNT(*) FROM queue WHERE open_count > 0").fetchone()[0]
+            total['opened'] = opened
+        except: total['opened'] = 0
+
         # Node stats
         rows = conn.execute("SELECT assigned_node, status, COUNT(*) as c FROM queue GROUP BY assigned_node, status").fetchall()
         nodes = {}
@@ -450,6 +463,9 @@ def bulk_import_task(raw_recipients, subject, body, pool):
         recipients = [r.strip() for r in raw_recipients.split('\n') if r.strip()]
         random.shuffle(recipients) # Shuffle for better distribution
         
+        cfg = load_config()
+        tracking_base = cfg.get('web_config', {}).get('public_domain', '').rstrip('/')
+
         charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
         # Chat corpus for anti-spam
         chat_corpus = [
@@ -632,10 +648,16 @@ def bulk_import_task(raw_recipients, subject, body, pool):
                 # Select 5-10 random sentences to simulate normal chat
                 rand_chat = ' '.join(random.choices(chat_corpus, k=random.randint(5, 10)))
                 
+                tracking_id = str(uuid.uuid4())
+                tracking_html = ""
+                if tracking_base:
+                    tracking_url = f"{tracking_base}/track/{tracking_id}"
+                    tracking_html = f"<img src='{tracking_url}' width='1' height='1' style='display:none;'>"
+
                 # footer removed
                 final_subject = f"{subject} {rand_sub}"
                 # Insert hidden chat content
-                final_body = f"{body}<div style='display:none;opacity:0;font-size:0;line-height:0;max-height:0;overflow:hidden;'>{rand_chat}</div>"
+                final_body = f"{body}<div style='display:none;opacity:0;font-size:0;line-height:0;max-height:0;overflow:hidden;'>{rand_chat}</div>{tracking_html}"
 
                 msg = MIMEText(final_body, 'html', 'utf-8')
                 msg['Subject'] = final_subject
@@ -647,13 +669,13 @@ def bulk_import_task(raw_recipients, subject, body, pool):
                 node = random.choice(pool)
                 node_name = node.get('name', 'Unknown')
                 
-                tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk'))
+                tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk', tracking_id))
                 count += 1
                 
                 if len(tasks) >= 500:
                     with get_db() as conn:
                         conn.executemany(
-                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source) VALUES (?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
                             tasks
                         )
                     tasks = []
@@ -664,7 +686,7 @@ def bulk_import_task(raw_recipients, subject, body, pool):
         if tasks:
             with get_db() as conn:
                 conn.executemany(
-                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     tasks
                 )
         logger.info(f"Bulk import finished: {count} emails processed")
@@ -764,6 +786,16 @@ def api_bulk_status():
     cfg = load_config()
     return jsonify(cfg.get('bulk_control', {'status': 'running'}))
 
+TRACKING_GIF = base64.b64decode(b'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7')
+
+@app.route('/track/<tid>')
+def track_email(tid):
+    try:
+        with get_db() as conn:
+            conn.execute("UPDATE queue SET opened_at=CURRENT_TIMESTAMP, open_count=open_count+1 WHERE tracking_id=?", (tid,))
+    except Exception as e:
+        logger.error(f"Tracking error: {e}")
+    return TRACKING_GIF, 200, {'Content-Type': 'image/gif', 'Cache-Control': 'no-cache, no-store, must-revalidate'}
 
 def start_services():
     init_db()
@@ -935,7 +967,19 @@ EOF
 
                 <!-- Stats Cards -->
                 <div class="row g-4 mb-4">
-                    <div class="col-md-3 col-6" v-for="(label, key) in {'pending': '待发送', 'processing': '发送中', 'sent': '已成功', 'failed': '已失败'}" :key="key">
+                    <div class="col-md-2 col-6">
+                        <div class="card stat-card h-100">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-start mb-2">
+                                    <div class="p-2 rounded bg-info-subtle text-info"><i class="bi bi-eye-fill"></i></div>
+                                    <span class="badge rounded-pill border text-muted">Opens</span>
+                                </div>
+                                <h2 class="fw-bold mb-0">[[ qStats.total.opened || 0 ]]</h2>
+                                <div class="small text-muted">已打开</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-2 col-6" v-for="(label, key) in {'pending': '待发送', 'processing': '发送中', 'sent': '已成功', 'failed': '已失败'}" :key="key">
                         <div class="card stat-card h-100">
                             <div class="card-body">
                                 <div class="d-flex justify-content-between align-items-start mb-2">
@@ -1093,6 +1137,11 @@ EOF
                                 <div class="mb-3">
                                     <label class="form-label">监听端口</label>
                                     <input type="number" v-model.number="config.server_config.port" class="form-control">
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">追踪域名 (Tracking URL)</label>
+                                    <input type="text" v-model="config.web_config.public_domain" class="form-control" placeholder="http://YOUR_IP:8080">
+                                    <div class="form-text">用于生成邮件打开追踪链接，请填写公网可访问地址。</div>
                                 </div>
                                 <div class="row g-3">
                                     <div class="col-6">
