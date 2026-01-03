@@ -104,6 +104,10 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
+        try:
+            conn.execute("ALTER TABLE queue ADD COLUMN source TEXT DEFAULT 'relay'")
+        except:
+            pass
         conn.execute('''CREATE TABLE IF NOT EXISTS contacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE,
@@ -161,8 +165,8 @@ class RelayHandler:
         try:
             with get_db() as conn:
                 conn.execute(
-                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status) VALUES (?, ?, ?, ?, ?)",
-                    (envelope.mail_from, json.dumps(envelope.rcpt_tos), envelope.content, node_name, 'pending')
+                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source) VALUES (?, ?, ?, ?, ?, ?)",
+                    (envelope.mail_from, json.dumps(envelope.rcpt_tos), envelope.content, node_name, 'pending', 'relay')
                 )
             return '250 OK: Queued for delivery'
         except Exception as e:
@@ -176,22 +180,30 @@ def worker_thread():
         try:
             cfg = load_config()
             
-            # Rate Limiting
+            # Rate Limiting (Bulk Only)
             limit_cfg = cfg.get('limit_config', {})
             max_ph = int(limit_cfg.get('max_per_hour', 0))
+            bulk_paused = False
+            
             if max_ph > 0:
                 with get_db() as conn:
-                    cnt = conn.execute("SELECT COUNT(*) FROM queue WHERE status='sent' AND updated_at > datetime('now', '-1 hour')").fetchone()[0]
-                if cnt >= max_ph:
-                    logger.info(f"⏳ Hourly limit reached ({cnt}/{max_ph}). Pausing...")
-                    time.sleep(60)
-                    continue
+                    try:
+                        cnt = conn.execute("SELECT COUNT(*) FROM queue WHERE status='sent' AND source='bulk' AND updated_at > datetime('now', '-1 hour')").fetchone()[0]
+                        if cnt >= max_ph:
+                            bulk_paused = True
+                    except: pass
 
             pool = {n['name']: n for n in cfg.get('downstream_pool', [])}
             
             with get_db() as conn:
                 # Fetch pending items
-                cursor = conn.execute("SELECT * FROM queue WHERE status='pending' LIMIT 5")
+                if bulk_paused:
+                    try:
+                        cursor = conn.execute("SELECT * FROM queue WHERE status='pending' AND source!='bulk' LIMIT 5")
+                    except:
+                        cursor = conn.execute("SELECT * FROM queue WHERE status='pending' LIMIT 5")
+                else:
+                    cursor = conn.execute("SELECT * FROM queue WHERE status='pending' LIMIT 5")
                 rows = cursor.fetchall()
             
             if not rows:
@@ -260,11 +272,17 @@ def worker_thread():
                 with get_db() as conn:
                     if success:
                         conn.execute("UPDATE queue SET status='sent', updated_at=CURRENT_TIMESTAMP WHERE id=?", (row_id,))
-                    else:
-                        # Retry logic
-                        if row['retry_count'] < 3:
-                            conn.execute("UPDATE queue SET status='pending', retry_count=retry_count+1, last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (error_msg, row_id))
-                        else:
+                    else: (Bulk Only)
+                is_bulk = False
+                try:
+                    if row['source'] == 'bulk': is_bulk = True
+                except: pass
+                
+                if is_bulk:
+                    min_int = int(limit_cfg.get('min_interval', 1))
+                    max_int = int(limit_cfg.get('max_interval', 5))
+                    if max_int > 0:
+                            else:
                             conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (error_msg, row_id))
                             send_telegram(f"❌ Mail ID:{row_id} Failed permanently via {node_name}\nErr: {error_msg}")
                 
@@ -417,8 +435,8 @@ def api_send_bulk():
             msg['From'] = '' # Placeholder, worker will fill
             msg['To'] = rcpt
             msg['Date'] = formatdate(localtime=True)
-            msg['Message-ID'] = make_msgid()
-            
+            msg['Message-ID'] = make_msgid(), source) VALUES (?, ?, ?, ?, ?, ?)",
+                ('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk
             node = random.choice(pool)
             node_name = node.get('name', 'Unknown')
             
