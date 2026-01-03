@@ -70,6 +70,7 @@ import sqlite3
 import time
 import base64
 from datetime import datetime
+from email import message_from_bytes
 from logging.handlers import RotatingFileHandler
 from aiosmtpd.controller import Controller
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
@@ -193,11 +194,22 @@ def worker_thread():
                     try:
                         sender = node.get('sender_email') or row['mail_from']
                         rcpt_tos = json.loads(row['rcpt_tos'])
-                        
+                        msg_content = row['content']
+
+                        # 强制修改邮件头 From
+                        if node.get('sender_email'):
+                            try:
+                                msg = message_from_bytes(msg_content)
+                                if 'From' in msg: del msg['From']
+                                msg['From'] = node['sender_email']
+                                msg_content = msg.as_bytes()
+                            except Exception as parse_err:
+                                logger.warning(f"Header rewrite failed: {parse_err}")
+
                         with smtplib.SMTP(node['host'], int(node['port']), timeout=20) as s:
                             if node.get('encryption') in ['tls', 'ssl']: s.starttls()
                             if node.get('username') and node.get('password'): s.login(node['username'], node['password'])
-                            s.sendmail(sender, rcpt_tos, row['content'])
+                            s.sendmail(sender, rcpt_tos, msg_content)
                         
                         success = True
                         logger.info(f"✅ Sent ID:{row_id} via {node_name}")
