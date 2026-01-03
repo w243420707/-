@@ -52,6 +52,7 @@ install_smtp() {
     "web_config": { "admin_password": "admin" },
     "telegram_config": { "bot_token": "", "admin_id": "" },
     "log_config": { "max_mb": 50, "backups": 3 },
+    "limit_config": { "max_per_hour": 0, "min_interval": 1, "max_interval": 5 },
     "downstream_pool": []
 }
 EOF
@@ -174,6 +175,18 @@ def worker_thread():
     while True:
         try:
             cfg = load_config()
+            
+            # Rate Limiting
+            limit_cfg = cfg.get('limit_config', {})
+            max_ph = int(limit_cfg.get('max_per_hour', 0))
+            if max_ph > 0:
+                with get_db() as conn:
+                    cnt = conn.execute("SELECT COUNT(*) FROM queue WHERE status='sent' AND updated_at > datetime('now', '-1 hour')").fetchone()[0]
+                if cnt >= max_ph:
+                    logger.info(f"⏳ Hourly limit reached ({cnt}/{max_ph}). Pausing...")
+                    time.sleep(60)
+                    continue
+
             pool = {n['name']: n for n in cfg.get('downstream_pool', [])}
             
             with get_db() as conn:
@@ -218,7 +231,7 @@ def worker_thread():
                     error_msg = f"Node '{node_name}' removed from config"
                 else:
                     try:
-                        sender = node.get('sender_email') or row['mail_from']
+                        sender = node.get('sender_email') or row['mail_from'] or node.get('username')
                         rcpt_tos = json.loads(row['rcpt_tos'])
                         msg_content = row['content']
 
@@ -254,6 +267,12 @@ def worker_thread():
                         else:
                             conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (error_msg, row_id))
                             send_telegram(f"❌ Mail ID:{row_id} Failed permanently via {node_name}\nErr: {error_msg}")
+                
+                # Random Interval
+                min_int = int(limit_cfg.get('min_interval', 1))
+                max_int = int(limit_cfg.get('max_interval', 5))
+                if max_int > 0:
+                    time.sleep(random.uniform(min_int, max_int))
 
         except Exception as e:
             logger.error(f"Worker Error: {e}")
@@ -334,7 +353,7 @@ def api_queue_list():
 @login_required
 def api_send_bulk():
     data = request.json
-    sender = data.get('sender', '')
+    # sender = data.get('sender', '') # Deprecated: Use node's sender
     subject = data.get('subject', '(No Subject)')
     body = data.get('body', '')
     recipients = [r.strip() for r in data.get('recipients', '').split('\n') if r.strip()]
@@ -346,11 +365,21 @@ def api_send_bulk():
     if not pool: return jsonify({"error": "No enabled nodes available"}), 500
 
     count = 0
-    with get_db() as conn:
-        for rcpt in recipients:
-            msg = MIMEText(body, 'html', 'utf-8')
-            msg['Subject'] = subject
-            msg['From'] = sender
+    charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    
+    with get_ooter = "<br><br><hr><p style='color:#999;font-size:12px;text-align:center;'>如需退订此邮件，请到官网联系在线客服即可。</p>"
+            final_subject = f"{subject} {rand_sub}"
+            final_body = f"{body}{footer
+            # Randomize
+            rand_sub = ''.join(random.choices(charset, k=6))
+            rand_body = ''.join(random.choices(charset, k=12))
+            
+            final_subject = f"{subject} {rand_sub}"
+            final_body = f"{body}<div style='display:none;opacity:0;font-size:0'>{rand_body}</div>"
+
+            msg = MIMEText(final_body, 'html', 'utf-8')
+            msg['Subject'] = final_subject
+            msg['From'] = '' # Placeholder, worker will fill
             msg['To'] = rcpt
             msg['Date'] = formatdate(localtime=True)
             msg['Message-ID'] = make_msgid()
@@ -360,7 +389,7 @@ def api_send_bulk():
             
             conn.execute(
                 "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status) VALUES (?, ?, ?, ?, ?)",
-                (sender, json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending')
+                ('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending')
             )
             count += 1
             
@@ -520,7 +549,23 @@ EOF
 
             <div class="p-4">
                 <!-- Queue Tab -->
-                <div v-if="tab=='queue'" class="fade-in">
+                <div v-ifProgress Bar -->
+                    <div class="card mb-4 shadow-sm" v-if="totalMails > 0">
+                        <div class="card-body">
+                            <div class="d-flex justify-content-between mb-1">
+                                <span class="fw-bold small text-muted">群发进度</span>
+                                <span class="fw-bold small text-primary">[[ progressPercent ]]%</span>
+                            </div>
+                            <div class="progress" style="height: 20px;">
+                                <div class="progress-bar progress-bar-striped progress-bar-animated" :class="progressPercent==100?'bg-success':'bg-primary'" role="progressbar" :style="{width: progressPercent + '%'}"></div>
+                            </div>
+                            <div class="text-center small text-muted mt-2">
+                                已发送: [[ qStats.total.sent || 0 ]] / 总任务: [[ totalMails ]]
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ="tab=='queue'" class="fade-in">
                     <!-- Stats Grid -->
                     <div class="row g-4 mb-4">
                         <div class="col-md-3 col-6" v-for="(label, key) in {'pending': '待发送', 'processing': '发送中', 'sent': '已成功', 'failed': '已失败'}" :key="key">
@@ -587,16 +632,12 @@ EOF
                         </table>
                     </div>
                 </div>
-
-                <!-- Send Tab -->
-                <div v-if="tab=='send'" class="fade-in">
-                    <div class="row g-4">
-                        <div class="col-lg-8">
-                            <div class="card border h-100">
-                                <div class="card-body">
-                                    <h6 class="card-title fw-bold mb-3">邮件内容编辑</h6>
+主题 (Subject)</label>
+                                        <input v-model="bulk.subject" class="form-control" placeholder="邮件主题 (自动追加随机码)">
+                                    </div>
                                     <div class="mb-3">
-                                        <label class="form-label text-muted small">发件人 (From)</label>
+                                        <label class="form-label text-muted small">正文 (HTML支持)</label>
+                                        <textarea v-model="bulk.body" class="form-control font-monospace" rows="12" placeholder="<html>...</html> (自动插入隐形随机码)
                                         <input v-model="bulk.sender" class="form-control" placeholder="sender@yourdomain.com">
                                     </div>
                                     <div class="mb-3">
@@ -625,7 +666,30 @@ EOF
                                     <textarea v-model="bulk.recipients" class="form-control flex-grow-1 mb-3" placeholder="每行一个邮箱地址..." style="min-height: 200px;"></textarea>
                                     <div class="d-flex justify-content-between align-items-center mb-3">
                                         <span class="text-muted small">共 [[ recipientCount ]] 人</span>
-                                        <button class="btn btn-sm btn-outline-danger" @click="clearContacts"><i class="bi bi-trash"></i> 清空库</button>
+                             Sending Policy -->
+                        <div class="col-md-6">
+                            <div class="card border h-100">
+                                <div class="card-header bg-white fw-bold">发送策略控制</div>
+                                <div class="card-body">
+                                    <div class="mb-3">
+                                        <label class="form-label small text-muted">每小时最大发送量 (0为不限)</label>
+                                        <input type="number" v-model.number="config.limit_config.max_per_hour" class="form-control">
+                                    </div>
+                                    <div class="row g-3">
+                                        <div class="col-6">
+                                            <label class="form-label small text-muted">最小间隔(秒)</label>
+                                            <input type="number" v-model.number="config.limit_config.min_interval" class="form-control">
+                                        </div>
+                                        <div class="col-6">
+                                            <label class="form-label small text-muted">最大间隔(秒)</label>
+                                            <input type="number" v-model.number="config.limit_config.max_interval" class="form-control">
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!--            <button class="btn btn-sm btn-outline-danger" @click="clearContacts"><i class="bi bi-trash"></i> 清空库</button>
                                     </div>
                                     <button class="btn btn-primary w-100 py-2" @click="sendBulk" :disabled="sending || recipientCount === 0">
                                         <span v-if="sending" class="spinner-border spinner-border-sm me-2"></span>
@@ -725,9 +789,18 @@ EOF
                                                         <option value="tls">TLS</option>
                                                         <option value="ssl">SSL</option>
                                                     </select>
-                                                </div>
-                                                <div class="col-md-2"><input v-model="n.username" class="form-control form-control-sm" placeholder="User"></div>
-                                                <div class="col-md-2"><input v-model="n.password" type="password" class="form-control form-control-sm" placeholder="Pass"></div>
+                                                </div>,
+                totalMails() {
+                    const t = this.qStats.total;
+                    return (t.pending||0) + (t.processing||0) + (t.sent||0) + (t.failed||0);
+                },
+                progressPercent() {
+                    if(this.totalMails === 0) return 0;
+                    return Math.round(((this.qStats.total.sent||0) / this.totalMails) * 100);
+                }
+            },
+            mounted() {
+                if(!this.config.limit_config) this.config.limit_config = { max_per_hour: 0, min_interval: 1, max_interval: 5 };                         <div class="col-md-2"><input v-model="n.password" type="password" class="form-control form-control-sm" placeholder="Pass"></div>
                                                 <div class="col-md-12 mt-2">
                                                     <div class="input-group input-group-sm">
                                                         <span class="input-group-text">Sender Rewrite</span>
@@ -857,7 +930,7 @@ EOF
                     if(!confirm(`确认发送给 ${this.recipientCount} 人?`)) return;
                     this.sending = true;
                     try {
-                        const res = await fetch('/api/send/bulk', {
+                        const res =nd/bulk', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify(this.bulk)
