@@ -53,6 +53,7 @@ install_smtp() {
     "telegram_config": { "bot_token": "", "admin_id": "" },
     "log_config": { "max_mb": 50, "backups": 3 },
     "limit_config": { "max_per_hour": 0, "min_interval": 1, "max_interval": 5 },
+    "bulk_control": { "status": "running" },
     "downstream_pool": []
 }
 EOF
@@ -186,12 +187,15 @@ def worker_thread():
         try:
             cfg = load_config()
             
-            # Rate Limiting (Bulk Only)
+            # Rate Limiting & Manual Control (Bulk Only)
             limit_cfg = cfg.get('limit_config', {})
+            bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
             max_ph = int(limit_cfg.get('max_per_hour', 0))
-            bulk_paused = False
             
-            if max_ph > 0:
+            # Pause if manually paused OR rate limited
+            bulk_paused = (bulk_ctrl == 'paused')
+            
+            if not bulk_paused and max_ph > 0:
                 with get_db() as conn:
                     try:
                         cnt = conn.execute("SELECT COUNT(*) FROM queue WHERE status='sent' AND source='bulk' AND updated_at > datetime('now', '-1 hour')").fetchone()[0]
@@ -205,8 +209,10 @@ def worker_thread():
                 # Fetch pending items
                 if bulk_paused:
                     try:
+                        # Only fetch relay mails, skip bulk
                         cursor = conn.execute("SELECT * FROM queue WHERE status='pending' AND source!='bulk' LIMIT 5")
                     except:
+                        # Fallback if source column missing (shouldn't happen)
                         cursor = conn.execute("SELECT * FROM queue WHERE status='pending' LIMIT 5")
                 else:
                     cursor = conn.execute("SELECT * FROM queue WHERE status='pending' LIMIT 5")
@@ -496,6 +502,34 @@ def api_queue_clear():
     with get_db() as conn:
         conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed')")
     return jsonify({"status": "ok"})
+@app.route('/api/bulk/control', methods=['POST'])
+@login_required
+def api_bulk_control():
+    action = request.json.get('action')
+    cfg = load_config()
+    if 'bulk_control' not in cfg: cfg['bulk_control'] = {'status': 'running'}
+    
+    if action == 'pause':
+        cfg['bulk_control']['status'] = 'paused'
+        save_config(cfg)
+    elif action == 'resume':
+        cfg['bulk_control']['status'] = 'running'
+        save_config(cfg)
+    elif action == 'stop':
+        # Stop means clear pending bulk
+        with get_db() as conn:
+            conn.execute("DELETE FROM queue WHERE status='pending' AND source='bulk'")
+        # Also pause to be safe? No, just clear queue is enough for "Stop" usually.
+        # But user might want to stop and then resume later with new list.
+        
+    return jsonify({"status": "ok", "current": cfg['bulk_control']['status']})
+
+@app.route('/api/bulk/status')
+@login_required
+def api_bulk_status():
+    cfg = load_config()
+    return jsonify(cfg.get('bulk_control', {'status': 'running'}))
+
 
 def start_services():
     init_db()
@@ -581,7 +615,23 @@ EOF
                         </div>
                     </div>
                 </div>
-                <button type="button" class="btn-close" @click="showPwd = false"></button>
+                <button tBulk Control -->
+                    <div class="card mb-4 shadow-sm border-primary" v-if="totalMails > 0 || bulkStatus == 'paused'">
+                        <div class="card-body d-flex justify-content-between align-items-center py-2">
+                            <div class="d-flex align-items-center gap-3">
+                                <h6 class="fw-bold mb-0">群发任务控制</h6>
+                                <span v-if="bulkStatus=='running'" class="badge bg-success">进行中</span>
+                                <span v-else class="badge bg-warning text-dark">已暂停</span>
+                            </div>
+                            <div class="btn-group">
+                                <button v-if="bulkStatus=='running'" class="btn btn-sm btn-warning" @click="controlBulk('pause')"><i class="bi bi-pause-fill"></i> 暂停</button>
+                                <button v-else class="btn btn-sm btn-success" @click="controlBulk('resume')"><i class="bi bi-play-fill"></i> 继续</button>
+                                <button class="btn btn-sm btn-danger" @click="controlBulk('stop')"><i class="bi bi-stop-fill"></i> 停止(清空待发)</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- ype="button" class="btn-close" @click="showPwd = false"></button>
             </div>
         </div>
 
@@ -867,7 +917,8 @@ EOF
                 </div>
             </div>
         </div>
-    </div>
+    </div>,
+                    bulkStatus: 'running'
 
     <script>
         const { createApp } = Vue;
@@ -890,7 +941,11 @@ EOF
                 recipientCount() { return this.bulk.recipients ? this.bulk.recipients.split('\n').filter(r => r.trim()).length : 0; },
                 totalMails() {
                     const t = this.qStats.total;
-                    return (t.pending||0) + (t.processing||0) + (t.sent||0) + (t.failed||0);
+                this.fetchBulkStatus();
+                setInterval(() => {
+                    this.fetchQueue();
+                    this.fetchBulkStatus();
+                } (t.processing||0) + (t.sent||0) + (t.failed||0);
                 },
                 progressPercent() {
                     if(this.totalMails === 0) return 0;
@@ -926,7 +981,30 @@ EOF
                 },
                 async fetchContactCount() {
                     try {
-                        const res = await fetch('/api/contacts/count');
+                      fetchBulkStatus() {
+                    try {
+                        const res = await fetch('/api/bulk/status');
+                        const data = await res.json();
+                        this.bulkStatus = data.status;
+                    } catch(e) {}
+                },
+                async controlBulk(action) {
+                    if(action === 'stop' && !confirm('确定停止并清空所有待发送的群发邮件吗？')) return;
+                    try {
+                        const res = await fetch('/api/bulk/control', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({action: action})
+                        });
+                        const data = await res.json();
+                        this.bulkStatus = data.current;
+                        if(action === 'stop') {
+                            alert('已停止并清空待发队列');
+                            this.fetchQueue();
+                        }
+                    } catch(e) { alert('操作失败: ' + e); }
+                },
+                async   const res = await fetch('/api/contacts/count');
                         const data = await res.json();
                         this.contactCount = data.count;
                     } catch(e) {}
