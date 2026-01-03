@@ -104,7 +104,11 @@ def init_db():
             retry_count INTEGER DEFAULT 0,
             last_error TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            source TEXT DEFAULT 'relay',
+            tracking_id TEXT UNIQUE,
+            opened_at TIMESTAMP,
+            open_count INTEGER DEFAULT 0
         )''')
         
         # Check and add source column safely
