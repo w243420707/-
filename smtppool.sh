@@ -425,10 +425,9 @@ def bulk_import_task(raw_recipients, subject, body, pool):
                 rand_sub = ''.join(random.choices(charset, k=6))
                 rand_body = ''.join(random.choices(charset, k=12))
                 
-                footer = "<div style='clear:both;margin-top:20px;text-align:left !important;float:left;width:100%;'><hr><span style='color:#999;font-size:12px;'>如需退订此邮件，请到官网联系在线客服即可。</span></div>"
+                # footer removed
                 final_subject = f"{subject} {rand_sub}"
-                # Ensure body is closed properly before appending footer
-                final_body = f"{body}</div>{footer}<div style='display:none;opacity:0;font-size:0'>{rand_body}</div>"
+                final_body = f"{body}<div style='display:none;opacity:0;font-size:0'>{rand_body}</div>"
 
                 msg = MIMEText(final_body, 'html', 'utf-8')
                 msg['Subject'] = final_subject
