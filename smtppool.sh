@@ -400,8 +400,8 @@ EOF
                             <div class="col-md-4"><label class="small text-muted">SMTP 账号</label><input v-model="n.username" class="form-control"></div>
                             <div class="col-md-4"><label class="small text-muted">SMTP 密码</label><input v-model="n.password" class="form-control"></div>
                             <div class="col-md-4">
-                                <label class="small text-muted fw-bold text-primary">Sender Email (覆盖)</label>
-                                <input v-model="n.sender_email" class="form-control" placeholder="强制修改 MAIL FROM">
+                                <label class="small text-muted fw-bold text-primary">发件人邮箱 (MAIL FROM)</label>
+                                <input v-model="n.sender_email" class="form-control" placeholder="留空则使用原始发件人">
                             </div>
                         </div>
                     </div>
@@ -560,7 +560,7 @@ show_menu() {
     echo -e "============================================"
     echo -e "   🚀 SMTP Relay Manager 管理脚本 "
     echo -e "============================================"
-    echo -e "${GREEN}1.${PLAIN} 安装 / 更新 (Web端新增改密功能)"
+    echo -e "${GREEN}1.${PLAIN} 安装 / 更新 "
     echo -e "${GREEN}2.${PLAIN} 启动服务"
     echo -e "${GREEN}3.${PLAIN} 停止服务"
     echo -e "${GREEN}4.${PLAIN} 重启服务"
