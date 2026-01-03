@@ -524,8 +524,22 @@ EOF
     supervisorctl update >/dev/null
     supervisorctl restart smtp-web
 
-    echo -e "${GREEN}✅ 更新完成！${PLAIN}"
-    echo -e "请刷新 Web 页面，右上角已增加 [修改密码] 按钮。"
+    # Get IP
+    IP=$(curl -s ifconfig.me || echo "你的服务器IP")
+
+    echo -e "${GREEN}✅ 安装/更新完成！${PLAIN}"
+    echo -e "==============================================="
+    echo -e " Web 管理面板: http://${IP}:8080"
+    echo -e " 默认密码:     admin"
+    echo -e "-----------------------------------------------"
+    echo -e " SMTP 服务器:  ${IP}:587"
+    echo -e " SMTP 账号:    myapp (默认)"
+    echo -e " SMTP 密码:    123   (默认)"
+    echo -e "-----------------------------------------------"
+    echo -e " 安装目录:     $APP_DIR"
+    echo -e " 日志目录:     $LOG_DIR"
+    echo -e "==============================================="
+    echo -e "如果无法访问，请检查防火墙端口 8080/587 是否开放。"
 }
 
 uninstall_smtp() {
