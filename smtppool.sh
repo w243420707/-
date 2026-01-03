@@ -809,9 +809,25 @@ EOF
                 </div>
             </div>
         </div>
-    </div>,
-                contactCount: 0
-            }},
+    </div>
+
+    <script>
+        const { createApp } = Vue;
+        createApp({
+            delimiters: ['[[', ']]'],
+            data() {
+                return {
+                    tab: 'dashboard',
+                    config: {{ config | tojson }},
+                    saving: false,
+                    showPwd: false,
+                    qStats: { total: {}, nodes: {} },
+                    qList: [],
+                    bulk: { sender: '', subject: '', recipients: '', body: '' },
+                    sending: false,
+                    contactCount: 0
+                }
+            },
             computed: {
                 recipientCount() { return this.bulk.recipients ? this.bulk.recipients.split('\n').filter(r => r.trim()).length : 0; }
             },
@@ -859,20 +875,7 @@ EOF
                         this.fetchContactCount();
                         alert('通讯录已清空');
                     } catch(e) { alert('清空失败: ' + e); }
-                },: { total: {}, nodes: {} },
-                qList: [],
-                bulk: { sender: '', subject: '', recipients: '', body: '' },
-                sending: false
-            }},
-            computed: {
-                recipientCount() { return this.bulk.recipients ? this.bulk.recipients.split('\n').filter(r => r.trim()).length : 0; }
-            },
-            mounted() {
-                this.config.downstream_pool.forEach(n => { if(n.enabled === undefined) n.enabled = true; });
-                this.fetchQueue();
-                setInterval(this.fetchQueue, 5000);
-            },
-            methods: {
+                },
                 addNode() { 
                     this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true }); 
                 },
