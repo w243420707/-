@@ -272,7 +272,11 @@ def worker_thread():
                 with get_db() as conn:
                     if success:
                         conn.execute("UPDATE queue SET status='sent', updated_at=CURRENT_TIMESTAMP WHERE id=?", (row_id,))
-                    else: (Bulk Only)
+                    else:
+                        conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (error_msg, row_id))
+                        send_telegram(f"❌ Mail ID:{row_id} Failed permanently via {node_name}\nErr: {error_msg}")
+                
+                # Random Interval (Bulk Only)
                 is_bulk = False
                 try:
                     if row['source'] == 'bulk': is_bulk = True
@@ -282,9 +286,7 @@ def worker_thread():
                     min_int = int(limit_cfg.get('min_interval', 1))
                     max_int = int(limit_cfg.get('max_interval', 5))
                     if max_int > 0:
-                            else:
-                            conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (error_msg, row_id))
-                            send_telegram(f"❌ Mail ID:{row_id} Failed permanently via {node_name}\nErr: {error_msg}")
+                        time.sleep(random.uniform(min_int, max_int))
                 
                 # Random Interval
                 min_int = int(limit_cfg.get('min_interval', 1))
@@ -435,14 +437,14 @@ def api_send_bulk():
             msg['From'] = '' # Placeholder, worker will fill
             msg['To'] = rcpt
             msg['Date'] = formatdate(localtime=True)
-            msg['Message-ID'] = make_msgid(), source) VALUES (?, ?, ?, ?, ?, ?)",
-                ('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk
+            msg['Message-ID'] = make_msgid()
+
             node = random.choice(pool)
             node_name = node.get('name', 'Unknown')
             
             conn.execute(
-                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status) VALUES (?, ?, ?, ?, ?)",
-                ('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending')
+                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source) VALUES (?, ?, ?, ?, ?, ?)",
+                ('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk')
             )
             count += 1
             
