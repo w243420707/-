@@ -367,15 +367,15 @@ def api_send_bulk():
     count = 0
     charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
     
-    with get_ooter = "<br><br><hr><p style='color:#999;font-size:12px;text-align:center;'>如需退订此邮件，请到官网联系在线客服即可。</p>"
-            final_subject = f"{subject} {rand_sub}"
-            final_body = f"{body}{footer
+    with get_db() as conn:
+        for rcpt in recipients:
             # Randomize
             rand_sub = ''.join(random.choices(charset, k=6))
             rand_body = ''.join(random.choices(charset, k=12))
             
+            footer = "<br><br><hr><p style='color:#999;font-size:12px;text-align:center;'>如需退订此邮件，请到官网联系在线客服即可。</p>"
             final_subject = f"{subject} {rand_sub}"
-            final_body = f"{body}<div style='display:none;opacity:0;font-size:0'>{rand_body}</div>"
+            final_body = f"{body}{footer}<div style='display:none;opacity:0;font-size:0'>{rand_body}</div>"
 
             msg = MIMEText(final_body, 'html', 'utf-8')
             msg['Subject'] = final_subject
