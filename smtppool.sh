@@ -414,6 +414,7 @@ def bulk_import_task(raw_recipients, subject, body, pool):
     try:
         # Process recipients in background to avoid blocking
         recipients = [r.strip() for r in raw_recipients.split('\n') if r.strip()]
+        random.shuffle(recipients) # Shuffle for better distribution
         
         charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
         tasks = []
