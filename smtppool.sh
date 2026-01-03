@@ -584,7 +584,8 @@ EOF
 
             <div class="p-4">
                 <!-- Queue Tab -->
-                <div v-ifProgress Bar -->
+                <div v-if="tab=='queue'" class="fade-in">
+                    <!-- Progress Bar -->
                     <div class="card mb-4 shadow-sm" v-if="totalMails > 0">
                         <div class="card-body">
                             <div class="d-flex justify-content-between mb-1">
@@ -600,7 +601,6 @@ EOF
                         </div>
                     </div>
 
-                    <!-- ="tab=='queue'" class="fade-in">
                     <!-- Stats Grid -->
                     <div class="row g-4 mb-4">
                         <div class="col-md-3 col-6" v-for="(label, key) in {'pending': '待发送', 'processing': '发送中', 'sent': '已成功', 'failed': '已失败'}" :key="key">
@@ -667,21 +667,21 @@ EOF
                         </table>
                     </div>
                 </div>
-主题 (Subject)</label>
+
+                <!-- Send Tab -->
+                <div v-if="tab=='send'" class="fade-in">
+                    <div class="row g-4">
+                        <div class="col-lg-8">
+                            <div class="card border h-100">
+                                <div class="card-body">
+                                    <h6 class="card-title fw-bold mb-3">邮件内容编辑</h6>
+                                    <div class="mb-3">
+                                        <label class="form-label text-muted small">主题 (Subject)</label>
                                         <input v-model="bulk.subject" class="form-control" placeholder="邮件主题 (自动追加随机码)">
                                     </div>
                                     <div class="mb-3">
                                         <label class="form-label text-muted small">正文 (HTML支持)</label>
-                                        <textarea v-model="bulk.body" class="form-control font-monospace" rows="12" placeholder="<html>...</html> (自动插入隐形随机码)
-                                        <input v-model="bulk.sender" class="form-control" placeholder="sender@yourdomain.com">
-                                    </div>
-                                    <div class="mb-3">
-                                        <label class="form-label text-muted small">主题 (Subject)</label>
-                                        <input v-model="bulk.subject" class="form-control" placeholder="邮件主题...">
-                                    </div>
-                                    <div class="mb-3">
-                                        <label class="form-label text-muted small">正文 (HTML支持)</label>
-                                        <textarea v-model="bulk.body" class="form-control font-monospace" rows="12" placeholder="<html>...</html>"></textarea>
+                                        <textarea v-model="bulk.body" class="form-control font-monospace" rows="12" placeholder="<html>...</html> (自动插入隐形随机码)"></textarea>
                                     </div>
                                 </div>
                             </div>
@@ -701,7 +701,23 @@ EOF
                                     <textarea v-model="bulk.recipients" class="form-control flex-grow-1 mb-3" placeholder="每行一个邮箱地址..." style="min-height: 200px;"></textarea>
                                     <div class="d-flex justify-content-between align-items-center mb-3">
                                         <span class="text-muted small">共 [[ recipientCount ]] 人</span>
-                             Sending Policy -->
+                                        <button class="btn btn-sm btn-outline-danger" @click="clearContacts"><i class="bi bi-trash"></i> 清空库</button>
+                                    </div>
+                                    <button class="btn btn-primary w-100 py-2" @click="sendBulk" :disabled="sending || recipientCount === 0">
+                                        <span v-if="sending" class="spinner-border spinner-border-sm me-2"></span>
+                                        <i v-else class="bi bi-send-fill me-2"></i>
+                                        [[ sending ? '发送中...' : '确认发送' ]]
+                                    </button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Settings Tab -->
+                <div v-if="tab=='settings'" class="fade-in">
+                    <div class="row g-4">
+                        <!-- Sending Policy -->
                         <div class="col-md-6">
                             <div class="card border h-100">
                                 <div class="card-header bg-white fw-bold">发送策略控制</div>
@@ -724,22 +740,6 @@ EOF
                             </div>
                         </div>
 
-                        <!--            <button class="btn btn-sm btn-outline-danger" @click="clearContacts"><i class="bi bi-trash"></i> 清空库</button>
-                                    </div>
-                                    <button class="btn btn-primary w-100 py-2" @click="sendBulk" :disabled="sending || recipientCount === 0">
-                                        <span v-if="sending" class="spinner-border spinner-border-sm me-2"></span>
-                                        <i v-else class="bi bi-send-fill me-2"></i>
-                                        [[ sending ? '发送中...' : '确认发送' ]]
-                                    </button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Settings Tab -->
-                <div v-if="tab=='settings'" class="fade-in">
-                    <div class="row g-4">
                         <!-- Basic Config -->
                         <div class="col-md-6">
                             <div class="card border h-100">
@@ -824,18 +824,9 @@ EOF
                                                         <option value="tls">TLS</option>
                                                         <option value="ssl">SSL</option>
                                                     </select>
-                                                </div>,
-                totalMails() {
-                    const t = this.qStats.total;
-                    return (t.pending||0) + (t.processing||0) + (t.sent||0) + (t.failed||0);
-                },
-                progressPercent() {
-                    if(this.totalMails === 0) return 0;
-                    return Math.round(((this.qStats.total.sent||0) / this.totalMails) * 100);
-                }
-            },
-            mounted() {
-                if(!this.config.limit_config) this.config.limit_config = { max_per_hour: 0, min_interval: 1, max_interval: 5 };                         <div class="col-md-2"><input v-model="n.password" type="password" class="form-control form-control-sm" placeholder="Pass"></div>
+                                                </div>
+                                                <div class="col-md-2"><input v-model="n.username" class="form-control form-control-sm" placeholder="User"></div>
+                                                <div class="col-md-2"><input v-model="n.password" type="password" class="form-control form-control-sm" placeholder="Pass"></div>
                                                 <div class="col-md-12 mt-2">
                                                     <div class="input-group input-group-sm">
                                                         <span class="input-group-text">Sender Rewrite</span>
@@ -872,9 +863,18 @@ EOF
                 }
             },
             computed: {
-                recipientCount() { return this.bulk.recipients ? this.bulk.recipients.split('\n').filter(r => r.trim()).length : 0; }
+                recipientCount() { return this.bulk.recipients ? this.bulk.recipients.split('\n').filter(r => r.trim()).length : 0; },
+                totalMails() {
+                    const t = this.qStats.total;
+                    return (t.pending||0) + (t.processing||0) + (t.sent||0) + (t.failed||0);
+                },
+                progressPercent() {
+                    if(this.totalMails === 0) return 0;
+                    return Math.round(((this.qStats.total.sent||0) / this.totalMails) * 100);
+                }
             },
             mounted() {
+                if(!this.config.limit_config) this.config.limit_config = { max_per_hour: 0, min_interval: 1, max_interval: 5 };
                 this.config.downstream_pool.forEach(n => { if(n.enabled === undefined) n.enabled = true; });
                 this.fetchQueue();
                 this.fetchContactCount();
@@ -961,11 +961,11 @@ EOF
                     } catch(e) { console.error(e); }
                 },
                 async sendBulk() {
-                    if(!this.bulk.sender || !this.bulk.subject || !this.bulk.body) return alert('请填写完整信息');
+                    if(!this.bulk.subject || !this.bulk.body) return alert('请填写完整信息');
                     if(!confirm(`确认发送给 ${this.recipientCount} 人?`)) return;
                     this.sending = true;
                     try {
-                        const res =nd/bulk', {
+                        const res = await fetch('/api/send/bulk', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify(this.bulk)
