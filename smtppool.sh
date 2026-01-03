@@ -296,11 +296,46 @@ def login():
         if request.form.get('password') == cfg.get('web_config', {}).get('admin_password', 'admin'):
             session['logged_in'] = True
             return redirect(url_for('index'))
-    return '''<body style="display:flex;justify-content:center;align-items:center;height:100vh;background:#f0f2f5;font-family:sans-serif">
-    <form method="post" style="background:#fff;padding:40px;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,0.1);text-align:center">
-        <h3>系统登录</h3><input type="password" name="password" placeholder="输入密码" style="padding:10px;width:100%;margin:15px 0;border:1px solid #ddd;border-radius:4px">
-        <button style="width:100%;padding:10px;background:#0d6efd;color:#fff;border:none;border-radius:4px;cursor:pointer">登录</button>
-    </form></body>'''
+    return '''
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>登录 - SMTP Relay Manager</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
+    <style>
+        body { background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); height: 100vh; display: flex; align-items: center; justify-content: center; }
+        .login-card { border: none; border-radius: 1rem; box-shadow: 0 10px 25px rgba(0,0,0,0.1); overflow: hidden; width: 100%; max-width: 400px; }
+        .card-header { background: #fff; border-bottom: none; padding-top: 2rem; text-align: center; }
+        .btn-primary { padding: 0.6rem; font-weight: 500; }
+    </style>
+</head>
+<body>
+    <div class="card login-card">
+        <div class="card-header">
+            <div class="bg-primary text-white rounded-circle d-inline-flex align-items-center justify-content-center mb-3" style="width: 64px; height: 64px;">
+                <i class="bi bi-shield-lock-fill fs-2"></i>
+            </div>
+            <h4 class="fw-bold text-dark">系统登录</h4>
+            <p class="text-muted small">SMTP Relay Manager</p>
+        </div>
+        <div class="card-body p-4">
+            <form method="post">
+                <div class="mb-3">
+                    <div class="input-group">
+                        <span class="input-group-text bg-light border-end-0"><i class="bi bi-key"></i></span>
+                        <input type="password" name="password" class="form-control border-start-0 ps-0" placeholder="请输入管理员密码" required autofocus>
+                    </div>
+                </div>
+                <button type="submit" class="btn btn-primary w-100 mb-3">立即登录</button>
+            </form>
+        </div>
+    </div>
+</body>
+</html>
+'''
 
 @app.route('/')
 @login_required
