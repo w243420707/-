@@ -410,55 +410,78 @@ def api_queue_list():
         rows = conn.execute(f"SELECT id, mail_from, rcpt_tos, assigned_node, status, retry_count, last_error, created_at FROM queue ORDER BY id DESC LIMIT {limit}").fetchall()
     return jsonify([dict(r) for r in rows])
 
+def bulk_import_task(raw_recipients, subject, body, pool):
+    try:
+        # Process recipients in background to avoid blocking
+        recipients = [r.strip() for r in raw_recipients.split('\n') if r.strip()]
+        
+        charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        tasks = []
+        count = 0
+        
+        for rcpt in recipients:
+            try:
+                # Randomize
+                rand_sub = ''.join(random.choices(charset, k=6))
+                rand_body = ''.join(random.choices(charset, k=12))
+                
+                footer = "<div style='clear:both;margin-top:20px;text-align:left;'><hr><span style='color:#999;font-size:12px;'>如需退订此邮件，请到官网联系在线客服即可。</span></div>"
+                final_subject = f"{subject} {rand_sub}"
+                final_body = f"{body}{footer}<div style='display:none;opacity:0;font-size:0'>{rand_body}</div>"
+
+                msg = MIMEText(final_body, 'html', 'utf-8')
+                msg['Subject'] = final_subject
+                msg['From'] = '' # Placeholder, worker will fill
+                msg['To'] = rcpt
+                msg['Date'] = formatdate(localtime=True)
+                msg['Message-ID'] = make_msgid()
+
+                node = random.choice(pool)
+                node_name = node.get('name', 'Unknown')
+                
+                tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk'))
+                count += 1
+                
+                if len(tasks) >= 500:
+                    with get_db() as conn:
+                        conn.executemany(
+                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source) VALUES (?, ?, ?, ?, ?, ?)",
+                            tasks
+                        )
+                    tasks = []
+            except Exception as e:
+                logger.error(f"Error preparing email for {rcpt}: {e}")
+                continue
+
+        if tasks:
+            with get_db() as conn:
+                conn.executemany(
+                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source) VALUES (?, ?, ?, ?, ?, ?)",
+                    tasks
+                )
+        logger.info(f"Bulk import finished: {count} emails processed")
+    except Exception as e:
+        logger.error(f"Bulk import task failed: {e}")
+
 @app.route('/api/send/bulk', methods=['POST'])
 @login_required
 def api_send_bulk():
     try:
         data = request.json
-        # sender = data.get('sender', '') # Deprecated: Use node's sender
         subject = data.get('subject', '(No Subject)')
         body = data.get('body', '')
-        recipients = [r.strip() for r in data.get('recipients', '').split('\n') if r.strip()]
+        raw_recipients = data.get('recipients', '')
         
-        if not recipients: return jsonify({"error": "No recipients"}), 400
+        if not raw_recipients.strip(): return jsonify({"error": "No recipients"}), 400
         
         cfg = load_config()
         pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
         if not pool: return jsonify({"error": "No enabled nodes available"}), 500
 
-        count = 0
-        charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-        tasks = []
-        
-        for rcpt in recipients:
-            # Randomize
-            rand_sub = ''.join(random.choices(charset, k=6))
-            rand_body = ''.join(random.choices(charset, k=12))
-            
-            footer = "<div style='clear:both;margin-top:20px;text-align:left;'><hr><span style='color:#999;font-size:12px;'>如需退订此邮件，请到官网联系在线客服即可。</span></div>"
-            final_subject = f"{subject} {rand_sub}"
-            final_body = f"{body}{footer}<div style='display:none;opacity:0;font-size:0'>{rand_body}</div>"
-
-            msg = MIMEText(final_body, 'html', 'utf-8')
-            msg['Subject'] = final_subject
-            msg['From'] = '' # Placeholder, worker will fill
-            msg['To'] = rcpt
-            msg['Date'] = formatdate(localtime=True)
-            msg['Message-ID'] = make_msgid()
-
-            node = random.choice(pool)
-            node_name = node.get('name', 'Unknown')
-            
-            tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk'))
-            count += 1
-            
-        with get_db() as conn:
-            conn.executemany(
-                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source) VALUES (?, ?, ?, ?, ?, ?)",
-                tasks
-            )
+        # Start background task with raw string
+        threading.Thread(target=bulk_import_task, args=(raw_recipients, subject, body, pool)).start()
                 
-        return jsonify({"status": "ok", "count": count})
+        return jsonify({"status": "ok", "count": "Processing in background"})
     except Exception as e:
         logger.error(f"Bulk send error: {e}")
         return jsonify({"error": str(e)}), 500
@@ -503,7 +526,7 @@ def api_contacts_clear():
 @login_required
 def api_queue_clear():
     with get_db() as conn:
-        conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed')")
+        conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed', 'processing')")
     return jsonify({"status": "ok"})
 @app.route('/api/bulk/control', methods=['POST'])
 @login_required
@@ -521,7 +544,7 @@ def api_bulk_control():
     elif action == 'stop':
         # Stop means clear pending bulk
         with get_db() as conn:
-            conn.execute("DELETE FROM queue WHERE status='pending' AND source='bulk'")
+            conn.execute("DELETE FROM queue WHERE (status='pending' OR status='processing') AND source='bulk'")
         # Also pause to be safe? No, just clear queue is enough for "Stop" usually.
         # But user might want to stop and then resume later with new list.
         
