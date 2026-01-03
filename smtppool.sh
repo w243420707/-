@@ -287,12 +287,6 @@ def worker_thread():
                     max_int = int(limit_cfg.get('max_interval', 5))
                     if max_int > 0:
                         time.sleep(random.uniform(min_int, max_int))
-                
-                # Random Interval
-                min_int = int(limit_cfg.get('min_interval', 1))
-                max_int = int(limit_cfg.get('max_interval', 5))
-                if max_int > 0:
-                    time.sleep(random.uniform(min_int, max_int))
 
         except Exception as e:
             logger.error(f"Worker Error: {e}")
