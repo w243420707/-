@@ -190,52 +190,34 @@ class RelayHandler:
         
         # Load Balancing: Routing > Weighted
         rcpt = envelope.rcpt_tos[0] if envelope.rcpt_tos else ''
-        node = select_node_for_recipient(pool, rcpt, cfg.get('limit_config', {}))
-        node_name = node.get('name', 'Unknown')
         
-        logger.info(f"📥 Received | From: {envelope.mail_from} | To: {envelope.rcpt_tos} | Assigned: {node_name}")
+        # --- Redundant Send Logic (3 Nodes) ---
+        # 1. Select candidates (Ignore routing rules for relay, use all enabled nodes)
+        candidates = pool 
         
-        # Try Direct Send
-        status = 'pending'
-        last_error = None
-        response = '250 OK: Queued for retry'
-        
-        try:
-            sender = node.get('sender_email') or envelope.mail_from or node.get('username')
-            rcpt_tos = envelope.rcpt_tos
-            msg_content = envelope.content
-
-            # Header rewrite
-            if node.get('sender_email'):
-                try:
-                    msg = message_from_bytes(msg_content)
-                    if 'From' in msg: del msg['From']
-                    msg['From'] = node['sender_email']
-                    msg_content = msg.as_bytes()
-                except: pass
-
-            with smtplib.SMTP(node['host'], int(node['port']), timeout=30) as s:
-                if node.get('encryption') in ['tls', 'ssl']: s.starttls()
-                if node.get('username') and node.get('password'): s.login(node['username'], node['password'])
-                s.sendmail(sender, rcpt_tos, msg_content)
+        # 2. Randomly select up to 3 unique nodes
+        selected_nodes = []
+        if len(candidates) <= 3:
+            selected_nodes = candidates
+        else:
+            selected_nodes = random.sample(candidates, 3)
             
-            # Success
-            status = 'sent'
-            response = '250 OK: Delivered'
-            logger.info(f"✅ Direct Sent via {node_name}")
+        if not selected_nodes:
+             logger.warning("❌ No suitable nodes found for redundancy")
+             return '451 Temporary failure: No suitable nodes'
 
-        except Exception as e:
-            # Failed: Log as pending for retry
-            last_error = str(e)
-            logger.warning(f"⚠️ Direct Send Failed ({e}), Queued.")
-
+        logger.info(f"📥 Received | From: {envelope.mail_from} | To: {envelope.rcpt_tos} | Redundant Nodes: {[n['name'] for n in selected_nodes]}")
+        
+        # 3. Queue for all selected nodes (No Direct Send anymore to ensure async redundancy)
         try:
             with get_db() as conn:
-                conn.execute(
-                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, last_error) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (envelope.mail_from, json.dumps(envelope.rcpt_tos), envelope.content, node_name, status, 'relay', last_error)
-                )
-            return response
+                for node in selected_nodes:
+                    node_name = node.get('name', 'Unknown')
+                    conn.execute(
+                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, last_error) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (envelope.mail_from, json.dumps(envelope.rcpt_tos), envelope.content, node_name, 'pending', 'relay', None)
+                    )
+            return '250 OK: Queued for redundant delivery'
         except Exception as e:
             logger.error(f"❌ DB Error: {e}")
             return '451 Temporary failure: DB Error'
@@ -281,18 +263,19 @@ def worker_thread():
                     blocked_nodes.append(name)
             
             # 2. Fetch pending items with smart filtering
+            # Priority: Relay tasks (source != 'bulk') should be processed first (Jump Queue)
             with get_db() as conn:
                 if bulk_ctrl == 'paused':
                     # If paused, only fetch non-bulk (relay)
-                    rows = conn.execute("SELECT * FROM queue WHERE status='pending' AND source != 'bulk' LIMIT 50").fetchall()
+                    rows = conn.execute("SELECT * FROM queue WHERE status='pending' AND source != 'bulk' ORDER BY id ASC LIMIT 50").fetchall()
                 elif blocked_nodes:
                     # Fetch: (All Non-Bulk) OR (Bulk for Non-Blocked Nodes)
                     placeholders = ','.join(['?'] * len(blocked_nodes))
-                    query = f"SELECT * FROM queue WHERE status='pending' AND (source != 'bulk' OR assigned_node NOT IN ({placeholders})) LIMIT 50"
+                    query = f"SELECT * FROM queue WHERE status='pending' AND (source != 'bulk' OR assigned_node NOT IN ({placeholders})) ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 50"
                     rows = conn.execute(query, tuple(blocked_nodes)).fetchall()
                 else:
-                    # Fetch everything
-                    rows = conn.execute("SELECT * FROM queue WHERE status='pending' LIMIT 50").fetchall()
+                    # Fetch everything, but prioritize relay
+                    rows = conn.execute("SELECT * FROM queue WHERE status='pending' ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 50").fetchall()
 
             if not rows:
                 time.sleep(1)
@@ -561,7 +544,7 @@ def select_weighted_node(nodes, global_limit):
     except:
         return random.choice(nodes)
 
-def select_node_for_recipient(pool, recipient, global_limit):
+def select_node_for_recipient(pool, recipient, global_limit, source='relay'):
     # pool is list of node dicts
     if not pool: return None
     try:
@@ -573,6 +556,10 @@ def select_node_for_recipient(pool, recipient, global_limit):
     wildcard_nodes = []
     
     for node in pool:
+        # Filter by source capability
+        if source == 'bulk' and not node.get('allow_bulk', True):
+            continue
+
         rules = node.get('routing_rules', '')
         if not rules or not rules.strip():
             wildcard_nodes.append(node)
@@ -584,7 +571,12 @@ def select_node_for_recipient(pool, recipient, global_limit):
     
     # Priority: Specific > Wildcard > All (Fallback)
     candidates = specific_nodes if specific_nodes else wildcard_nodes
-    if not candidates: candidates = pool
+    
+    # If no candidates found (e.g. all nodes are bulk-disabled but source is bulk), 
+    # we might return None or fallback to pool (but respecting allow_bulk).
+    # Let's filter the original pool by allow_bulk just in case.
+    if not candidates:
+        candidates = [n for n in pool if (source != 'bulk' or n.get('allow_bulk', True))]
     
     return select_weighted_node(candidates, global_limit)
 
@@ -802,8 +794,8 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool):
                 msg['Date'] = formatdate(localtime=True)
                 msg['Message-ID'] = make_msgid()
 
-                node = select_node_for_recipient(pool, rcpt, limit_cfg)
-                node_name = node.get('name', 'Unknown')
+                node = select_node_for_recipient(pool, rcpt, limit_cfg, source='bulk')
+                node_name = node.get('name', 'Unknown') if node else 'No_Node_Available'
                 
                 tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk', tracking_id))
                 count += 1
@@ -963,8 +955,27 @@ def api_queue_rebalance():
                     rcpt = rcpts[0] if rcpts else ''
                 except: rcpt = ''
                 
-                node = select_node_for_recipient(pool, rcpt, limit_cfg)
-                updates.append((node['name'], r['id']))
+                # Determine source from queue row if possible, but here we assume 'bulk' if rebalancing bulk queue?
+                # Actually rebalance is generic. We should check the source column.
+                # But we didn't select source in step 1. Let's fix step 1.
+                pass 
+
+            # 1. Get all pending IDs and recipients to re-route correctly
+            cursor = conn.execute("SELECT id, rcpt_tos, source FROM queue WHERE status='pending'")
+            rows = cursor.fetchall()
+            if not rows: return jsonify({"count": 0})
+            
+            # 2. Prepare updates
+            updates = []
+            for r in rows:
+                try:
+                    rcpts = json.loads(r['rcpt_tos'])
+                    rcpt = rcpts[0] if rcpts else ''
+                except: rcpt = ''
+                
+                node = select_node_for_recipient(pool, rcpt, limit_cfg, source=r['source'])
+                if node:
+                    updates.append((node['name'], r['id']))
             
             # 3. Execute batch update
             conn.executemany("UPDATE queue SET assigned_node=? WHERE id=?", updates)
@@ -1045,37 +1056,67 @@ EOF
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <style>
-        :root { --sidebar-width: 240px; --primary-color: #4361ee; --bg-color: #f8f9fa; }
-        body { background-color: var(--bg-color); font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; overflow-x: hidden; }
+        :root { --sidebar-width: 240px; --primary-color: #4361ee; }
+        
+        [data-bs-theme="light"] {
+            --bg-color: #f8f9fa;
+            --sidebar-bg: #ffffff;
+            --sidebar-border: #eeeeee;
+            --card-bg: #ffffff;
+            --hover-bg: #f8f9fa;
+            --active-bg: #eef2ff;
+            --text-main: #212529;
+            --text-muted: #6c757d;
+        }
+        
+        [data-bs-theme="dark"] {
+            --bg-color: #0d1117;
+            --sidebar-bg: #161b22;
+            --sidebar-border: #30363d;
+            --card-bg: #212529;
+            --hover-bg: #2c3036;
+            --active-bg: #1f2937;
+            --text-main: #e6edf3;
+            --text-muted: #8b949e;
+        }
+
+        body { background-color: var(--bg-color); color: var(--text-main); font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; overflow-x: hidden; }
         
         /* Sidebar */
-        .sidebar { width: var(--sidebar-width); height: 100vh; position: fixed; left: 0; top: 0; background: #fff; border-right: 1px solid #eee; z-index: 1000; display: flex; flex-direction: column; }
-        .sidebar-header { padding: 1.5rem; display: flex; align-items: center; gap: 0.75rem; border-bottom: 1px solid #f0f0f0; }
+        .sidebar { width: var(--sidebar-width); height: 100vh; position: fixed; left: 0; top: 0; background: var(--sidebar-bg); border-right: 1px solid var(--sidebar-border); z-index: 1000; display: flex; flex-direction: column; }
+        .sidebar-header { padding: 1.5rem; display: flex; align-items: center; gap: 0.75rem; border-bottom: 1px solid var(--sidebar-border); }
         .logo-icon { width: 32px; height: 32px; background: var(--primary-color); color: #fff; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 1.2rem; }
         .nav-menu { padding: 1.5rem 1rem; flex: 1; }
-        .nav-item { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1rem; color: #666; text-decoration: none; border-radius: 8px; margin-bottom: 0.5rem; transition: all 0.2s; cursor: pointer; }
-        .nav-item:hover { background: #f8f9fa; color: var(--primary-color); }
-        .nav-item.active { background: #eef2ff; color: var(--primary-color); font-weight: 600; }
+        .nav-item { display: flex; align-items: center; gap: 0.75rem; padding: 0.75rem 1rem; color: var(--text-muted); text-decoration: none; border-radius: 8px; margin-bottom: 0.5rem; transition: all 0.2s; cursor: pointer; }
+        .nav-item:hover { background: var(--hover-bg); color: var(--primary-color); }
+        .nav-item.active { background: var(--active-bg); color: var(--primary-color); font-weight: 600; }
         .nav-item i { font-size: 1.2rem; }
         
         /* Main Content */
         .main-content { margin-left: var(--sidebar-width); padding: 2rem; min-height: 100vh; }
         
         /* Cards */
-        .card { border: none; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.03); background: #fff; transition: transform 0.2s; }
+        .card { border: none; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.03); background: var(--card-bg); transition: transform 0.2s; }
         .stat-card:hover { transform: translateY(-2px); }
-        .card-header { background: transparent; border-bottom: 1px solid #f0f0f0; padding: 1.25rem; font-weight: 600; }
+        .card-header { background: transparent; border-bottom: 1px solid var(--sidebar-border); padding: 1.25rem; font-weight: 600; }
         
         /* Status Colors */
         .text-pending { color: #f59e0b; } .bg-pending-subtle { background: #fffbeb; }
         .text-processing { color: #3b82f6; } .bg-processing-subtle { background: #eff6ff; }
         .text-sent { color: #10b981; } .bg-sent-subtle { background: #ecfdf5; }
         .text-failed { color: #ef4444; } .bg-failed-subtle { background: #fef2f2; }
+
+        [data-bs-theme="dark"] .bg-pending-subtle { background: #451a03; }
+        [data-bs-theme="dark"] .bg-processing-subtle { background: #172554; }
+        [data-bs-theme="dark"] .bg-sent-subtle { background: #064e3b; }
+        [data-bs-theme="dark"] .bg-failed-subtle { background: #450a0a; }
         
         /* Utils */
         .btn-primary { background: var(--primary-color); border-color: var(--primary-color); }
-        .table-custom th { font-weight: 600; color: #666; background: #f8f9fa; border-bottom: 2px solid #eee; }
-        .table-custom td { vertical-align: middle; }
+        .table-custom th { font-weight: 600; color: var(--text-muted); background: var(--hover-bg); border-bottom: 2px solid var(--sidebar-border); }
+        .table-custom td { vertical-align: middle; color: var(--text-main); }
+        
+        .sidebar-header .text-dark { color: var(--text-main) !important; }
         
         @media (max-width: 768px) {
             .sidebar { transform: translateX(-100%); transition: transform 0.3s; }
@@ -1117,6 +1158,11 @@ EOF
                 </div>
             </div>
             <div class="p-3 border-top">
+                <div class="btn-group w-100 mb-2" role="group">
+                    <button type="button" class="btn btn-sm" :class="theme=='light'?'btn-primary':'btn-outline-secondary'" @click="setTheme('light')"><i class="bi bi-sun-fill"></i></button>
+                    <button type="button" class="btn btn-sm" :class="theme=='auto'?'btn-primary':'btn-outline-secondary'" @click="setTheme('auto')"><i class="bi bi-circle-half"></i></button>
+                    <button type="button" class="btn btn-sm" :class="theme=='dark'?'btn-primary':'btn-outline-secondary'" @click="setTheme('dark')"><i class="bi bi-moon-stars-fill"></i></button>
+                </div>
                 <button class="btn btn-light w-100 text-start mb-2" @click="showPwd = !showPwd">
                     <i class="bi bi-key me-2"></i> 修改密码
                 </button>
@@ -1480,6 +1526,13 @@ EOF
                                                 <input v-model.number="n.max_interval" type="number" class="form-control" placeholder="Default">
                                             </div>
                                             <div class="col-12">
+                                                <div class="form-check form-switch my-2">
+                                                    <input class="form-check-input" type="checkbox" v-model="n.allow_bulk" :id="'allowBulk'+i">
+                                                    <label class="form-check-label" :for="'allowBulk'+i">允许用于群发任务 (Allow Bulk)</label>
+                                                </div>
+                                                <div class="form-text mb-2" v-if="n.allow_bulk===false">⚠️ 此节点仅处理中转邮件 (Relay)，不会分配群发任务。</div>
+                                            </div>
+                                            <div class="col-12">
                                                 <label class="small text-muted">分流规则 (点击选择)</label>
                                                 <div class="d-flex flex-wrap gap-2 mb-2">
                                                     <button class="btn btn-sm" :class="(!n.routing_rules)?'btn-primary':'btn-outline-secondary'" @click="n.routing_rules=''">通用 (其他)</button>
@@ -1519,7 +1572,8 @@ EOF
                     sending: false,
                     contactCount: 0,
                     bulkStatus: 'running',
-                    rebalancing: false
+                    rebalancing: false,
+                    theme: 'auto'
                 }
             },
             computed: {
@@ -1564,10 +1618,17 @@ EOF
             mounted() {
                 if(!this.config.limit_config) this.config.limit_config = { max_per_hour: 0, min_interval: 1, max_interval: 5 };
                 if(!this.config.log_config) this.config.log_config = { max_mb: 50, backups: 3, retention_days: 7 };
-                this.config.downstream_pool.forEach(n => { if(n.enabled === undefined) n.enabled = true; });
+                this.config.downstream_pool.forEach(n => { 
+                    if(n.enabled === undefined) n.enabled = true; 
+                    if(n.allow_bulk === undefined) n.allow_bulk = true;
+                });
                 
                 // Auto-load draft
                 this.loadDraft();
+                
+                // Load theme
+                const savedTheme = localStorage.getItem('theme') || 'auto';
+                this.setTheme(savedTheme);
 
                 this.fetchQueue();
                 this.fetchContactCount();
@@ -1584,6 +1645,20 @@ EOF
                 }
             },
             methods: {
+                setTheme(t) {
+                    this.theme = t;
+                    localStorage.setItem('theme', t);
+                    const html = document.documentElement;
+                    if (t === 'auto') {
+                        if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
+                            html.setAttribute('data-bs-theme', 'dark');
+                        } else {
+                            html.setAttribute('data-bs-theme', 'light');
+                        }
+                    } else {
+                        html.setAttribute('data-bs-theme', t);
+                    }
+                },
                 async loadDraft() {
                     try {
                         const res = await fetch('/api/draft');
@@ -1756,7 +1831,7 @@ EOF
                     n.routing_rules = rules.join(',');
                 },
                 addNode() { 
-                    this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true, routing_rules: '' }); 
+                    this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true, allow_bulk: true, routing_rules: '' }); 
                 },
                 delNode(i) { if(confirm('删除此节点?')) this.config.downstream_pool.splice(i, 1); },
                 async save() {
