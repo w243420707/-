@@ -1164,38 +1164,6 @@ EOF
                 <div class="row g-4">
                     <div class="col-md-6">
                         <div class="card h-100">
-                            <div class="card-header">发送策略 (Rate Limiting)</div>
-                            <div class="card-body">
-                                <div class="mb-3">
-                                    <label class="form-label">每小时最大发送量</label>
-                                    <div class="input-group">
-                                        <input type="number" v-model.number="config.limit_config.max_per_hour" class="form-control">
-                                        <span class="input-group-text">封</span>
-                                    </div>
-                                    <div class="form-text">设为 0 则不限制</div>
-                                </div>
-                                <div class="row g-3">
-                                    <div class="col-6">
-                                        <label class="form-label">最小间隔</label>
-                                        <div class="input-group">
-                                            <input type="number" v-model.number="config.limit_config.min_interval" class="form-control">
-                                            <span class="input-group-text">秒</span>
-                                        </div>
-                                    </div>
-                                    <div class="col-6">
-                                        <label class="form-label">最大间隔</label>
-                                        <div class="input-group">
-                                            <input type="number" v-model.number="config.limit_config.max_interval" class="form-control">
-                                            <span class="input-group-text">秒</span>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="col-md-6">
-                        <div class="card h-100">
                             <div class="card-header">数据与日志 (Storage)</div>
                             <div class="card-body">
                                 <div class="mb-3">
