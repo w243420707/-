@@ -505,6 +505,12 @@ def api_queue_stats():
             total['opened'] = opened
         except: total['opened'] = 0
 
+        # Speed stats (Sent in last hour)
+        try:
+            speed = conn.execute("SELECT COUNT(*) FROM queue WHERE status='sent' AND updated_at > datetime('now', '-1 hour')").fetchone()[0]
+            total['speed_ph'] = speed
+        except: total['speed_ph'] = 0
+
         # Node stats
         rows = conn.execute("SELECT assigned_node, status, COUNT(*) as c FROM queue GROUP BY assigned_node, status").fetchall()
         nodes = {}
@@ -1046,7 +1052,10 @@ EOF
                                 </div>
                                 <div>
                                     <h6 class="fw-bold mb-0">群发任务 [[ statusText ]]</h6>
-                                    <div class="small text-muted">进度: [[ progressPercent ]]% ([[ qStats.total.sent || 0 ]] / [[ totalMails ]])</div>
+                                    <div class="small text-muted">
+                                        进度: [[ progressPercent ]]% ([[ qStats.total.sent || 0 ]] / [[ totalMails ]])
+                                        <span class="ms-2 badge bg-light text-dark border">[[ qStats.total.speed_ph || 0 ]] 封/小时</span>
+                                    </div>
                                 </div>
                             </div>
                             <div class="btn-group">
