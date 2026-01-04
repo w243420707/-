@@ -51,7 +51,7 @@ install_smtp() {
     "server_config": { "host": "0.0.0.0", "port": 587, "username": "myapp", "password": "123" },
     "web_config": { "admin_password": "admin", "public_domain": "" },
     "telegram_config": { "bot_token": "", "admin_id": "" },
-    "log_config": { "max_mb": 50, "backups": 3 },
+    "log_config": { "max_mb": 50, "backups": 3, "retention_days": 7 },
     "limit_config": { "max_per_hour": 0, "min_interval": 1, "max_interval": 5 },
     "bulk_control": { "status": "running" },
     "downstream_pool": []
@@ -125,6 +125,14 @@ def init_db():
                 conn.execute("ALTER TABLE queue ADD COLUMN open_count INTEGER DEFAULT 0")
         except Exception as e:
             print(f"DB Init Warning: {e}")
+
+        # Optimization: Indexes & WAL
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON queue (status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_node_status ON queue (assigned_node, status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON queue (created_at)")
+        except: pass
 
         conn.execute('''CREATE TABLE IF NOT EXISTS contacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -227,123 +235,161 @@ class RelayHandler:
 
 # --- Queue Worker (Consumer) ---
 def worker_thread():
-    logger.info("👷 Queue Worker Started")
+    logger.info("👷 Queue Worker Started (Smart Rate Limiting)")
+    
+    # Runtime state tracking
+    node_next_send_time = {}  # { 'node_name': timestamp }
+    node_hourly_counts = {}   # { 'node_name': { 'hour': 10, 'count': 50 } }
+    last_cleanup_time = 0
+
     while True:
         try:
             cfg = load_config()
             
-            # Rate Limiting & Manual Control (Bulk Only)
-            limit_cfg = cfg.get('limit_config', {})
-            bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
-            max_ph = int(limit_cfg.get('max_per_hour', 0))
-            
-            # Pause if manually paused OR rate limited
-            bulk_paused = (bulk_ctrl == 'paused')
-            
-            if not bulk_paused and max_ph > 0:
-                with get_db() as conn:
-                    try:
-                        cnt = conn.execute("SELECT COUNT(*) FROM queue WHERE status='sent' AND source='bulk' AND updated_at > datetime('now', '-1 hour')").fetchone()[0]
-                        if cnt >= max_ph:
-                            bulk_paused = True
-                    except: pass
+            # --- Auto Cleanup (Once per hour) ---
+            if time.time() - last_cleanup_time > 3600:
+                try:
+                    days = int(cfg.get('log_config', {}).get('retention_days', 7))
+                    if days > 0:
+                        with get_db() as conn:
+                            conn.execute(f"DELETE FROM queue WHERE status IN ('sent', 'failed') AND updated_at < datetime('now', '-{days} days')")
+                        logger.info(f"🧹 Auto-cleaned records older than {days} days")
+                except Exception as e:
+                    logger.error(f"Cleanup failed: {e}")
+                last_cleanup_time = time.time()
 
-            pool = {n['name']: n for n in cfg.get('downstream_pool', [])}
+            pool_cfg = {n['name']: n for n in cfg.get('downstream_pool', [])}
             
+            # Global Bulk Control
+            bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
+            
+            now = time.time()
+            
+            # 1. Identify nodes that are currently cooling down (for BULK only)
+            # If a node is cooling, we should NOT fetch BULK tasks for it, 
+            # but we MUST fetch RELAY tasks for it.
+            blocked_nodes = []
+            for name, next_time in node_next_send_time.items():
+                if now < next_time:
+                    blocked_nodes.append(name)
+            
+            # 2. Fetch pending items with smart filtering
             with get_db() as conn:
-                # Fetch pending items
-                if bulk_paused:
-                    try:
-                        # Only fetch relay mails, skip bulk
-                        cursor = conn.execute("SELECT * FROM queue WHERE status='pending' AND source!='bulk' LIMIT 5")
-                    except:
-                        # Fallback if source column missing (shouldn't happen)
-                        cursor = conn.execute("SELECT * FROM queue WHERE status='pending' LIMIT 5")
+                if bulk_ctrl == 'paused':
+                    # If paused, only fetch non-bulk (relay)
+                    rows = conn.execute("SELECT * FROM queue WHERE status='pending' AND source != 'bulk' LIMIT 50").fetchall()
+                elif blocked_nodes:
+                    # Fetch: (All Non-Bulk) OR (Bulk for Non-Blocked Nodes)
+                    placeholders = ','.join(['?'] * len(blocked_nodes))
+                    query = f"SELECT * FROM queue WHERE status='pending' AND (source != 'bulk' OR assigned_node NOT IN ({placeholders})) LIMIT 50"
+                    rows = conn.execute(query, tuple(blocked_nodes)).fetchall()
                 else:
-                    cursor = conn.execute("SELECT * FROM queue WHERE status='pending' LIMIT 5")
-                rows = cursor.fetchall()
-            
+                    # Fetch everything
+                    rows = conn.execute("SELECT * FROM queue WHERE status='pending' LIMIT 50").fetchall()
+
             if not rows:
-                time.sleep(2)
+                time.sleep(1)
                 continue
-                
+
+            did_work = False
+
             for row in rows:
                 row_id = row['id']
                 node_name = row['assigned_node']
+                source = row['source']
+                is_bulk = (source == 'bulk')
                 
-                # Mark as processing
+                node = pool_cfg.get(node_name)
+                
+                # Skip if node removed
+                if not node:
+                    with get_db() as conn:
+                        conn.execute("UPDATE queue SET status='failed', last_error='Node removed' WHERE id=?", (row_id,))
+                    continue
+
+                # --- Rate Limiting Checks (BULK ONLY) ---
+                if is_bulk:
+                    # A. Interval Check
+                    if now < node_next_send_time.get(node_name, 0):
+                        continue # Should be filtered by SQL, but double check
+
+                    # B. Hourly Limit Check
+                    max_ph = int(node.get('max_per_hour', 0))
+                    if max_ph > 0:
+                        current_hour = datetime.now().hour
+                        # Reset/Init counter
+                        if node_name not in node_hourly_counts or node_hourly_counts[node_name]['hour'] != current_hour:
+                            with get_db() as conn:
+                                cnt = conn.execute(
+                                    "SELECT COUNT(*) FROM queue WHERE assigned_node=? AND status='sent' AND updated_at > datetime('now', '-1 hour')", 
+                                    (node_name,)
+                                ).fetchone()[0]
+                            node_hourly_counts[node_name] = {'hour': current_hour, 'count': cnt}
+                        
+                        if node_hourly_counts[node_name]['count'] >= max_ph:
+                            # Limit reached, block this node for a while (e.g. 1 min)
+                            node_next_send_time[node_name] = now + 60 
+                            continue
+
+                # --- Processing ---
+                did_work = True
+                
+                # Mark processing
                 with get_db() as conn:
                     conn.execute("UPDATE queue SET status='processing', updated_at=CURRENT_TIMESTAMP WHERE id=?", (row_id,))
-                
-                node = pool.get(node_name)
-
-                # Re-route if disabled
-                if node and not node.get('enabled', True):
-                    active_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
-                    if active_nodes:
-                        new_node = random.choice(active_nodes)
-                        logger.info(f"🔄 Re-routing ID:{row_id} from disabled '{node_name}' to '{new_node['name']}'")
-                        node = new_node
-                        node_name = node['name']
-                        with get_db() as conn:
-                            conn.execute("UPDATE queue SET assigned_node=? WHERE id=?", (node_name, row_id))
-                    else:
-                        with get_db() as conn:
-                            conn.execute("UPDATE queue SET status='pending' WHERE id=?", (row_id,))
-                        time.sleep(1)
-                        continue
 
                 error_msg = ""
                 success = False
                 
-                if not node:
-                    error_msg = f"Node '{node_name}' removed from config"
-                else:
-                    try:
-                        sender = node.get('sender_email') or row['mail_from'] or node.get('username')
-                        rcpt_tos = json.loads(row['rcpt_tos'])
-                        msg_content = row['content']
+                try:
+                    sender = node.get('sender_email') or row['mail_from'] or node.get('username')
+                    rcpt_tos = json.loads(row['rcpt_tos'])
+                    msg_content = row['content']
 
-                        # 强制修改邮件头 From
-                        if node.get('sender_email'):
-                            try:
-                                msg = message_from_bytes(msg_content)
-                                if 'From' in msg: del msg['From']
-                                msg['From'] = node['sender_email']
-                                msg_content = msg.as_bytes()
-                            except Exception as parse_err:
-                                logger.warning(f"Header rewrite failed: {parse_err}")
+                    # Header rewrite
+                    if node.get('sender_email'):
+                        try:
+                            msg = message_from_bytes(msg_content)
+                            if 'From' in msg: del msg['From']
+                            msg['From'] = node['sender_email']
+                            msg_content = msg.as_bytes()
+                        except: pass
 
-                        with smtplib.SMTP(node['host'], int(node['port']), timeout=20) as s:
-                            if node.get('encryption') in ['tls', 'ssl']: s.starttls()
-                            if node.get('username') and node.get('password'): s.login(node['username'], node['password'])
-                            s.sendmail(sender, rcpt_tos, msg_content)
-                        
-                        success = True
-                        logger.info(f"✅ Sent ID:{row_id} via {node_name}")
-                    except Exception as e:
-                        error_msg = str(e)
-                        logger.error(f"⚠️ Failed ID:{row_id} via {node_name}: {e}")
-                
-                # Update final status
+                    with smtplib.SMTP(node['host'], int(node['port']), timeout=20) as s:
+                        if node.get('encryption') in ['tls', 'ssl']: s.starttls()
+                        if node.get('username') and node.get('password'): s.login(node['username'], node['password'])
+                        s.sendmail(sender, rcpt_tos, msg_content)
+                    
+                    success = True
+                    logger.info(f"✅ Sent ID:{row_id} via {node_name} (Source: {source})")
+                    
+                    # Update hourly count (All traffic counts towards limit)
+                    if node_name in node_hourly_counts:
+                        node_hourly_counts[node_name]['count'] += 1
+
+                except Exception as e:
+                    error_msg = str(e)
+                    logger.error(f"⚠️ Failed ID:{row_id} via {node_name}: {e}")
+
+                # Update DB
                 with get_db() as conn:
                     if success:
                         conn.execute("UPDATE queue SET status='sent', updated_at=CURRENT_TIMESTAMP WHERE id=?", (row_id,))
                     else:
                         conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (error_msg, row_id))
-                        send_telegram(f"❌ Mail ID:{row_id} Failed permanently via {node_name}\nErr: {error_msg}")
+
+                # --- Set Next Available Time ---
+                # We update the cooling timer for ALL successful sends to pace the connection,
+                # BUT only Bulk items will respect it in the next loop.
+                global_limit = cfg.get('limit_config', {})
+                min_int = int(node.get('min_interval') or global_limit.get('min_interval', 1))
+                max_int = int(node.get('max_interval') or global_limit.get('max_interval', 5))
                 
-                # Random Interval (Bulk Only)
-                is_bulk = False
-                try:
-                    if row['source'] == 'bulk': is_bulk = True
-                except: pass
-                
-                if is_bulk:
-                    min_int = int(limit_cfg.get('min_interval', 1))
-                    max_int = int(limit_cfg.get('max_interval', 5))
-                    if max_int > 0:
-                        time.sleep(random.uniform(min_int, max_int))
+                delay = random.uniform(min_int, max_int)
+                node_next_send_time[node_name] = time.time() + delay
+
+            if not did_work:
+                time.sleep(0.5)
 
         except Exception as e:
             logger.error(f"Worker Error: {e}")
@@ -456,9 +502,11 @@ def api_queue_stats():
 @app.route('/api/queue/list')
 @login_required
 def api_queue_list():
-    limit = request.args.get('limit', 50)
+    try:
+        limit = int(request.args.get('limit', 50))
+    except: limit = 50
     with get_db() as conn:
-        rows = conn.execute(f"SELECT id, mail_from, rcpt_tos, assigned_node, status, retry_count, last_error, created_at FROM queue ORDER BY id DESC LIMIT {limit}").fetchall()
+        rows = conn.execute("SELECT id, mail_from, rcpt_tos, assigned_node, status, retry_count, last_error, created_at FROM queue ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return jsonify([dict(r) for r in rows])
 
 def bulk_import_task(raw_recipients, subject, body, pool):
@@ -1033,7 +1081,7 @@ EOF
                 <!-- Recent Logs -->
                 <div class="card">
                     <div class="card-header d-flex justify-content-between align-items-center">
-                        <span>最近投递记录</span>
+                        <span>最近投递记录 <span class="text-muted small fw-normal ms-2" v-if="totalMails > 100">(仅显示最新 100 条 / 共 [[ totalMails ]] 条)</span></span>
                         <button class="btn btn-sm btn-outline-danger" @click="clearQueue">清理历史</button>
                     </div>
                     <div class="table-responsive">
@@ -1148,6 +1196,35 @@ EOF
 
                     <div class="col-md-6">
                         <div class="card h-100">
+                            <div class="card-header">数据与日志 (Storage)</div>
+                            <div class="card-body">
+                                <div class="mb-3">
+                                    <label class="form-label">历史记录保留天数</label>
+                                    <div class="input-group">
+                                        <input type="number" v-model.number="config.log_config.retention_days" class="form-control" placeholder="7">
+                                        <span class="input-group-text">天</span>
+                                    </div>
+                                    <div class="form-text">超过此时间的成功/失败记录将被自动删除 (0=不删除)</div>
+                                </div>
+                                <div class="row g-3">
+                                    <div class="col-6">
+                                        <label class="form-label">日志文件大小</label>
+                                        <div class="input-group">
+                                            <input type="number" v-model.number="config.log_config.max_mb" class="form-control" placeholder="50">
+                                            <span class="input-group-text">MB</span>
+                                        </div>
+                                    </div>
+                                    <div class="col-6">
+                                        <label class="form-label">日志备份数</label>
+                                        <input type="number" v-model.number="config.log_config.backups" class="form-control" placeholder="3">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="col-md-6">
+                        <div class="card h-100">
                             <div class="card-header">基础配置</div>
                             <div class="card-body">
                                 <div class="mb-3">
@@ -1228,6 +1305,19 @@ EOF
                                                 <label class="small text-muted">Password</label>
                                                 <input v-model="n.password" type="password" class="form-control">
                                             </div>
+                                            <div class="col-12"><hr class="my-2"></div>
+                                            <div class="col-md-4">
+                                                <label class="small text-muted">Max/Hour (0=No Limit)</label>
+                                                <input v-model.number="n.max_per_hour" type="number" class="form-control" placeholder="Default">
+                                            </div>
+                                            <div class="col-md-4">
+                                                <label class="small text-muted">Min Interval (s)</label>
+                                                <input v-model.number="n.min_interval" type="number" class="form-control" placeholder="Default">
+                                            </div>
+                                            <div class="col-md-4">
+                                                <label class="small text-muted">Max Interval (s)</label>
+                                                <input v-model.number="n.max_interval" type="number" class="form-control" placeholder="Default">
+                                            </div>
                                         </div>
                                     </div>
                                 </div>
@@ -1299,6 +1389,7 @@ EOF
             },
             mounted() {
                 if(!this.config.limit_config) this.config.limit_config = { max_per_hour: 0, min_interval: 1, max_interval: 5 };
+                if(!this.config.log_config) this.config.log_config = { max_mb: 50, backups: 3, retention_days: 7 };
                 this.config.downstream_pool.forEach(n => { if(n.enabled === undefined) n.enabled = true; });
                 
                 // Auto-load draft
@@ -1417,7 +1508,8 @@ EOF
                         const res1 = await fetch('/api/queue/stats');
                         this.qStats = await res1.json();
                         if(this.tab === 'queue') {
-                            const res2 = await fetch('/api/queue/list?limit=50');
+                            // User requested limit 100 to prevent freezing
+                            const res2 = await fetch('/api/queue/list?limit=100');
                             this.qList = await res2.json();
                         }
                     } catch(e) { console.error(e); }
@@ -1464,6 +1556,10 @@ autostart=true
 autorestart=true
 stderr_logfile=$LOG_DIR/err.log
 stdout_logfile=$LOG_DIR/out.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=3
+stderr_logfile_maxbytes=10MB
+stderr_logfile_backups=3
 user=root
 EOF
 
