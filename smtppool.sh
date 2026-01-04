@@ -140,6 +140,12 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )''')
 
+        conn.execute('''CREATE TABLE IF NOT EXISTS drafts (
+            id INTEGER PRIMARY KEY,
+            content TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )''')
+
 # --- Config & Logging ---
 def load_config():
     if not os.path.exists(CONFIG_FILE): return {}
@@ -582,7 +588,7 @@ def select_node_for_recipient(pool, recipient, global_limit):
     
     return select_weighted_node(candidates, global_limit)
 
-def bulk_import_task(raw_recipients, subject, body, pool):
+def bulk_import_task(raw_recipients, subjects, bodies, pool):
     try:
         # Process recipients in background to avoid blocking
         recipients = [r.strip() for r in raw_recipients.split('\n') if r.strip()]
@@ -774,6 +780,10 @@ def bulk_import_task(raw_recipients, subject, body, pool):
                 # Select 5-10 random sentences to simulate normal chat
                 rand_chat = ' '.join(random.choices(chat_corpus, k=random.randint(5, 10)))
                 
+                # Randomly select subject and body
+                current_subject = random.choice(subjects) if subjects else "(No Subject)"
+                current_body = random.choice(bodies) if bodies else ""
+
                 tracking_id = str(uuid.uuid4())
                 tracking_html = ""
                 if tracking_base:
@@ -781,9 +791,9 @@ def bulk_import_task(raw_recipients, subject, body, pool):
                     tracking_html = f"<img src='{tracking_url}' width='1' height='1' style='display:none;'>"
 
                 # footer removed
-                final_subject = f"{subject} {rand_sub}"
+                final_subject = f"{current_subject} {rand_sub}"
                 # Insert hidden chat content
-                final_body = f"{body}<div style='display:none;opacity:0;font-size:0;line-height:0;max-height:0;overflow:hidden;'>{rand_chat}</div>{tracking_html}"
+                final_body = f"{current_body}<div style='display:none;opacity:0;font-size:0;line-height:0;max-height:0;overflow:hidden;'>{rand_chat}</div>{tracking_html}"
 
                 msg = MIMEText(final_body, 'html', 'utf-8')
                 msg['Subject'] = final_subject
@@ -824,18 +834,35 @@ def bulk_import_task(raw_recipients, subject, body, pool):
 def api_send_bulk():
     try:
         data = request.json
-        subject = data.get('subject', '(No Subject)')
-        body = data.get('body', '')
+        raw_subject = data.get('subject', '(No Subject)')
         raw_recipients = data.get('recipients', '')
         
         if not raw_recipients.strip(): return jsonify({"error": "No recipients"}), 400
         
+        # Parse multiple subjects (one per line)
+        subjects = [s.strip() for s in raw_subject.split('\n') if s.strip()]
+        if not subjects: subjects = ['(No Subject)']
+
+        # Parse multiple bodies
+        # 1. Try 'bodies' list (new format)
+        bodies = data.get('bodies', [])
+        # 2. Fallback to 'body' string (old format, separated by |||)
+        if not bodies and 'body' in data:
+             raw_body = data.get('body', '')
+             bodies = [b.strip() for b in raw_body.split('|||') if b.strip()]
+        
+        # Ensure bodies is a list of strings
+        if isinstance(bodies, str): bodies = [bodies]
+        bodies = [str(b).strip() for b in bodies if str(b).strip()]
+        
+        if not bodies: bodies = ['']
+
         cfg = load_config()
         pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
         if not pool: return jsonify({"error": "No enabled nodes available"}), 500
 
         # Start background task with raw string
-        threading.Thread(target=bulk_import_task, args=(raw_recipients, subject, body, pool)).start()
+        threading.Thread(target=bulk_import_task, args=(raw_recipients, subjects, bodies, pool)).start()
                 
         return jsonify({"status": "ok", "count": "Processing in background"})
     except Exception as e:
@@ -884,6 +911,24 @@ def api_contacts_clear():
     with get_db() as conn:
         conn.execute("DELETE FROM contacts")
     return jsonify({"status": "ok"})
+
+@app.route('/api/draft', methods=['GET', 'POST'])
+@login_required
+def api_draft():
+    if request.method == 'POST':
+        try:
+            content = json.dumps(request.json)
+            with get_db() as conn:
+                conn.execute("INSERT OR REPLACE INTO drafts (id, content, updated_at) VALUES (1, ?, CURRENT_TIMESTAMP)", (content,))
+            return jsonify({"status": "ok"})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    else:
+        with get_db() as conn:
+            row = conn.execute("SELECT content FROM drafts WHERE id=1").fetchone()
+        if row:
+            return jsonify(json.loads(row['content']))
+        return jsonify({})
 
 @app.route('/api/queue/clear', methods=['POST'])
 @login_required
@@ -1248,12 +1293,16 @@ EOF
                             <div class="card-body">
                                 <div class="mb-3">
                                     <label class="form-label fw-bold">邮件主题</label>
-                                    <input v-model="bulk.subject" class="form-control form-control-lg" placeholder="输入主题 (系统会自动追加随机码)">
+                                    <textarea v-model="bulk.subject" class="form-control form-control-lg" rows="3" placeholder="输入主题 (每行一个，系统随机选择，并自动追加随机码)"></textarea>
                                 </div>
                                 <div class="mb-3">
                                     <label class="form-label fw-bold">邮件正文 (HTML)</label>
-                                    <textarea v-model="bulk.body" class="form-control font-monospace bg-light" rows="15" placeholder="<html>...</html>"></textarea>
-                                    <div class="form-text">系统会自动在末尾插入隐形随机码和退订链接。</div>
+                                    <div v-for="(item, index) in bulk.bodyList" :key="index" class="mb-2 position-relative">
+                                        <textarea v-model="bulk.bodyList[index]" class="form-control font-monospace bg-light" rows="8" :placeholder="'正文模板 ' + (index + 1)"></textarea>
+                                        <button v-if="bulk.bodyList.length > 1" @click="removeBody(index)" class="btn btn-sm btn-outline-danger position-absolute top-0 end-0 m-2" title="删除此模板"><i class="bi bi-trash"></i></button>
+                                    </div>
+                                    <button class="btn btn-sm btn-outline-primary" @click="addBody"><i class="bi bi-plus-lg"></i> 添加正文模板</button>
+                                    <div class="form-text mt-2">系统会从上述模板中随机选择一个发送。会自动在末尾插入隐形随机码和退订链接。</div>
                                 </div>
                             </div>
                         </div>
@@ -1466,7 +1515,7 @@ EOF
                     showPwd: false,
                     qStats: { total: {}, nodes: {} },
                     qList: [],
-                    bulk: { sender: '', subject: '', recipients: '', body: '' },
+                    bulk: { sender: '', subject: '', recipients: '', body: '', bodyList: [''] },
                     sending: false,
                     contactCount: 0,
                     bulkStatus: 'running',
@@ -1518,8 +1567,7 @@ EOF
                 this.config.downstream_pool.forEach(n => { if(n.enabled === undefined) n.enabled = true; });
                 
                 // Auto-load draft
-                const draft = localStorage.getItem('smtp_draft');
-                if(draft) { try { this.bulk = JSON.parse(draft); } catch(e){} }
+                this.loadDraft();
 
                 this.fetchQueue();
                 this.fetchContactCount();
@@ -1531,11 +1579,46 @@ EOF
             },
             watch: {
                 bulk: {
-                    handler(v) { localStorage.setItem('smtp_draft', JSON.stringify(v)); },
+                    handler(v) { this.debouncedSaveDraft(); },
                     deep: true
                 }
             },
             methods: {
+                async loadDraft() {
+                    try {
+                        const res = await fetch('/api/draft');
+                        const data = await res.json();
+                        if (data && Object.keys(data).length > 0) {
+                            this.bulk = data;
+                            // Migration check
+                            if (!this.bulk.bodyList || this.bulk.bodyList.length === 0) {
+                                if (this.bulk.body) {
+                                    this.bulk.bodyList = this.bulk.body.split('|||').map(x => x.trim()).filter(x => x);
+                                }
+                                if (!this.bulk.bodyList || this.bulk.bodyList.length === 0) {
+                                    this.bulk.bodyList = [''];
+                                }
+                            }
+                        }
+                    } catch(e) { console.error("Failed to load draft", e); }
+                },
+                debouncedSaveDraft: (() => {
+                    let timer;
+                    return function() {
+                        if(timer) clearTimeout(timer);
+                        timer = setTimeout(async () => {
+                            try {
+                                await fetch('/api/draft', {
+                                    method: 'POST',
+                                    headers: {'Content-Type': 'application/json'},
+                                    body: JSON.stringify(this.bulk)
+                                });
+                            } catch(e) { console.error("Failed to save draft", e); }
+                        }, 1000);
+                    }
+                })(),
+                addBody() { this.bulk.bodyList.push(''); },
+                removeBody(i) { if(this.bulk.bodyList.length > 1) this.bulk.bodyList.splice(i, 1); },
                 getEstDuration(name, pending) {
                     if (!pending || pending <= 0) return '-';
                     const speed = this.getNodeSpeed(name);
@@ -1707,14 +1790,21 @@ EOF
                     } catch(e) { console.error(e); }
                 },
                 async sendBulk() {
-                    if(!this.bulk.subject || !this.bulk.body) return alert('请填写完整信息');
+                    // Sync bodyList to body for compatibility or just use bodyList
+                    // We will send 'bodies' array
+                    const validBodies = this.bulk.bodyList.filter(b => b.trim());
+                    if(!this.bulk.subject || validBodies.length === 0) return alert('请填写完整信息 (至少一个正文)');
                     if(!confirm(`确认发送给 ${this.recipientCount} 人?`)) return;
                     this.sending = true;
                     try {
+                        const payload = {
+                            ...this.bulk,
+                            bodies: validBodies
+                        };
                         const res = await fetch('/api/send/bulk', {
                             method: 'POST',
                             headers: {'Content-Type': 'application/json'},
-                            body: JSON.stringify(this.bulk)
+                            body: JSON.stringify(payload)
                         });
                         const data = await res.json();
                         if(res.ok) {
