@@ -397,7 +397,16 @@ def worker_thread():
 
 # --- Web App ---
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+# Persistent Secret Key to prevent session logout on restart
+try:
+    _cfg = load_config()
+    if 'secret_key' not in _cfg.get('web_config', {}):
+        if 'web_config' not in _cfg: _cfg['web_config'] = {}
+        _cfg['web_config']['secret_key'] = os.urandom(24).hex()
+        save_config(_cfg)
+    app.secret_key = bytes.fromhex(_cfg['web_config']['secret_key'])
+except:
+    app.secret_key = os.urandom(24)
 
 def login_required(f):
     @wraps(f)
@@ -1427,6 +1436,15 @@ EOF
                             headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify({emails: emails})
                         });
+                        
+                        // Check for session expiry (HTML response instead of JSON)
+                        const ct = res.headers.get("content-type");
+                        if (ct && ct.indexOf("application/json") === -1) {
+                            alert('会话已过期，请刷新页面重新登录');
+                            window.location.reload();
+                            return;
+                        }
+
                         const data = await res.json();
                         alert(`成功新增 ${data.added} 个`);
                         this.fetchContactCount();
