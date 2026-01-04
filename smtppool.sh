@@ -1378,9 +1378,22 @@ EOF
                                 </div>
                                 <div class="mb-3">
                                     <label class="form-label fw-bold">邮件正文 (HTML)</label>
-                                    <div v-for="(item, index) in bulk.bodyList" :key="index" class="mb-2 position-relative">
-                                        <textarea v-model="bulk.bodyList[index]" class="form-control font-monospace bg-theme-light" rows="8" :placeholder="'正文模板 ' + (index + 1)"></textarea>
-                                        <button v-if="bulk.bodyList.length > 1" @click="removeBody(index)" class="btn btn-sm btn-outline-danger position-absolute top-0 end-0 m-2" title="删除此模板"><i class="bi bi-trash"></i></button>
+                                    <div v-for="(item, index) in bulk.bodyList" :key="index" class="mb-3 p-2 border rounded position-relative">
+                                        <div class="d-flex justify-content-between align-items-center mb-2">
+                                            <span class="badge bg-secondary">模板 [[ index + 1 ]]</span>
+                                            <button v-if="bulk.bodyList.length > 1" @click="removeBody(index)" class="btn btn-sm btn-outline-danger py-0 px-2" title="删除"><i class="bi bi-trash"></i></button>
+                                        </div>
+                                        <div class="row g-2">
+                                            <div class="col-md-6">
+                                                <textarea v-model="bulk.bodyList[index]" class="form-control font-monospace bg-theme-light" rows="10" placeholder="输入HTML内容..."></textarea>
+                                            </div>
+                                            <div class="col-md-6">
+                                                <div class="border rounded h-100 overflow-auto p-2" style="background-color: #fff; color: #000; min-height: 200px; max-height: 250px;">
+                                                    <div v-if="!bulk.bodyList[index]" class="text-muted text-center pt-5 small">实时预览区域</div>
+                                                    <div v-else v-html="bulk.bodyList[index]"></div>
+                                                </div>
+                                            </div>
+                                        </div>
                                     </div>
                                     <button class="btn btn-sm btn-outline-primary" @click="addBody"><i class="bi bi-plus-lg"></i> 添加正文模板</button>
                                     <div class="form-text mt-2">系统会从上述模板中随机选择一个发送。会自动在末尾插入隐形随机码和退订链接。</div>
