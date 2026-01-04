@@ -1153,15 +1153,17 @@ EOF
                     </div>
                     <div class="table-responsive">
                         <table class="table table-custom table-hover mb-0">
-                            <thead><tr><th>节点名称</th><th class="text-center">堆积</th><th class="text-center">成功</th><th class="text-center">失败</th></tr></thead>
+                            <thead><tr><th>节点名称</th><th class="text-center">堆积</th><th class="text-center">成功</th><th class="text-center">失败</th><th>预计时长</th><th>预计结束</th></tr></thead>
                             <tbody>
                                 <tr v-for="(s, name) in qStats.nodes" :key="name">
                                     <td class="fw-medium">[[ name ]]</td>
                                     <td class="text-center"><span class="badge bg-warning text-dark">[[ s.pending || 0 ]]</span></td>
                                     <td class="text-center text-success">[[ s.sent || 0 ]]</td>
                                     <td class="text-center text-danger">[[ s.failed || 0 ]]</td>
+                                    <td class="text-muted small">[[ getEstDuration(name, s.pending) ]]</td>
+                                    <td class="text-muted small">[[ getEstFinishTime(name, s.pending) ]]</td>
                                 </tr>
-                                <tr v-if="Object.keys(qStats.nodes).length === 0"><td colspan="4" class="text-center text-muted py-4">暂无节点数据</td></tr>
+                                <tr v-if="Object.keys(qStats.nodes).length === 0"><td colspan="6" class="text-center text-muted py-4">暂无节点数据</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -1221,7 +1223,7 @@ EOF
                             <div class="card-header bg-white">收件人列表</div>
                             <div class="card-body d-flex flex-column">
                                 <div class="d-flex gap-2 mb-3">
-                                    <button class="btn btn-outline-primary flex-grow-1" @click="loadContacts"><i class="bi bi-cloud-download"></i> 加载全部</button>
+                                    <button class="btn btn-outline-primary flex-grow-1" @click="loadContacts"><i class="bi bi-cloud-download"></i> 加载全部 ([[ contactCount ]])</button>
                                     <button class="btn btn-outline-success flex-grow-1" @click="saveContacts"><i class="bi bi-cloud-upload"></i> 保存当前</button>
                                 </div>
                                 <textarea v-model="bulk.recipients" class="form-control flex-grow-1 mb-3" placeholder="每行一个邮箱地址..." style="min-height: 200px;"></textarea>
@@ -1469,6 +1471,40 @@ EOF
                 }
             },
             methods: {
+                getEstDuration(name, pending) {
+                    if (!pending || pending <= 0) return '-';
+                    const speed = this.getNodeSpeed(name);
+                    const seconds = pending / speed;
+                    if (seconds < 60) return '< 1m';
+                    const h = Math.floor(seconds / 3600);
+                    const m = Math.floor((seconds % 3600) / 60);
+                    if (h > 0) return `${h}h ${m}m`;
+                    return `${m}m`;
+                },
+                getEstFinishTime(name, pending) {
+                    if (!pending || pending <= 0) return '-';
+                    const speed = this.getNodeSpeed(name);
+                    const seconds = pending / speed;
+                    const finish = new Date(Date.now() + seconds * 1000);
+                    const h = finish.getHours().toString().padStart(2, '0');
+                    const m = finish.getMinutes().toString().padStart(2, '0');
+                    return `${h}:${m}`;
+                },
+                getNodeSpeed(name) {
+                    const node = this.config.downstream_pool.find(n => n.name === name);
+                    if (!node) return 0.1;
+                    const global = this.config.limit_config || {};
+                    const min_i = parseFloat(node.min_interval || global.min_interval || 1);
+                    const max_i = parseFloat(node.max_interval || global.max_interval || 5);
+                    let avg_i = (min_i + max_i) / 2;
+                    if (avg_i <= 0.01) avg_i = 0.01;
+                    let speed = 1 / avg_i;
+                    const max_ph = parseInt(node.max_per_hour || 0);
+                    if (max_ph > 0) {
+                        if ((max_ph / 3600) < speed) speed = max_ph / 3600;
+                    }
+                    return speed;
+                },
                 getStatusColor(key) {
                     const map = { 'pending': 'pending', 'processing': 'processing', 'sent': 'sent', 'failed': 'failed' };
                     return map[key] || 'secondary';
