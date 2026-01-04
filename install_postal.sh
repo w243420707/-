@@ -215,6 +215,13 @@ echo -e "${GREEN}=======================================================${NC}"
 echo -e "🏠 管理面板: ${YELLOW}https://$DOMAIN${NC}"
 echo -e "📨 SMTP 端口: ${YELLOW}$SMTP_PORT${NC}"
 echo -e ""
+echo -e "$DOMAIN${NC}.	1	IN	A	IP ; cf_tags=cf-proxied:false"
+echo -e "rp.$DOMAIN${NC}.	1	IN	A	IP ; cf_tags=cf-proxied:false"
+echo -e "routes.$DOMAIN${NC}.	1	IN	MX	10 $DOMAIN${NC}."
+echo -e "rp.$DOMAIN${NC}.	1	IN	MX	10 $DOMAIN${NC}."
+echo -e "rp.$DOMAIN${NC}.	1	IN	TXT	"v=spf1 a mx include:spf.$DOMAIN${NC} ~all""
+echo -e "spf.$DOMAIN${NC}.	1	IN	TXT	"v=spf1 ip4:IP ~all""
+echo -e ""
 echo -e "正在验证服务状态..."
 sleep 5
 
