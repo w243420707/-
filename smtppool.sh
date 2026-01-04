@@ -1388,9 +1388,8 @@ EOF
                                                 <textarea v-model="bulk.bodyList[index]" class="form-control font-monospace bg-theme-light" rows="10" placeholder="输入HTML内容..."></textarea>
                                             </div>
                                             <div class="col-md-6">
-                                                <div class="border rounded h-100 overflow-auto p-2" style="background-color: #fff; color: #000; min-height: 200px; max-height: 250px;">
-                                                    <div v-if="!bulk.bodyList[index]" class="text-muted text-center pt-5 small">实时预览区域</div>
-                                                    <div v-else v-html="bulk.bodyList[index]"></div>
+                                                <div class="border rounded h-100 overflow-hidden" style="background-color: #fff; min-height: 200px; max-height: 250px;">
+                                                    <preview-frame :content="bulk.bodyList[index]"></preview-frame>
                                                 </div>
                                             </div>
                                         </div>
@@ -1605,7 +1604,7 @@ EOF
 
     <script>
         const { createApp } = Vue;
-        createApp({
+        const app = createApp({
             delimiters: ['[[', ']]'],
             data() {
                 return {
@@ -1962,7 +1961,25 @@ EOF
                     this.rebalancing = false;
                 }
             }
-        }).mount('#app');
+        });
+
+        app.component('preview-frame', {
+            props: ['content'],
+            template: '<iframe ref="frm" style="width:100%;height:100%;border:none;"></iframe>',
+            mounted() { this.update(); },
+            updated() { this.update(); },
+            watch: { content() { this.update(); } },
+            methods: {
+                update() {
+                    const doc = this.$refs.frm.contentDocument || this.$refs.frm.contentWindow.document;
+                    doc.open();
+                    doc.write(this.content || '<div style="text-align:center;color:#999;padding-top:2rem;font-family:sans-serif;font-size:12px;">实时预览区域</div>');
+                    doc.close();
+                }
+            }
+        });
+
+        app.mount('#app');
     </script>
 </body>
 </html>
