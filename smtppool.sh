@@ -371,9 +371,9 @@ def worker_thread():
                 # Update DB
                 with get_db() as conn:
                     if success:
-                        conn.execute("UPDATE queue SET status='sent', updated_at=CURRENT_TIMESTAMP WHERE id=?", (row_id,))
+                        conn.execute("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", (row_id,))
                     else:
-                        conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (error_msg, row_id))
+                        conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", (error_msg, row_id))
 
                 # --- Set Next Available Time ---
                 # We update the cooling timer for ALL successful sends to pace the connection,
@@ -1020,7 +1020,7 @@ TRACKING_GIF = base64.b64decode(b'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAA
 def track_email(tid):
     try:
         with get_db() as conn:
-            conn.execute("UPDATE queue SET opened_at=CURRENT_TIMESTAMP, open_count=open_count+1 WHERE tracking_id=?", (tid,))
+            conn.execute("UPDATE queue SET opened_at=datetime('now', '+08:00'), open_count=open_count+1 WHERE tracking_id=?", (tid,))
     except Exception as e:
         logger.error(f"Tracking error: {e}")
     return TRACKING_GIF, 200, {'Content-Type': 'image/gif', 'Cache-Control': 'no-cache, no-store, must-revalidate'}
