@@ -72,7 +72,7 @@ import sqlite3
 import time
 import base64
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from email import message_from_bytes
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
@@ -103,8 +103,8 @@ def init_db():
             assigned_node TEXT,
             retry_count INTEGER DEFAULT 0,
             last_error TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT (datetime('now', '+08:00')),
+            updated_at TIMESTAMP DEFAULT (datetime('now', '+08:00')),
             source TEXT DEFAULT 'relay',
             tracking_id TEXT UNIQUE,
             opened_at TIMESTAMP,
@@ -137,13 +137,13 @@ def init_db():
         conn.execute('''CREATE TABLE IF NOT EXISTS contacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             email TEXT UNIQUE,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT (datetime('now', '+08:00'))
         )''')
 
         conn.execute('''CREATE TABLE IF NOT EXISTS drafts (
             id INTEGER PRIMARY KEY,
             content TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT (datetime('now', '+08:00'))
         )''')
 
 # --- Config & Logging ---
@@ -214,7 +214,7 @@ class RelayHandler:
                 for node in selected_nodes:
                     node_name = node.get('name', 'Unknown')
                     conn.execute(
-                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, last_error) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+08:00'), datetime('now', '+08:00'))",
                         (envelope.mail_from, json.dumps(envelope.rcpt_tos), envelope.content, node_name, 'pending', 'relay', None)
                     )
             return '250 OK: Queued for redundant delivery'
@@ -241,7 +241,7 @@ def worker_thread():
                     days = int(cfg.get('log_config', {}).get('retention_days', 7))
                     if days > 0:
                         with get_db() as conn:
-                            conn.execute(f"DELETE FROM queue WHERE status IN ('sent', 'failed') AND updated_at < datetime('now', '-{days} days')")
+                            conn.execute(f"DELETE FROM queue WHERE status IN ('sent', 'failed') AND updated_at < datetime('now', '+08:00', '-{days} days')")
                         logger.info(f"🧹 Auto-cleaned records older than {days} days")
                 except Exception as e:
                     logger.error(f"Cleanup failed: {e}")
@@ -313,12 +313,12 @@ def worker_thread():
                     # B. Hourly Limit Check
                     max_ph = int(node.get('max_per_hour', 0))
                     if max_ph > 0:
-                        current_hour = datetime.now().hour
+                        current_hour = (datetime.utcnow() + timedelta(hours=8)).hour
                         # Reset/Init counter
                         if node_name not in node_hourly_counts or node_hourly_counts[node_name]['hour'] != current_hour:
                             with get_db() as conn:
                                 cnt = conn.execute(
-                                    "SELECT COUNT(*) FROM queue WHERE assigned_node=? AND status='sent' AND updated_at > datetime('now', '-1 hour')", 
+                                    "SELECT COUNT(*) FROM queue WHERE assigned_node=? AND status='sent' AND updated_at > datetime('now', '+08:00', '-1 hour')", 
                                     (node_name,)
                                 ).fetchone()[0]
                             node_hourly_counts[node_name] = {'hour': current_hour, 'count': cnt}
@@ -333,7 +333,7 @@ def worker_thread():
                 
                 # Mark processing
                 with get_db() as conn:
-                    conn.execute("UPDATE queue SET status='processing', updated_at=CURRENT_TIMESTAMP WHERE id=?", (row_id,))
+                    conn.execute("UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id=?", (row_id,))
 
                 error_msg = ""
                 success = False
@@ -497,7 +497,7 @@ def api_queue_stats():
 
         # Speed stats (Sent in last hour)
         try:
-            speed = conn.execute("SELECT COUNT(*) FROM queue WHERE status='sent' AND updated_at > datetime('now', '-1 hour')").fetchone()[0]
+            speed = conn.execute("SELECT COUNT(*) FROM queue WHERE status='sent' AND updated_at > datetime('now', '+08:00', '-1 hour')").fetchone()[0]
             total['speed_ph'] = speed
         except: total['speed_ph'] = 0
 
@@ -797,13 +797,13 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool):
                 node = select_node_for_recipient(pool, rcpt, limit_cfg, source='bulk')
                 node_name = node.get('name', 'Unknown') if node else 'No_Node_Available'
                 
-                tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk', tracking_id))
+                tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8)))
                 count += 1
                 
                 if len(tasks) >= 500:
                     with get_db() as conn:
                         conn.executemany(
-                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             tasks
                         )
                     tasks = []
@@ -814,7 +814,7 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool):
         if tasks:
             with get_db() as conn:
                 conn.executemany(
-                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     tasks
                 )
         logger.info(f"Bulk import finished: {count} emails processed")
@@ -870,7 +870,7 @@ def api_contacts_import():
     with get_db() as conn:
         for e in emails:
             try:
-                conn.execute("INSERT INTO contacts (email) VALUES (?)", (e,))
+                conn.execute("INSERT INTO contacts (email, created_at) VALUES (?, datetime('now', '+08:00'))", (e,))
                 added += 1
             except sqlite3.IntegrityError:
                 pass
@@ -911,7 +911,7 @@ def api_draft():
         try:
             content = json.dumps(request.json)
             with get_db() as conn:
-                conn.execute("INSERT OR REPLACE INTO drafts (id, content, updated_at) VALUES (1, ?, CURRENT_TIMESTAMP)", (content,))
+                conn.execute("INSERT OR REPLACE INTO drafts (id, content, updated_at) VALUES (1, ?, datetime('now', '+08:00'))", (content,))
             return jsonify({"status": "ok"})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
@@ -1067,6 +1067,9 @@ EOF
             --active-bg: #eef2ff;
             --text-main: #212529;
             --text-muted: #6c757d;
+            --input-bg: #ffffff;
+            --input-border: #dee2e6;
+            --code-bg: #f8f9fa;
         }
         
         [data-bs-theme="dark"] {
@@ -1078,6 +1081,9 @@ EOF
             --active-bg: #1f2937;
             --text-main: #e6edf3;
             --text-muted: #8b949e;
+            --input-bg: #0d1117;
+            --input-border: #30363d;
+            --code-bg: #161b22;
         }
 
         body { background-color: var(--bg-color); color: var(--text-main); font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; overflow-x: hidden; }
@@ -1098,7 +1104,7 @@ EOF
         /* Cards */
         .card { border: none; border-radius: 12px; box-shadow: 0 2px 12px rgba(0,0,0,0.03); background: var(--card-bg); transition: transform 0.2s; }
         .stat-card:hover { transform: translateY(-2px); }
-        .card-header { background: transparent; border-bottom: 1px solid var(--sidebar-border); padding: 1.25rem; font-weight: 600; }
+        .card-header { background: transparent; border-bottom: 1px solid var(--sidebar-border); padding: 1.25rem; font-weight: 600; color: var(--text-main); }
         
         /* Status Colors */
         .text-pending { color: #f59e0b; } .bg-pending-subtle { background: #fffbeb; }
@@ -1114,9 +1120,38 @@ EOF
         /* Utils */
         .btn-primary { background: var(--primary-color); border-color: var(--primary-color); }
         .table-custom th { font-weight: 600; color: var(--text-muted); background: var(--hover-bg); border-bottom: 2px solid var(--sidebar-border); }
-        .table-custom td { vertical-align: middle; color: var(--text-main); }
+        .table-custom td { vertical-align: middle; color: var(--text-main); border-bottom: 1px solid var(--sidebar-border); }
         
-        .sidebar-header .text-dark { color: var(--text-main) !important; }
+        /* Dark Mode Overrides */
+        .bg-theme-light { background-color: var(--code-bg) !important; }
+        .text-theme-main { color: var(--text-main) !important; }
+        .border-theme { border-color: var(--sidebar-border) !important; }
+        
+        [data-bs-theme="dark"] .form-control, [data-bs-theme="dark"] .form-select {
+            background-color: var(--input-bg);
+            border-color: var(--input-border);
+            color: var(--text-main);
+        }
+        [data-bs-theme="dark"] .form-control:focus {
+            background-color: var(--input-bg);
+            color: var(--text-main);
+            border-color: var(--primary-color);
+        }
+        [data-bs-theme="dark"] .btn-light {
+            background-color: var(--hover-bg);
+            border-color: var(--sidebar-border);
+            color: var(--text-main);
+        }
+        [data-bs-theme="dark"] .btn-light:hover {
+            background-color: var(--active-bg);
+        }
+        [data-bs-theme="dark"] .btn-white {
+            background-color: var(--card-bg);
+            border-color: var(--sidebar-border);
+            color: var(--text-main);
+        }
+        [data-bs-theme="dark"] .bg-light { background-color: var(--hover-bg) !important; }
+        [data-bs-theme="dark"] .bg-white { background-color: var(--card-bg) !important; }
         
         @media (max-width: 768px) {
             .sidebar { transform: translateX(-100%); transition: transform 0.3s; }
@@ -1129,7 +1164,7 @@ EOF
 <body>
     <div id="app">
         <!-- Mobile Toggle -->
-        <div class="d-md-none p-3 bg-white border-bottom d-flex justify-content-between align-items-center sticky-top">
+        <div class="d-md-none p-3 border-bottom d-flex justify-content-between align-items-center sticky-top" style="background: var(--sidebar-bg)">
             <div class="d-flex align-items-center gap-2">
                 <div class="logo-icon" style="width: 28px; height: 28px;"><i class="bi bi-send-fill"></i></div>
                 <span class="fw-bold">SMTP Relay</span>
@@ -1142,7 +1177,7 @@ EOF
             <div class="sidebar-header">
                 <div class="logo-icon"><i class="bi bi-send-fill"></i></div>
                 <div>
-                    <div class="fw-bold text-dark">SMTP Relay</div>
+                    <div class="fw-bold text-theme-main">SMTP Relay</div>
                     <div class="small text-muted" style="font-size: 0.75rem;">Pro Manager</div>
                 </div>
             </div>
@@ -1212,7 +1247,7 @@ EOF
                                     <h6 class="fw-bold mb-0">群发任务 [[ statusText ]]</h6>
                                     <div class="small text-muted">
                                         进度: [[ progressPercent ]]% ([[ qStats.total.sent || 0 ]] / [[ totalMails ]])
-                                        <span class="ms-2 badge bg-light text-dark border">[[ qStats.total.speed_ph || 0 ]] 封/小时</span>
+                                        <span class="ms-2 badge bg-theme-light text-theme-main border border-theme">[[ qStats.total.speed_ph || 0 ]] 封/小时</span>
                                     </div>
                                 </div>
                             </div>
@@ -1313,10 +1348,10 @@ EOF
                                 <tr v-for="m in qList" :key="m.id">
                                     <td class="ps-4 text-muted">#[[ m.id ]]</td>
                                     <td>
-                                        <div class="fw-bold text-dark">[[ m.mail_from ]]</div>
+                                        <div class="fw-bold text-theme-main">[[ m.mail_from ]]</div>
                                         <div class="text-muted small text-truncate" style="max-width: 250px;">[[ m.rcpt_tos ]]</div>
                                     </td>
-                                    <td><span class="badge bg-light text-dark border">[[ m.assigned_node ]]</span></td>
+                                    <td><span class="badge bg-theme-light text-theme-main border border-theme">[[ m.assigned_node ]]</span></td>
                                     <td>
                                         <span class="badge" :class="'bg-'+m.status+'-subtle text-'+m.status">[[ m.status ]]</span>
                                         <div v-if="m.last_error" class="text-danger small mt-1" style="font-size: 0.7rem;">[[ m.last_error ]]</div>
@@ -1344,7 +1379,7 @@ EOF
                                 <div class="mb-3">
                                     <label class="form-label fw-bold">邮件正文 (HTML)</label>
                                     <div v-for="(item, index) in bulk.bodyList" :key="index" class="mb-2 position-relative">
-                                        <textarea v-model="bulk.bodyList[index]" class="form-control font-monospace bg-light" rows="8" :placeholder="'正文模板 ' + (index + 1)"></textarea>
+                                        <textarea v-model="bulk.bodyList[index]" class="form-control font-monospace bg-theme-light" rows="8" :placeholder="'正文模板 ' + (index + 1)"></textarea>
                                         <button v-if="bulk.bodyList.length > 1" @click="removeBody(index)" class="btn btn-sm btn-outline-danger position-absolute top-0 end-0 m-2" title="删除此模板"><i class="bi bi-trash"></i></button>
                                     </div>
                                     <button class="btn btn-sm btn-outline-primary" @click="addBody"><i class="bi bi-plus-lg"></i> 添加正文模板</button>
@@ -1355,7 +1390,7 @@ EOF
                     </div>
                     <div class="col-lg-4">
                         <div class="card h-100">
-                            <div class="card-header bg-white">收件人列表</div>
+                            <div class="card-header">收件人列表</div>
                             <div class="card-body d-flex flex-column">
                                 <div class="d-flex gap-2 mb-2">
                                     <button class="btn btn-outline-success flex-grow-1" @click="saveContacts"><i class="bi bi-cloud-upload"></i> 保存当前</button>
@@ -1463,7 +1498,7 @@ EOF
                                 <span>下游节点池 (Load Balancing)</span>
                                 <button class="btn btn-sm btn-outline-primary" @click="addNode"><i class="bi bi-plus-lg"></i> 添加节点</button>
                             </div>
-                            <div class="card-body bg-light">
+                            <div class="card-body bg-theme-light">
                                 <div v-if="config.downstream_pool.length === 0" class="text-center py-5 text-muted">
                                     暂无节点，请点击右上角添加
                                 </div>
