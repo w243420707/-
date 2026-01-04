@@ -301,10 +301,17 @@ def worker_thread():
                 
                 node = pool_cfg.get(node_name)
                 
-                # Skip if node removed
-                if not node:
-                    with get_db() as conn:
-                        conn.execute("UPDATE queue SET status='failed', last_error='Node removed' WHERE id=?", (row_id,))
+                # Re-route if node removed or disabled
+                if not node or not node.get('enabled', True):
+                    active_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
+                    if active_nodes:
+                        new_node = random.choice(active_nodes)
+                        logger.info(f"🔄 Re-routing ID:{row_id} from '{node_name}' to '{new_node['name']}'")
+                        with get_db() as conn:
+                            conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
+                    else:
+                        with get_db() as conn:
+                            conn.execute("UPDATE queue SET status='failed', last_error='No active nodes available' WHERE id=?", (row_id,))
                     continue
 
                 # --- Rate Limiting Checks (BULK ONLY) ---
@@ -819,6 +826,37 @@ def api_queue_clear():
     with get_db() as conn:
         conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed', 'processing')")
     return jsonify({"status": "ok"})
+
+@app.route('/api/queue/rebalance', methods=['POST'])
+@login_required
+def api_queue_rebalance():
+    try:
+        cfg = load_config()
+        # Get enabled nodes
+        pool = [n['name'] for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
+        if not pool: return jsonify({"error": "No enabled nodes available"}), 400
+        
+        count = 0
+        with get_db() as conn:
+            # 1. Get all pending IDs
+            cursor = conn.execute("SELECT id FROM queue WHERE status='pending'")
+            rows = cursor.fetchall()
+            if not rows: return jsonify({"count": 0})
+            
+            # 2. Prepare updates
+            updates = []
+            for r in rows:
+                updates.append((random.choice(pool), r['id']))
+            
+            # 3. Execute batch update
+            conn.executemany("UPDATE queue SET assigned_node=? WHERE id=?", updates)
+            count = len(updates)
+            
+        return jsonify({"status": "ok", "count": count})
+    except Exception as e:
+        logger.error(f"Rebalance error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/bulk/control', methods=['POST'])
 @login_required
 def api_bulk_control():
@@ -1070,7 +1108,13 @@ EOF
 
                 <!-- Node Status -->
                 <div class="card mb-4">
-                    <div class="card-header">节点健康状态</div>
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <span>节点健康状态</span>
+                        <button class="btn btn-sm btn-outline-primary" @click="rebalanceQueue" :disabled="rebalancing">
+                            <i class="bi" :class="rebalancing?'bi-hourglass-split':'bi-shuffle'"></i> 
+                            [[ rebalancing ? '分配中...' : '重分配待发任务' ]]
+                        </button>
+                    </div>
                     <div class="table-responsive">
                         <table class="table table-custom table-hover mb-0">
                             <thead><tr><th>节点名称</th><th class="text-center">堆积</th><th class="text-center">成功</th><th class="text-center">失败</th></tr></thead>
@@ -1322,7 +1366,8 @@ EOF
                     bulk: { sender: '', subject: '', recipients: '', body: '' },
                     sending: false,
                     contactCount: 0,
-                    bulkStatus: 'running'
+                    bulkStatus: 'running',
+                    rebalancing: false
                 }
             },
             computed: {
@@ -1526,6 +1571,21 @@ EOF
                     if(!confirm('清理历史记录? (保留Pending)')) return;
                     await fetch('/api/queue/clear', { method: 'POST' });
                     this.fetchQueue();
+                },
+                async rebalanceQueue() {
+                    if(!confirm('确定要将所有【待发送】邮件重新随机分配给当前启用的节点吗？\n\n这通常用于：\n1. 新增节点后，让其立即参与当前任务\n2. 某个节点堆积过多，需要分流')) return;
+                    this.rebalancing = true;
+                    try {
+                        const res = await fetch('/api/queue/rebalance', { method: 'POST' });
+                        const data = await res.json();
+                        if(res.ok) {
+                            alert(`成功重分配 ${data.count} 个任务`);
+                            this.fetchQueue();
+                        } else {
+                            alert('错误: ' + data.error);
+                        }
+                    } catch(e) { alert('失败: ' + e); }
+                    this.rebalancing = false;
                 }
             }
         }).mount('#app');
