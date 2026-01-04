@@ -531,6 +531,29 @@ def api_queue_list():
         rows = conn.execute("SELECT id, mail_from, rcpt_tos, assigned_node, status, retry_count, last_error, created_at FROM queue ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return jsonify([dict(r) for r in rows])
 
+def select_weighted_node(nodes, global_limit):
+    if not nodes: return None
+    try:
+        weights = []
+        for node in nodes:
+            # Calculate theoretical speed (Emails/Hour)
+            min_i = float(node.get('min_interval') or global_limit.get('min_interval', 1))
+            max_i = float(node.get('max_interval') or global_limit.get('max_interval', 5))
+            avg_i = (min_i + max_i) / 2
+            if avg_i <= 0.01: avg_i = 0.01
+            
+            speed = 3600 / avg_i
+            
+            # Cap by hourly limit
+            max_ph = int(node.get('max_per_hour', 0))
+            if max_ph > 0: speed = min(speed, max_ph)
+            
+            weights.append(speed)
+            
+        return random.choices(nodes, weights=weights, k=1)[0]
+    except:
+        return random.choice(nodes)
+
 def bulk_import_task(raw_recipients, subject, body, pool):
     try:
         # Process recipients in background to avoid blocking
@@ -538,6 +561,7 @@ def bulk_import_task(raw_recipients, subject, body, pool):
         random.shuffle(recipients) # Shuffle for better distribution
         
         cfg = load_config()
+        limit_cfg = cfg.get('limit_config', {})
         tracking_base = cfg.get('web_config', {}).get('public_domain', '').rstrip('/')
 
         charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
@@ -740,7 +764,7 @@ def bulk_import_task(raw_recipients, subject, body, pool):
                 msg['Date'] = formatdate(localtime=True)
                 msg['Message-ID'] = make_msgid()
 
-                node = random.choice(pool)
+                node = select_weighted_node(pool, limit_cfg)
                 node_name = node.get('name', 'Unknown')
                 
                 tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk', tracking_id))
@@ -838,11 +862,13 @@ def api_queue_clear():
 def api_queue_rebalance():
     try:
         cfg = load_config()
-        # Get enabled nodes
-        pool = [n['name'] for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
+        # Get enabled nodes (Full objects)
+        pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
         if not pool: return jsonify({"error": "No enabled nodes available"}), 400
         
         count = 0
+        limit_cfg = cfg.get('limit_config', {})
+        
         with get_db() as conn:
             # 1. Get all pending IDs
             cursor = conn.execute("SELECT id FROM queue WHERE status='pending'")
@@ -852,7 +878,8 @@ def api_queue_rebalance():
             # 2. Prepare updates
             updates = []
             for r in rows:
-                updates.append((random.choice(pool), r['id']))
+                node = select_weighted_node(pool, limit_cfg)
+                updates.append((node['name'], r['id']))
             
             # 3. Execute batch update
             conn.executemany("UPDATE queue SET assigned_node=? WHERE id=?", updates)
