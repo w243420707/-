@@ -182,8 +182,9 @@ class RelayHandler:
             logger.warning("❌ No enabled downstream nodes available")
             return '451 Temporary failure: No nodes'
         
-        # Load Balancing: Randomly assign a node at reception
-        node = random.choice(pool)
+        # Load Balancing: Routing > Weighted
+        rcpt = envelope.rcpt_tos[0] if envelope.rcpt_tos else ''
+        node = select_node_for_recipient(pool, rcpt, cfg.get('limit_config', {}))
         node_name = node.get('name', 'Unknown')
         
         logger.info(f"📥 Received | From: {envelope.mail_from} | To: {envelope.rcpt_tos} | Assigned: {node_name}")
@@ -554,6 +555,33 @@ def select_weighted_node(nodes, global_limit):
     except:
         return random.choice(nodes)
 
+def select_node_for_recipient(pool, recipient, global_limit):
+    # pool is list of node dicts
+    if not pool: return None
+    try:
+        domain = recipient.split('@')[-1].lower().strip()
+    except:
+        domain = ""
+        
+    specific_nodes = []
+    wildcard_nodes = []
+    
+    for node in pool:
+        rules = node.get('routing_rules', '')
+        if not rules or not rules.strip():
+            wildcard_nodes.append(node)
+        else:
+            # Check if domain matches any rule
+            allowed = [d.strip().lower() for d in rules.split(',') if d.strip()]
+            if domain in allowed:
+                specific_nodes.append(node)
+    
+    # Priority: Specific > Wildcard > All (Fallback)
+    candidates = specific_nodes if specific_nodes else wildcard_nodes
+    if not candidates: candidates = pool
+    
+    return select_weighted_node(candidates, global_limit)
+
 def bulk_import_task(raw_recipients, subject, body, pool):
     try:
         # Process recipients in background to avoid blocking
@@ -764,7 +792,7 @@ def bulk_import_task(raw_recipients, subject, body, pool):
                 msg['Date'] = formatdate(localtime=True)
                 msg['Message-ID'] = make_msgid()
 
-                node = select_weighted_node(pool, limit_cfg)
+                node = select_node_for_recipient(pool, rcpt, limit_cfg)
                 node_name = node.get('name', 'Unknown')
                 
                 tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk', tracking_id))
@@ -832,8 +860,15 @@ def api_contacts_import():
 @app.route('/api/contacts/list')
 @login_required
 def api_contacts_list():
+    limit = request.args.get('limit', -1, type=int)
+    offset = request.args.get('offset', 0, type=int)
+    query = "SELECT email FROM contacts ORDER BY id DESC"
+    params = ()
+    if limit > 0:
+        query += " LIMIT ? OFFSET ?"
+        params = (limit, offset)
     with get_db() as conn:
-        rows = conn.execute("SELECT email FROM contacts ORDER BY id DESC").fetchall()
+        rows = conn.execute(query, params).fetchall()
     return jsonify([r['email'] for r in rows])
 
 @app.route('/api/contacts/count')
@@ -870,15 +905,20 @@ def api_queue_rebalance():
         limit_cfg = cfg.get('limit_config', {})
         
         with get_db() as conn:
-            # 1. Get all pending IDs
-            cursor = conn.execute("SELECT id FROM queue WHERE status='pending'")
+            # 1. Get all pending IDs and recipients to re-route correctly
+            cursor = conn.execute("SELECT id, rcpt_tos FROM queue WHERE status='pending'")
             rows = cursor.fetchall()
             if not rows: return jsonify({"count": 0})
             
             # 2. Prepare updates
             updates = []
             for r in rows:
-                node = select_weighted_node(pool, limit_cfg)
+                try:
+                    rcpts = json.loads(r['rcpt_tos'])
+                    rcpt = rcpts[0] if rcpts else ''
+                except: rcpt = ''
+                
+                node = select_node_for_recipient(pool, rcpt, limit_cfg)
                 updates.append((node['name'], r['id']))
             
             # 3. Execute batch update
@@ -1222,14 +1262,27 @@ EOF
                         <div class="card h-100">
                             <div class="card-header bg-white">收件人列表</div>
                             <div class="card-body d-flex flex-column">
-                                <div class="d-flex gap-2 mb-3">
-                                    <button class="btn btn-outline-primary flex-grow-1" @click="loadContacts"><i class="bi bi-cloud-download"></i> 加载全部 ([[ contactCount ]])</button>
+                                <div class="d-flex gap-2 mb-2">
                                     <button class="btn btn-outline-success flex-grow-1" @click="saveContacts"><i class="bi bi-cloud-upload"></i> 保存当前</button>
+                                    <button class="btn btn-outline-danger" @click="clearContacts"><i class="bi bi-trash"></i> 清空</button>
                                 </div>
+                                
+                                <div v-if="contactCount > 50000" class="mb-2">
+                                    <div class="d-flex flex-wrap gap-2" style="max-height: 150px; overflow-y: auto;">
+                                        <button v-for="i in Math.ceil(contactCount / 50000)" :key="i" 
+                                                class="btn btn-outline-primary btn-sm flex-grow-1" 
+                                                @click="loadContacts(i-1)">
+                                            分组[[ i ]] ([[ getGroupRange(i) ]])
+                                        </button>
+                                    </div>
+                                </div>
+                                <button v-else class="btn btn-outline-primary w-100 mb-2" @click="loadContacts(0)">
+                                    <i class="bi bi-cloud-download"></i> 加载全部 ([[ contactCount ]])
+                                </button>
+
                                 <textarea v-model="bulk.recipients" class="form-control flex-grow-1 mb-3" placeholder="每行一个邮箱地址..." style="min-height: 200px;"></textarea>
                                 <div class="d-flex justify-content-between align-items-center mb-3">
-                                    <span class="fw-bold">[[ recipientCount ]] 人</span>
-                                    <button class="btn btn-sm btn-link text-danger text-decoration-none" @click="clearContacts">清空通讯录</button>
+                                    <span class="fw-bold">当前输入: [[ recipientCount ]] 人</span>
                                 </div>
                                 <button class="btn btn-primary w-100 py-3 fw-bold" @click="sendBulk" :disabled="sending || recipientCount === 0">
                                     <span v-if="sending" class="spinner-border spinner-border-sm me-2"></span>
@@ -1376,6 +1429,18 @@ EOF
                                             <div class="col-md-4">
                                                 <label class="small text-muted">Max Interval (s)</label>
                                                 <input v-model.number="n.max_interval" type="number" class="form-control" placeholder="Default">
+                                            </div>
+                                            <div class="col-12">
+                                                <label class="small text-muted">分流规则 (点击选择)</label>
+                                                <div class="d-flex flex-wrap gap-2 mb-2">
+                                                    <button class="btn btn-sm" :class="(!n.routing_rules)?'btn-primary':'btn-outline-secondary'" @click="n.routing_rules=''">通用 (其他)</button>
+                                                    <button class="btn btn-sm" :class="hasDomain(n, 'qq.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, 'qq.com')">QQ.com</button>
+                                                    <button class="btn btn-sm" :class="hasDomain(n, 'gmail.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, 'gmail.com')">Gmail.com</button>
+                                                    <button class="btn btn-sm" :class="hasDomain(n, '163.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, '163.com')">163.com</button>
+                                                    <button class="btn btn-sm" :class="hasDomain(n, '126.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, '126.com')">126.com</button>
+                                                </div>
+                                                <input v-model="n.routing_rules" class="form-control form-control-sm" placeholder="自定义域名 (逗号分隔)...">
+                                                <div class="form-text" style="font-size: 0.75rem;">[[ (!n.routing_rules) ? '当前为通用节点，处理所有未匹配的邮件。' : '当前为专用节点，仅处理上述域名的邮件。' ]]</div>
                                             </div>
                                         </div>
                                     </div>
@@ -1567,10 +1632,21 @@ EOF
                         this.fetchContactCount();
                     } catch(e) { alert('失败: ' + e); }
                 },
-                async loadContacts() {
+                getGroupRange(i) {
+                     const start = (i-1)*50000 + 1;
+                     const end = Math.min(i*50000, this.contactCount);
+                     return `${start}-${end}`;
+                },
+                async loadContacts(groupIndex) {
                     if(this.bulk.recipients && !confirm('覆盖当前输入框?')) return;
                     try {
-                        const res = await fetch('/api/contacts/list');
+                        let url = '/api/contacts/list';
+                        if (this.contactCount > 50000) {
+                            const limit = 50000;
+                            const offset = groupIndex * limit;
+                            url += `?limit=${limit}&offset=${offset}`;
+                        }
+                        const res = await fetch(url);
                         const emails = await res.json();
                         this.bulk.recipients = emails.join('\n');
                     } catch(e) { alert('失败: ' + e); }
@@ -1583,8 +1659,21 @@ EOF
                         alert('已清空');
                     } catch(e) { alert('失败: ' + e); }
                 },
+                hasDomain(n, d) {
+                    if(!n.routing_rules) return false;
+                    return n.routing_rules.split(',').map(x=>x.trim()).includes(d);
+                },
+                toggleDomain(n, d) {
+                    let rules = n.routing_rules ? n.routing_rules.split(',').map(x=>x.trim()).filter(x=>x) : [];
+                    if(rules.includes(d)) {
+                        rules = rules.filter(x=>x!==d);
+                    } else {
+                        rules.push(d);
+                    }
+                    n.routing_rules = rules.join(',');
+                },
                 addNode() { 
-                    this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true }); 
+                    this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true, routing_rules: '' }); 
                 },
                 delNode(i) { if(confirm('删除此节点?')) this.config.downstream_pool.splice(i, 1); },
                 async save() {
