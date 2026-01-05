@@ -1535,7 +1535,47 @@ EOF
                         <div class="card">
                             <div class="card-header d-flex justify-content-between align-items-center">
                                 <span>下游节点池 (Load Balancing)</span>
-                                <button class="btn btn-sm btn-outline-primary" @click="addNode"><i class="bi bi-plus-lg"></i> 添加节点</button>
+                                <div class="d-flex gap-2">
+                                    <button class="btn btn-sm btn-outline-secondary" @click="showBatchEdit = !showBatchEdit"><i class="bi bi-pencil-square"></i> 批量编辑</button>
+                                    <button class="btn btn-sm btn-outline-primary" @click="addNode"><i class="bi bi-plus-lg"></i> 添加节点</button>
+                                </div>
+                            </div>
+                            <!-- Batch Edit Panel -->
+                            <div v-if="showBatchEdit" class="card-body border-bottom" style="background: var(--hover-bg);">
+                                <div class="row g-3 align-items-end">
+                                    <div class="col-12">
+                                        <div class="d-flex align-items-center gap-2 flex-wrap">
+                                            <span class="text-muted small fw-bold">选择节点:</span>
+                                            <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click="batchSelectAll">全选</button>
+                                            <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click="batchSelectNone">全不选</button>
+                                            <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click="batchSelectEnabled">仅启用</button>
+                                            <span class="badge bg-primary-subtle text-primary ms-2">[[ batchSelectedCount ]] 个已选</span>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label class="form-label small mb-1"><i class="bi bi-speedometer2"></i> 批量设置速度</label>
+                                        <div class="d-flex align-items-center gap-2">
+                                            <input v-model.number="batchEdit.max_per_hour" type="number" class="form-control form-control-sm" style="width: 80px;" placeholder="Max/Hr">
+                                            <span class="text-muted small">/h</span>
+                                            <input v-model.number="batchEdit.min_interval" type="number" class="form-control form-control-sm" style="width: 60px;" placeholder="Min">
+                                            <span class="text-muted small">~</span>
+                                            <input v-model.number="batchEdit.max_interval" type="number" class="form-control form-control-sm" style="width: 60px;" placeholder="Max">
+                                            <span class="text-muted small">s</span>
+                                            <button class="btn btn-sm btn-primary" @click="applyBatchSpeed">应用</button>
+                                        </div>
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label class="form-label small mb-1"><i class="bi bi-signpost-split"></i> 批量设置分流</label>
+                                        <div class="d-flex align-items-center gap-1 flex-wrap">
+                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchEdit.routing_rules===''?'btn-primary':'btn-outline-secondary'" @click="batchEdit.routing_rules=''">通用</button>
+                                            <template v-for="d in topDomains" :key="'batch-'+d.domain">
+                                                <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchHasDomain(d.domain)?'btn-success':'btn-outline-secondary'" @click="batchToggleDomain(d.domain)">[[ formatDomainLabel(d.domain) ]]</button>
+                                                <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchHasAllOther(d.domains)?'btn-success':'btn-outline-secondary'" @click="batchToggleOther(d.domains)"><i class="bi bi-three-dots"></i></button>
+                                            </template>
+                                            <button class="btn btn-sm btn-primary ms-2" @click="applyBatchRouting">应用</button>
+                                        </div>
+                                    </div>
+                                </div>
                             </div>
                             <div class="card-body bg-theme-light">
                                 <div v-if="config.downstream_pool.length === 0" class="text-center py-5 text-muted">
@@ -1552,6 +1592,7 @@ EOF
                                         <div class="card h-100 shadow-sm" :style="draggingIndex === i ? 'opacity: 0.5' : ''">
                                             <div class="card-header d-flex justify-content-between align-items-center py-2 bg-transparent">
                                                 <div class="d-flex align-items-center gap-2 flex-grow-1" style="cursor:pointer; min-width: 0;" @click="n.expanded = !n.expanded">
+                                                    <input v-if="showBatchEdit" type="checkbox" v-model="n.batchSelected" class="form-check-input" style="width: 1.2em; height: 1.2em;" @click.stop title="选择此节点">
                                                     <i class="bi text-muted" :class="n.expanded ? 'bi-chevron-down' : 'bi-chevron-right'"></i>
                                                     <div class="form-check form-switch" @click.stop title="启用/禁用节点">
                                                         <input class="form-check-input" type="checkbox" v-model="n.enabled" style="width: 2em; height: 1em;">
@@ -1694,7 +1735,9 @@ EOF
                     theme: 'auto',
                     draggingIndex: null,
                     dragOverIndex: null,
-                    topDomains: []
+                    topDomains: [],
+                    showBatchEdit: false,
+                    batchEdit: { max_per_hour: null, min_interval: null, max_interval: null, routing_rules: '' }
                 }
             },
             computed: {
@@ -1711,6 +1754,9 @@ EOF
                     return (((this.qStats.total.opened || 0) / s) * 100).toFixed(2) + '%';
                 },
                 recipientCount() { return this.bulk.recipients ? this.bulk.recipients.split('\n').filter(r => r.trim()).length : 0; },
+                batchSelectedCount() {
+                    return this.config.downstream_pool.filter(n => n.batchSelected).length;
+                },
                 totalMails() {
                     const t = this.qStats.total;
                     return (t.pending||0) + (t.processing||0) + (t.sent||0) + (t.failed||0);
@@ -2002,6 +2048,63 @@ EOF
                     if(!domains || domains.length === 0 || !n.routing_rules) return false;
                     const rules = n.routing_rules.split(',').map(x=>x.trim());
                     return domains.every(d => rules.includes(d));
+                },
+                // Batch edit methods
+                batchSelectAll() {
+                    this.config.downstream_pool.forEach(n => n.batchSelected = true);
+                },
+                batchSelectNone() {
+                    this.config.downstream_pool.forEach(n => n.batchSelected = false);
+                },
+                batchSelectEnabled() {
+                    this.config.downstream_pool.forEach(n => n.batchSelected = n.enabled);
+                },
+                batchHasDomain(d) {
+                    if(!this.batchEdit.routing_rules) return false;
+                    return this.batchEdit.routing_rules.split(',').map(x=>x.trim()).includes(d);
+                },
+                batchToggleDomain(d) {
+                    let rules = this.batchEdit.routing_rules ? this.batchEdit.routing_rules.split(',').map(x=>x.trim()).filter(x=>x) : [];
+                    if(rules.includes(d)) {
+                        rules = rules.filter(x=>x!==d);
+                    } else {
+                        rules.push(d);
+                    }
+                    this.batchEdit.routing_rules = rules.join(',');
+                },
+                batchHasAllOther(domains) {
+                    if(!domains || domains.length === 0 || !this.batchEdit.routing_rules) return false;
+                    const rules = this.batchEdit.routing_rules.split(',').map(x=>x.trim());
+                    return domains.every(d => rules.includes(d));
+                },
+                batchToggleOther(domains) {
+                    if(!domains || domains.length === 0) return;
+                    let rules = this.batchEdit.routing_rules ? this.batchEdit.routing_rules.split(',').map(x=>x.trim()).filter(x=>x) : [];
+                    const allSelected = domains.every(d => rules.includes(d));
+                    if(allSelected) {
+                        rules = rules.filter(x => !domains.includes(x));
+                    } else {
+                        domains.forEach(d => { if(!rules.includes(d)) rules.push(d); });
+                    }
+                    this.batchEdit.routing_rules = rules.join(',');
+                },
+                applyBatchSpeed() {
+                    const selected = this.config.downstream_pool.filter(n => n.batchSelected);
+                    if(selected.length === 0) { alert('请先选择要编辑的节点'); return; }
+                    selected.forEach(n => {
+                        if(this.batchEdit.max_per_hour !== null && this.batchEdit.max_per_hour !== '') n.max_per_hour = this.batchEdit.max_per_hour;
+                        if(this.batchEdit.min_interval !== null && this.batchEdit.min_interval !== '') n.min_interval = this.batchEdit.min_interval;
+                        if(this.batchEdit.max_interval !== null && this.batchEdit.max_interval !== '') n.max_interval = this.batchEdit.max_interval;
+                    });
+                    alert(`已应用到 ${selected.length} 个节点`);
+                },
+                applyBatchRouting() {
+                    const selected = this.config.downstream_pool.filter(n => n.batchSelected);
+                    if(selected.length === 0) { alert('请先选择要编辑的节点'); return; }
+                    selected.forEach(n => {
+                        n.routing_rules = this.batchEdit.routing_rules;
+                    });
+                    alert(`已应用到 ${selected.length} 个节点`);
                 },
                 addNode() { 
                     this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true, allow_bulk: true, routing_rules: '', expanded: true }); 
