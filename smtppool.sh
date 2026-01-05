@@ -526,6 +526,37 @@ def api_queue_list():
         rows = conn.execute("SELECT id, mail_from, rcpt_tos, assigned_node, status, retry_count, last_error, created_at FROM queue ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return jsonify([dict(r) for r in rows])
 
+@app.route('/api/domain/stats')
+@login_required
+def api_domain_stats():
+    """Get top 9 recipient domains by count"""
+    with get_db() as conn:
+        rows = conn.execute("SELECT rcpt_tos FROM queue").fetchall()
+    
+    domain_count = {}
+    for row in rows:
+        try:
+            rcpts = json.loads(row['rcpt_tos']) if row['rcpt_tos'] else []
+            for email in rcpts:
+                if '@' in email:
+                    domain = email.split('@')[-1].lower().strip()
+                    if domain:
+                        domain_count[domain] = domain_count.get(domain, 0) + 1
+        except: pass
+    
+    # Sort by count descending, take top 9
+    sorted_domains = sorted(domain_count.items(), key=lambda x: x[1], reverse=True)[:9]
+    result = [{'domain': d, 'count': c} for d, c in sorted_domains]
+    
+    # Calculate "other" count
+    top_total = sum(c for d, c in sorted_domains)
+    all_total = sum(domain_count.values())
+    other_count = all_total - top_total
+    if other_count > 0:
+        result.append({'domain': '__other__', 'count': other_count})
+    
+    return jsonify(result)
+
 def select_weighted_node(nodes, global_limit):
     if not nodes: return None
     try:
@@ -1595,9 +1626,11 @@ EOF
                                                         <label class="small text-muted">分流规则</label>
                                                         <div class="d-flex flex-wrap gap-1 mb-1">
                                                             <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-primary':'btn-outline-secondary'" @click="n.routing_rules=''">通用</button>
-                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, 'qq.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, 'qq.com')">QQ</button>
-                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, 'gmail.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, 'gmail.com')">Gmail</button>
-                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, '163.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, '163.com')">163</button>
+                                                            <template v-for="d in topDomains" :key="d.domain">
+                                                                <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)" :title="d.count + '封'">[[ formatDomainLabel(d.domain) ]]</button>
+                                                                <span v-else class="btn btn-sm py-0 px-1 btn-outline-secondary" style="font-size: 0.7rem; cursor: default;" :title="d.count + '封'"><i class="bi bi-three-dots"></i> 其他</span>
+                                                            </template>
+                                                            <span v-if="topDomains.length === 0" class="text-muted small">暂无数据</span>
                                                         </div>
                                                         <input v-model="n.routing_rules" class="form-control form-control-sm" placeholder="域名...">
                                                     </div>
@@ -1634,7 +1667,8 @@ EOF
                     rebalancing: false,
                     theme: 'auto',
                     draggingIndex: null,
-                    dragOverIndex: null
+                    dragOverIndex: null,
+                    topDomains: []
                 }
             },
             computed: {
@@ -1698,6 +1732,7 @@ EOF
                 this.fetchQueue();
                 this.fetchContactCount();
                 this.fetchBulkStatus();
+                this.fetchTopDomains();
                 setInterval(() => {
                     this.fetchQueue();
                     this.fetchBulkStatus();
@@ -1810,6 +1845,29 @@ EOF
                         const data = await res.json();
                         this.contactCount = data.count;
                     } catch(e) {}
+                },
+                async fetchTopDomains() {
+                    try {
+                        const res = await fetch('/api/domain/stats');
+                        this.topDomains = await res.json();
+                    } catch(e) { this.topDomains = []; }
+                },
+                formatDomainLabel(domain) {
+                    const map = {
+                        'qq.com': 'QQ',
+                        'gmail.com': 'Gmail',
+                        '163.com': '163',
+                        '126.com': '126',
+                        'outlook.com': 'Outlook',
+                        'hotmail.com': 'Hotmail',
+                        'yahoo.com': 'Yahoo',
+                        'sina.com': '新浪',
+                        'sohu.com': '搜狐',
+                        'foxmail.com': 'Foxmail',
+                        'icloud.com': 'iCloud',
+                        'aliyun.com': '阿里云'
+                    };
+                    return map[domain.toLowerCase()] || domain;
                 },
                 async fetchBulkStatus() {
                     try {
