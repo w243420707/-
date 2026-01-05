@@ -1506,17 +1506,21 @@ EOF
                                 <div class="row g-3">
                                     <div v-for="(n, i) in config.downstream_pool" :key="i" class="col-md-6 col-xl-4">
                                         <div class="card h-100 shadow-sm">
-                                            <div class="card-body">
-                                                <div class="d-flex justify-content-between align-items-center mb-3">
-                                                    <div class="d-flex align-items-center gap-2">
-                                                        <div class="form-check form-switch">
-                                                            <input class="form-check-input" type="checkbox" v-model="n.enabled" style="width: 2.5em; height: 1.25em;">
-                                                        </div>
-                                                        <span class="fw-bold text-truncate" style="max-width: 120px;" :title="n.name">[[ n.name ]]</span>
-                                                        <span class="badge" :class="n.enabled!==false?'bg-success':'bg-secondary'">[[ n.enabled!==false?'启用':'禁用' ]]</span>
+                                            <div class="card-header d-flex justify-content-between align-items-center py-2 bg-transparent">
+                                                <div class="d-flex align-items-center gap-2 flex-grow-1" style="cursor:pointer; min-width: 0;" @click="n.expanded = !n.expanded">
+                                                    <i class="bi text-muted" :class="n.expanded ? 'bi-chevron-down' : 'bi-chevron-right'"></i>
+                                                    <div class="form-check form-switch" @click.stop>
+                                                        <input class="form-check-input" type="checkbox" v-model="n.enabled" style="width: 2em; height: 1em;">
                                                     </div>
-                                                    <button class="btn btn-sm btn-outline-danger py-0 px-2" @click="delNode(i)"><i class="bi bi-trash"></i></button>
+                                                    <span class="fw-bold text-truncate" :title="n.name">[[ n.name ]]</span>
+                                                    <span class="badge small" :class="n.enabled!==false?'bg-success':'bg-secondary'">[[ n.enabled!==false?'ON':'OFF' ]]</span>
                                                 </div>
+                                                <div class="d-flex gap-1 flex-shrink-0">
+                                                    <button class="btn btn-sm btn-outline-primary py-0 px-2" @click.stop="save" title="保存配置"><i class="bi bi-save"></i></button>
+                                                    <button class="btn btn-sm btn-outline-danger py-0 px-2" @click.stop="delNode(i)" title="删除节点"><i class="bi bi-trash"></i></button>
+                                                </div>
+                                            </div>
+                                            <div class="card-body" v-show="n.expanded">
                                                 <div class="row g-2">
                                                     <div class="col-12">
                                                         <label class="small text-muted">备注名称</label>
@@ -1548,7 +1552,7 @@ EOF
                                                     </div>
                                                     <div class="col-12">
                                                         <label class="small text-muted">Password</label>
-                                                        <input v-model="n.password" type="password" class="form-control form-control-sm">
+                                                        <input v-model="n.password" type="text" class="form-control form-control-sm">
                                                     </div>
                                                     <div class="col-12"><hr class="my-2"></div>
                                                     <div class="col-4">
@@ -1661,6 +1665,7 @@ EOF
                 this.config.downstream_pool.forEach(n => { 
                     if(n.enabled === undefined) n.enabled = true; 
                     if(n.allow_bulk === undefined) n.allow_bulk = true;
+                    if(n.expanded === undefined) n.expanded = false;
                 });
                 
                 // Auto-load draft
@@ -1874,7 +1879,7 @@ EOF
                     n.routing_rules = rules.join(',');
                 },
                 addNode() { 
-                    this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true, allow_bulk: true, routing_rules: '' }); 
+                    this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true, allow_bulk: true, routing_rules: '', expanded: true }); 
                 },
                 delNode(i) { if(confirm('删除此节点?')) this.config.downstream_pool.splice(i, 1); },
                 async save() {
