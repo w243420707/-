@@ -549,10 +549,11 @@ def api_domain_stats():
     top9 = sorted_domains[:9]
     result = [{'domain': d, 'count': c} for d, c in top9]
     
-    # Calculate "other" count (all remaining domains)
+    # Calculate "other" - include all remaining domains as a list
     if len(sorted_domains) > 9:
+        other_domains = [d for d, c in sorted_domains[9:]]
         other_count = sum(c for d, c in sorted_domains[9:])
-        result.append({'domain': '__other__', 'count': other_count})
+        result.append({'domain': '__other__', 'count': other_count, 'domains': other_domains})
     
     return jsonify(result)
 
@@ -1588,7 +1589,7 @@ EOF
                                                             <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-primary':'btn-outline-secondary'" @click="n.routing_rules=''">通用</button>
                                                             <template v-for="d in topDomains" :key="d.domain">
                                                                 <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)">[[ formatDomainLabel(d.domain) ]]</button>
-                                                                <span v-else class="btn btn-sm py-0 px-1 btn-outline-secondary" style="font-size: 0.7rem; cursor: default;" :title="d.count + '封'"><i class="bi bi-three-dots"></i></span>
+                                                                <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasAllOtherDomains(n, d.domains)?'btn-success':'btn-outline-secondary'" @click="toggleOtherDomains(n, d.domains)" :title="d.count + '封 (' + (d.domains||[]).length + '个域名)'"><i class="bi bi-three-dots"></i></button>
                                                             </template>
                                                         </div>
                                                     </div>
@@ -1653,7 +1654,7 @@ EOF
                                                             <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-primary':'btn-outline-secondary'" @click="n.routing_rules=''">通用</button>
                                                             <template v-for="d in topDomains" :key="d.domain">
                                                                 <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)" :title="d.count + '封'">[[ formatDomainLabel(d.domain) ]]</button>
-                                                                <span v-else class="btn btn-sm py-0 px-1 btn-outline-secondary" style="font-size: 0.7rem; cursor: default;" :title="d.count + '封'"><i class="bi bi-three-dots"></i> 其他</span>
+                                                                <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasAllOtherDomains(n, d.domains)?'btn-success':'btn-outline-secondary'" @click="toggleOtherDomains(n, d.domains)" :title="d.count + '封 (' + (d.domains||[]).length + '个域名)'"><i class="bi bi-three-dots"></i> 其他</button>
                                                             </template>
                                                             <span v-if="topDomains.length === 0" class="text-muted small">暂无数据</span>
                                                         </div>
@@ -1980,6 +1981,27 @@ EOF
                         rules.push(d);
                     }
                     n.routing_rules = rules.join(',');
+                },
+                toggleOtherDomains(n, domains) {
+                    if(!domains || domains.length === 0) return;
+                    let rules = n.routing_rules ? n.routing_rules.split(',').map(x=>x.trim()).filter(x=>x) : [];
+                    // Check if all other domains are already selected
+                    const allSelected = domains.every(d => rules.includes(d));
+                    if(allSelected) {
+                        // Remove all other domains
+                        rules = rules.filter(x => !domains.includes(x));
+                    } else {
+                        // Add all other domains
+                        domains.forEach(d => {
+                            if(!rules.includes(d)) rules.push(d);
+                        });
+                    }
+                    n.routing_rules = rules.join(',');
+                },
+                hasAllOtherDomains(n, domains) {
+                    if(!domains || domains.length === 0 || !n.routing_rules) return false;
+                    const rules = n.routing_rules.split(',').map(x=>x.trim());
+                    return domains.every(d => rules.includes(d));
                 },
                 addNode() { 
                     this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true, allow_bulk: true, routing_rules: '', expanded: true }); 
