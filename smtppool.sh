@@ -1534,8 +1534,17 @@ EOF
                                 </button>
 
                                 <textarea v-model="bulk.recipients" class="form-control flex-grow-1 mb-3" placeholder="每行一个邮箱地址..." style="min-height: 200px;"></textarea>
-                                <div class="d-flex justify-content-between align-items-center mb-3">
+                                <div class="d-flex justify-content-between align-items-center mb-2">
                                     <span class="fw-bold">当前输入: [[ recipientCount ]] 人</span>
+                                    <div class="btn-group btn-group-sm">
+                                        <button class="btn btn-outline-secondary" @click="shuffleRecipients" title="打乱顺序"><i class="bi bi-shuffle"></i></button>
+                                        <button class="btn btn-outline-secondary" @click="downloadRecipients" title="下载全部"><i class="bi bi-download"></i></button>
+                                    </div>
+                                </div>
+                                <div class="d-flex flex-wrap gap-1 mb-3" v-if="recipientDomainStats.length > 0">
+                                    <span class="badge bg-light text-dark border" v-for="ds in recipientDomainStats" :key="ds.domain" style="cursor: pointer;" @click="removeDomainFromRecipients(ds.domain)" :title="'点击清除所有 ' + ds.domain + ' 邮箱'">
+                                        [[ ds.domain ]] <span class="text-muted">([[ ds.count ]])</span> <i class="bi bi-x-circle text-danger ms-1"></i>
+                                    </span>
                                 </div>
                                 <button class="btn btn-primary w-100 py-3 fw-bold" @click="sendBulk" :disabled="sending || recipientCount === 0">
                                     <span v-if="sending" class="spinner-border spinner-border-sm me-2"></span>
@@ -1838,6 +1847,22 @@ EOF
                     return (((this.qStats.total.opened || 0) / s) * 100).toFixed(2) + '%';
                 },
                 recipientCount() { return this.bulk.recipients ? this.bulk.recipients.split('\n').filter(r => r.trim()).length : 0; },
+                recipientDomainStats() {
+                    if (!this.bulk.recipients) return [];
+                    const emails = this.bulk.recipients.split('\n').filter(r => r.trim());
+                    const domainCounts = {};
+                    emails.forEach(e => {
+                        const parts = e.trim().split('@');
+                        if (parts.length === 2) {
+                            const domain = parts[1].toLowerCase();
+                            domainCounts[domain] = (domainCounts[domain] || 0) + 1;
+                        }
+                    });
+                    return Object.entries(domainCounts)
+                        .map(([domain, count]) => ({ domain, count }))
+                        .sort((a, b) => b.count - a.count)
+                        .slice(0, 15);
+                },
                 batchSelectedCount() {
                     return this.config.downstream_pool.filter(n => n.batchSelected).length;
                 },
@@ -2102,6 +2127,38 @@ EOF
                         this.fetchContactCount();
                         alert('已清空');
                     } catch(e) { alert('失败: ' + e); }
+                },
+                shuffleRecipients() {
+                    if (!this.bulk.recipients) return;
+                    let emails = this.bulk.recipients.split('\n').filter(r => r.trim());
+                    // Fisher-Yates shuffle
+                    for (let i = emails.length - 1; i > 0; i--) {
+                        const j = Math.floor(Math.random() * (i + 1));
+                        [emails[i], emails[j]] = [emails[j], emails[i]];
+                    }
+                    this.bulk.recipients = emails.join('\n');
+                },
+                removeDomainFromRecipients(domain) {
+                    if (!confirm(`确定清除所有 @${domain} 的邮箱吗？`)) return;
+                    if (!this.bulk.recipients) return;
+                    let emails = this.bulk.recipients.split('\n').filter(r => r.trim());
+                    const before = emails.length;
+                    emails = emails.filter(e => !e.trim().toLowerCase().endsWith('@' + domain.toLowerCase()));
+                    this.bulk.recipients = emails.join('\n');
+                    alert(`已清除 ${before - emails.length} 个 @${domain} 邮箱`);
+                },
+                downloadRecipients() {
+                    if (!this.bulk.recipients) { alert('没有收件人可下载'); return; }
+                    const emails = this.bulk.recipients.split('\n').filter(r => r.trim());
+                    const blob = new Blob([emails.join('\n')], { type: 'text/plain' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'recipients_' + new Date().toISOString().slice(0, 10) + '.txt';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
                 },
                 hasDomain(n, d) {
                     if(!n.routing_rules) return false;
