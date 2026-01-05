@@ -1533,6 +1533,7 @@ EOF
                                                 <div class="d-flex gap-1 flex-shrink-0">
                                                     <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click.stop="moveNode(i, -1)" :disabled="i === 0" title="上移"><i class="bi bi-arrow-up"></i></button>
                                                     <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click.stop="moveNode(i, 1)" :disabled="i === config.downstream_pool.length - 1" title="下移"><i class="bi bi-arrow-down"></i></button>
+                                                    <button class="btn btn-sm btn-outline-success py-0 px-2" @click.stop="copyNode(i)" title="复制节点"><i class="bi bi-copy"></i></button>
                                                     <button class="btn btn-sm btn-outline-primary py-0 px-2" @click.stop="save" title="保存配置"><i class="bi bi-save"></i></button>
                                                     <button class="btn btn-sm btn-outline-danger py-0 px-2" @click.stop="delNode(i)" title="删除节点"><i class="bi bi-trash"></i></button>
                                                 </div>
@@ -1901,6 +1902,13 @@ EOF
                     this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true, allow_bulk: true, routing_rules: '', expanded: true }); 
                 },
                 delNode(i) { if(confirm('删除此节点?')) this.config.downstream_pool.splice(i, 1); },
+                copyNode(i) {
+                    const original = this.config.downstream_pool[i];
+                    const copy = JSON.parse(JSON.stringify(original));
+                    copy.name = original.name + '-Copy';
+                    copy.expanded = true;
+                    this.config.downstream_pool.splice(i + 1, 0, copy);
+                },
                 moveNode(i, direction) {
                     const newIndex = i + direction;
                     if (newIndex < 0 || newIndex >= this.config.downstream_pool.length) return;
