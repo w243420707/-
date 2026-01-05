@@ -1503,82 +1503,83 @@ EOF
                                 <div v-if="config.downstream_pool.length === 0" class="text-center py-5 text-muted">
                                     暂无节点，请点击右上角添加
                                 </div>
-                                <div v-for="(n, i) in config.downstream_pool" :key="i" class="card mb-3 shadow-sm">
-                                    <div class="card-body">
-                                        <div class="d-flex justify-content-between align-items-center mb-3">
-                                            <div class="d-flex align-items-center gap-3">
-                                                <div class="form-check form-switch">
-                                                    <input class="form-check-input" type="checkbox" v-model="n.enabled" style="width: 3em; height: 1.5em;">
+                                <div class="row g-3">
+                                    <div v-for="(n, i) in config.downstream_pool" :key="i" class="col-md-6 col-xl-4">
+                                        <div class="card h-100 shadow-sm">
+                                            <div class="card-body">
+                                                <div class="d-flex justify-content-between align-items-center mb-3">
+                                                    <div class="d-flex align-items-center gap-2">
+                                                        <div class="form-check form-switch">
+                                                            <input class="form-check-input" type="checkbox" v-model="n.enabled" style="width: 2.5em; height: 1.25em;">
+                                                        </div>
+                                                        <span class="fw-bold text-truncate" style="max-width: 120px;" :title="n.name">[[ n.name ]]</span>
+                                                        <span class="badge" :class="n.enabled!==false?'bg-success':'bg-secondary'">[[ n.enabled!==false?'启用':'禁用' ]]</span>
+                                                    </div>
+                                                    <button class="btn btn-sm btn-outline-danger py-0 px-2" @click="delNode(i)"><i class="bi bi-trash"></i></button>
                                                 </div>
-                                                <span class="fw-bold fs-5">[[ n.name ]]</span>
-                                                <span class="badge" :class="n.enabled!==false?'bg-success':'bg-secondary'">[[ n.enabled!==false?'启用':'禁用' ]]</span>
-                                            </div>
-                                            <button class="btn btn-sm btn-outline-danger" @click="delNode(i)"><i class="bi bi-trash"></i></button>
-                                        </div>
-                                        <div class="row g-3">
-                                            <div class="col-md-3">
-                                                <label class="small text-muted">备注名称</label>
-                                                <input v-model="n.name" class="form-control" placeholder="备注">
-                                            </div>
-                                            <div class="col-md-3">
-                                                <label class="small text-muted">Host</label>
-                                                <input v-model="n.host" class="form-control" placeholder="smtp.example.com">
-                                            </div>
-                                            <div class="col-md-2">
-                                                <label class="small text-muted">Port</label>
-                                                <input v-model.number="n.port" class="form-control" placeholder="587">
-                                            </div>
-                                            <div class="col-md-2">
-                                                <label class="small text-muted">加密</label>
-                                                <select v-model="n.encryption" class="form-select">
-                                                    <option value="none">None</option>
-                                                    <option value="tls">TLS</option>
-                                                    <option value="ssl">SSL</option>
-                                                </select>
-                                            </div>
-                                            <div class="col-md-2">
-                                                <label class="small text-muted">Sender Rewrite</label>
-                                                <input v-model="n.sender_email" class="form-control" placeholder="可选">
-                                            </div>
-                                            <div class="col-md-6">
-                                                <label class="small text-muted">Username</label>
-                                                <input v-model="n.username" class="form-control">
-                                            </div>
-                                            <div class="col-md-6">
-                                                <label class="small text-muted">Password</label>
-                                                <input v-model="n.password" type="password" class="form-control">
-                                            </div>
-                                            <div class="col-12"><hr class="my-2"></div>
-                                            <div class="col-md-4">
-                                                <label class="small text-muted">Max/Hour (0=No Limit)</label>
-                                                <input v-model.number="n.max_per_hour" type="number" class="form-control" placeholder="Default">
-                                            </div>
-                                            <div class="col-md-4">
-                                                <label class="small text-muted">Min Interval (s)</label>
-                                                <input v-model.number="n.min_interval" type="number" class="form-control" placeholder="Default">
-                                            </div>
-                                            <div class="col-md-4">
-                                                <label class="small text-muted">Max Interval (s)</label>
-                                                <input v-model.number="n.max_interval" type="number" class="form-control" placeholder="Default">
-                                            </div>
-                                            <div class="col-12">
-                                                <div class="form-check form-switch my-2">
-                                                    <input class="form-check-input" type="checkbox" v-model="n.allow_bulk" :id="'allowBulk'+i">
-                                                    <label class="form-check-label" :for="'allowBulk'+i">允许用于群发任务 (Allow Bulk)</label>
+                                                <div class="row g-2">
+                                                    <div class="col-12">
+                                                        <label class="small text-muted">备注名称</label>
+                                                        <input v-model="n.name" class="form-control form-control-sm" placeholder="备注">
+                                                    </div>
+                                                    <div class="col-8">
+                                                        <label class="small text-muted">Host</label>
+                                                        <input v-model="n.host" class="form-control form-control-sm" placeholder="smtp.example.com">
+                                                    </div>
+                                                    <div class="col-4">
+                                                        <label class="small text-muted">Port</label>
+                                                        <input v-model.number="n.port" class="form-control form-control-sm" placeholder="587">
+                                                    </div>
+                                                    <div class="col-6">
+                                                        <label class="small text-muted">加密</label>
+                                                        <select v-model="n.encryption" class="form-select form-select-sm">
+                                                            <option value="none">None</option>
+                                                            <option value="tls">TLS</option>
+                                                            <option value="ssl">SSL</option>
+                                                        </select>
+                                                    </div>
+                                                    <div class="col-6">
+                                                        <label class="small text-muted">Sender Rewrite</label>
+                                                        <input v-model="n.sender_email" class="form-control form-control-sm" placeholder="可选">
+                                                    </div>
+                                                    <div class="col-12">
+                                                        <label class="small text-muted">Username</label>
+                                                        <input v-model="n.username" class="form-control form-control-sm">
+                                                    </div>
+                                                    <div class="col-12">
+                                                        <label class="small text-muted">Password</label>
+                                                        <input v-model="n.password" type="password" class="form-control form-control-sm">
+                                                    </div>
+                                                    <div class="col-12"><hr class="my-2"></div>
+                                                    <div class="col-4">
+                                                        <label class="small text-muted">Max/Hr</label>
+                                                        <input v-model.number="n.max_per_hour" type="number" class="form-control form-control-sm" placeholder="0">
+                                                    </div>
+                                                    <div class="col-4">
+                                                        <label class="small text-muted">Min(s)</label>
+                                                        <input v-model.number="n.min_interval" type="number" class="form-control form-control-sm" placeholder="1">
+                                                    </div>
+                                                    <div class="col-4">
+                                                        <label class="small text-muted">Max(s)</label>
+                                                        <input v-model.number="n.max_interval" type="number" class="form-control form-control-sm" placeholder="5">
+                                                    </div>
+                                                    <div class="col-12">
+                                                        <div class="form-check form-switch my-1">
+                                                            <input class="form-check-input" type="checkbox" v-model="n.allow_bulk" :id="'allowBulk'+i">
+                                                            <label class="form-check-label small" :for="'allowBulk'+i">允许群发 (Allow Bulk)</label>
+                                                        </div>
+                                                    </div>
+                                                    <div class="col-12">
+                                                        <label class="small text-muted">分流规则</label>
+                                                        <div class="d-flex flex-wrap gap-1 mb-1">
+                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-primary':'btn-outline-secondary'" @click="n.routing_rules=''">通用</button>
+                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, 'qq.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, 'qq.com')">QQ</button>
+                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, 'gmail.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, 'gmail.com')">Gmail</button>
+                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, '163.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, '163.com')">163</button>
+                                                        </div>
+                                                        <input v-model="n.routing_rules" class="form-control form-control-sm" placeholder="域名...">
+                                                    </div>
                                                 </div>
-                                                <div class="form-text mb-2" v-if="n.allow_bulk===false">⚠️ 此节点仅处理中转邮件 (Relay)，不会分配群发任务。</div>
-                                            </div>
-                                            <div class="col-12">
-                                                <label class="small text-muted">分流规则 (点击选择)</label>
-                                                <div class="d-flex flex-wrap gap-2 mb-2">
-                                                    <button class="btn btn-sm" :class="(!n.routing_rules)?'btn-primary':'btn-outline-secondary'" @click="n.routing_rules=''">通用 (其他)</button>
-                                                    <button class="btn btn-sm" :class="hasDomain(n, 'qq.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, 'qq.com')">QQ.com</button>
-                                                    <button class="btn btn-sm" :class="hasDomain(n, 'gmail.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, 'gmail.com')">Gmail.com</button>
-                                                    <button class="btn btn-sm" :class="hasDomain(n, '163.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, '163.com')">163.com</button>
-                                                    <button class="btn btn-sm" :class="hasDomain(n, '126.com')?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, '126.com')">126.com</button>
-                                                </div>
-                                                <input v-model="n.routing_rules" class="form-control form-control-sm" placeholder="自定义域名 (逗号分隔)...">
-                                                <div class="form-text" style="font-size: 0.75rem;">[[ (!n.routing_rules) ? '当前为通用节点，处理所有未匹配的邮件。' : '当前为专用节点，仅处理上述域名的邮件。' ]]</div>
                                             </div>
                                         </div>
                                     </div>
