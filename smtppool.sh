@@ -529,7 +529,7 @@ def api_queue_list():
 @app.route('/api/domain/stats')
 @login_required
 def api_domain_stats():
-    """Get top 9 recipient domains by count"""
+    """Get all recipient domains by count, sorted descending"""
     with get_db() as conn:
         rows = conn.execute("SELECT rcpt_tos FROM queue").fetchall()
     
@@ -544,16 +544,9 @@ def api_domain_stats():
                         domain_count[domain] = domain_count.get(domain, 0) + 1
         except: pass
     
-    # Sort by count descending, take top 9
-    sorted_domains = sorted(domain_count.items(), key=lambda x: x[1], reverse=True)[:9]
+    # Sort by count descending, return all domains
+    sorted_domains = sorted(domain_count.items(), key=lambda x: x[1], reverse=True)
     result = [{'domain': d, 'count': c} for d, c in sorted_domains]
-    
-    # Calculate "other" count
-    top_total = sum(c for d, c in sorted_domains)
-    all_total = sum(domain_count.values())
-    other_count = all_total - top_total
-    if other_count > 0:
-        result.append({'domain': '__other__', 'count': other_count})
     
     return jsonify(result)
 
