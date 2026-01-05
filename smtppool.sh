@@ -984,6 +984,48 @@ def api_contacts_clear():
         conn.execute("DELETE FROM contacts")
     return jsonify({"status": "ok"})
 
+@app.route('/api/contacts/shuffle', methods=['POST'])
+@login_required
+def api_contacts_shuffle():
+    """Shuffle all contacts and re-insert them in random order"""
+    with get_db() as conn:
+        rows = conn.execute("SELECT email FROM contacts").fetchall()
+        if not rows:
+            return jsonify({"status": "ok", "count": 0})
+        emails = [r['email'] for r in rows]
+        random.shuffle(emails)
+        conn.execute("DELETE FROM contacts")
+        for e in emails:
+            conn.execute("INSERT INTO contacts (email, created_at) VALUES (?, datetime('now', '+08:00'))", (e,))
+    return jsonify({"status": "ok", "count": len(emails)})
+
+@app.route('/api/contacts/download')
+@login_required
+def api_contacts_download():
+    """Download all contacts as a text file"""
+    with get_db() as conn:
+        rows = conn.execute("SELECT email FROM contacts ORDER BY id").fetchall()
+    content = '\n'.join([r['email'] for r in rows])
+    from flask import Response
+    return Response(
+        content,
+        mimetype='text/plain',
+        headers={'Content-Disposition': 'attachment; filename=contacts_' + datetime.now().strftime('%Y%m%d_%H%M%S') + '.txt'}
+    )
+
+@app.route('/api/contacts/remove', methods=['POST'])
+@login_required
+def api_contacts_remove():
+    """Remove a specific email from contacts"""
+    email = request.json.get('email', '').strip().lower()
+    if not email:
+        return jsonify({"error": "No email provided"}), 400
+    with get_db() as conn:
+        # SQLite LOWER() for case-insensitive match
+        result = conn.execute("DELETE FROM contacts WHERE LOWER(email) = ?", (email,))
+        deleted = result.rowcount
+    return jsonify({"status": "ok", "deleted": deleted})
+
 @app.route('/api/draft', methods=['GET', 'POST'])
 @login_required
 def api_draft():
@@ -1536,15 +1578,23 @@ EOF
                                 <textarea v-model="bulk.recipients" class="form-control flex-grow-1 mb-3" placeholder="每行一个邮箱地址..." style="min-height: 200px;"></textarea>
                                 <div class="d-flex justify-content-between align-items-center mb-2">
                                     <span class="fw-bold">当前输入: [[ recipientCount ]] 人</span>
-                                    <div class="btn-group btn-group-sm">
-                                        <button class="btn btn-outline-secondary" @click="shuffleRecipients" title="打乱顺序"><i class="bi bi-shuffle"></i></button>
-                                        <button class="btn btn-outline-secondary" @click="downloadRecipients" title="下载全部"><i class="bi bi-download"></i></button>
+                                    <div class="btn-group btn-group-sm" v-if="contactCount > 0">
+                                        <button class="btn btn-outline-secondary" @click="shuffleAllContacts" :disabled="shufflingContacts" :title="'打乱通讯录 (' + contactCount + ' 人)'">
+                                            <i class="bi" :class="shufflingContacts ? 'bi-hourglass-split' : 'bi-shuffle'"></i>
+                                        </button>
+                                        <button class="btn btn-outline-secondary" @click="downloadAllContacts" :title="'下载通讯录 (' + contactCount + ' 人)'">
+                                            <i class="bi bi-download"></i>
+                                        </button>
                                     </div>
                                 </div>
                                 <div class="d-flex flex-wrap gap-1 mb-3" v-if="recipientDomainStats.length > 0">
                                     <span class="badge bg-light text-dark border" v-for="ds in recipientDomainStats" :key="ds.domain" style="cursor: pointer;" @click="removeDomainFromRecipients(ds.domain)" :title="'点击清除所有 ' + ds.domain + ' 邮箱'">
                                         [[ ds.domain ]] <span class="text-muted">([[ ds.count ]])</span> <i class="bi bi-x-circle text-danger ms-1"></i>
                                     </span>
+                                </div>
+                                <div class="input-group input-group-sm mb-3">
+                                    <input type="text" v-model="removeEmail" class="form-control" placeholder="输入要清除的邮箱地址..." @keyup.enter="removeSpecificEmail">
+                                    <button class="btn btn-outline-danger" @click="removeSpecificEmail" :disabled="!removeEmail"><i class="bi bi-trash"></i> 清除</button>
                                 </div>
                                 <button class="btn btn-primary w-100 py-3 fw-bold" @click="sendBulk" :disabled="sending || recipientCount === 0">
                                     <span v-if="sending" class="spinner-border spinner-border-sm me-2"></span>
@@ -1830,7 +1880,9 @@ EOF
                     dragOverIndex: null,
                     topDomains: [],
                     showBatchEdit: false,
-                    batchEdit: { max_per_hour: null, min_interval: null, max_interval: null, routing_rules: '' }
+                    batchEdit: { max_per_hour: null, min_interval: null, max_interval: null, routing_rules: '' },
+                    shufflingContacts: false,
+                    removeEmail: ''
                 }
             },
             computed: {
@@ -2128,6 +2180,20 @@ EOF
                         alert('已清空');
                     } catch(e) { alert('失败: ' + e); }
                 },
+                async shuffleAllContacts() {
+                    if(!confirm(`确定打乱通讯录中的 ${this.contactCount} 个邮箱？\n打乱后分组顺序会重新排列。`)) return;
+                    this.shufflingContacts = true;
+                    try {
+                        const res = await fetch('/api/contacts/shuffle', { method: 'POST' });
+                        const data = await res.json();
+                        alert(`已打乱 ${data.count} 个邮箱`);
+                    } catch(e) { alert('失败: ' + e); }
+                    this.shufflingContacts = false;
+                },
+                downloadAllContacts() {
+                    if(this.contactCount === 0) { alert('通讯录为空'); return; }
+                    window.location.href = '/api/contacts/download';
+                },
                 shuffleRecipients() {
                     if (!this.bulk.recipients) return;
                     let emails = this.bulk.recipients.split('\n').filter(r => r.trim());
@@ -2146,6 +2212,32 @@ EOF
                     emails = emails.filter(e => !e.trim().toLowerCase().endsWith('@' + domain.toLowerCase()));
                     this.bulk.recipients = emails.join('\n');
                     alert(`已清除 ${before - emails.length} 个 @${domain} 邮箱`);
+                },
+                async removeSpecificEmail() {
+                    if (!this.removeEmail || !this.removeEmail.trim()) return;
+                    const target = this.removeEmail.trim();
+                    if (!confirm(`确定从通讯录中删除 ${target} 吗？`)) return;
+                    try {
+                        const res = await fetch('/api/contacts/remove', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ email: target })
+                        });
+                        const data = await res.json();
+                        if (data.deleted > 0) {
+                            alert(`已从通讯录中删除 ${target}`);
+                            this.removeEmail = '';
+                            this.fetchContactCount();
+                            // Also remove from current input if present
+                            if (this.bulk.recipients) {
+                                let emails = this.bulk.recipients.split('\n').filter(r => r.trim());
+                                emails = emails.filter(e => e.trim().toLowerCase() !== target.toLowerCase());
+                                this.bulk.recipients = emails.join('\n');
+                            }
+                        } else {
+                            alert(`通讯录中未找到 ${target}`);
+                        }
+                    } catch(e) { alert('失败: ' + e); }
                 },
                 downloadRecipients() {
                     if (!this.bulk.recipients) { alert('没有收件人可下载'); return; }
