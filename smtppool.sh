@@ -304,6 +304,19 @@ def worker_thread():
                             conn.execute("UPDATE queue SET status='failed', last_error='No active nodes available' WHERE id=?", (row_id,))
                     continue
 
+                # Re-route bulk mails if node's allow_bulk is disabled
+                if is_bulk and not node.get('allow_bulk', True):
+                    bulk_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True) and n.get('allow_bulk', True)]
+                    if bulk_nodes:
+                        new_node = random.choice(bulk_nodes)
+                        logger.info(f"🔄 Re-routing bulk ID:{row_id} from '{node_name}' (allow_bulk=False) to '{new_node['name']}'")
+                        with get_db() as conn:
+                            conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
+                    else:
+                        with get_db() as conn:
+                            conn.execute("UPDATE queue SET status='failed', last_error='No bulk-enabled nodes available' WHERE id=?", (row_id,))
+                    continue
+
                 # --- Rate Limiting Checks (BULK ONLY) ---
                 if is_bulk:
                     # A. Interval Check
