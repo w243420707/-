@@ -1509,11 +1509,13 @@ EOF
                                             <div class="card-header d-flex justify-content-between align-items-center py-2 bg-transparent">
                                                 <div class="d-flex align-items-center gap-2 flex-grow-1" style="cursor:pointer; min-width: 0;" @click="n.expanded = !n.expanded">
                                                     <i class="bi text-muted" :class="n.expanded ? 'bi-chevron-down' : 'bi-chevron-right'"></i>
-                                                    <div class="form-check form-switch" @click.stop>
+                                                    <div class="form-check form-switch" @click.stop title="启用/禁用节点">
                                                         <input class="form-check-input" type="checkbox" v-model="n.enabled" style="width: 2em; height: 1em;">
                                                     </div>
+                                                    <div class="form-check form-switch" @click.stop title="允许群发 (Bulk)">
+                                                        <input class="form-check-input" :class="n.allow_bulk ? 'bg-warning border-warning' : ''" type="checkbox" v-model="n.allow_bulk" style="width: 2em; height: 1em;">
+                                                    </div>
                                                     <span class="fw-bold text-truncate" :title="n.name">[[ n.name ]]</span>
-                                                    <span class="badge small" :class="n.enabled!==false?'bg-success':'bg-secondary'">[[ n.enabled!==false?'ON':'OFF' ]]</span>
                                                 </div>
                                                 <div class="d-flex gap-1 flex-shrink-0">
                                                     <button class="btn btn-sm btn-outline-primary py-0 px-2" @click.stop="save" title="保存配置"><i class="bi bi-save"></i></button>
