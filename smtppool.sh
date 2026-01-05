@@ -983,11 +983,15 @@ def rebalance_queue_internal():
     pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
     if not pool: return 0
     
+    # Build lookup for quick access
+    pool_by_name = {n['name']: n for n in pool}
+    bulk_pool = [n for n in pool if n.get('allow_bulk', True)]
+    
     count = 0
     limit_cfg = cfg.get('limit_config', {})
     
     with get_db() as conn:
-        cursor = conn.execute("SELECT id, rcpt_tos, source FROM queue WHERE status='pending'")
+        cursor = conn.execute("SELECT id, rcpt_tos, source, assigned_node FROM queue WHERE status='pending'")
         rows = cursor.fetchall()
         if not rows: return 0
         
@@ -998,9 +1002,23 @@ def rebalance_queue_internal():
                 rcpt = rcpts[0] if rcpts else ''
             except: rcpt = ''
             
-            node = select_node_for_recipient(pool, rcpt, limit_cfg, source=r['source'])
-            if node:
-                updates.append((node['name'], r['id']))
+            source = r['source']
+            current_node = pool_by_name.get(r['assigned_node'])
+            
+            # Check if current assignment is invalid
+            needs_reassign = False
+            if not current_node:
+                needs_reassign = True
+            elif source == 'bulk' and not current_node.get('allow_bulk', True):
+                # Bulk mail on a node that disabled allow_bulk
+                needs_reassign = True
+            
+            if needs_reassign:
+                # For bulk, only use bulk-enabled nodes
+                target_pool = bulk_pool if source == 'bulk' else pool
+                node = select_node_for_recipient(target_pool, rcpt, limit_cfg, source=source)
+                if node:
+                    updates.append((node['name'], r['id']))
         
         if updates:
             conn.executemany("UPDATE queue SET assigned_node=? WHERE id=?", updates)
