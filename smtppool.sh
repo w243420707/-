@@ -1569,6 +1569,31 @@ EOF
                                                     <button class="btn btn-sm btn-outline-danger py-0 px-2" @click.stop="delNode(i)" title="删除节点"><i class="bi bi-trash"></i></button>
                                                 </div>
                                             </div>
+                                            <!-- Collapsed quick edit -->
+                                            <div class="card-body py-2 px-3 border-top" v-show="!n.expanded" style="background: var(--hover-bg);">
+                                                <div class="row g-2">
+                                                    <div class="col-12">
+                                                        <div class="d-flex align-items-center gap-2">
+                                                            <span class="text-muted small"><i class="bi bi-speedometer2"></i></span>
+                                                            <input v-model.number="n.max_per_hour" type="number" class="form-control form-control-sm" style="width: 70px;" placeholder="0" title="Max/Hr">
+                                                            <span class="text-muted small">/h</span>
+                                                            <input v-model.number="n.min_interval" type="number" class="form-control form-control-sm" style="width: 50px;" placeholder="1" title="Min(s)">
+                                                            <span class="text-muted small">~</span>
+                                                            <input v-model.number="n.max_interval" type="number" class="form-control form-control-sm" style="width: 50px;" placeholder="5" title="Max(s)">
+                                                            <span class="text-muted small">s</span>
+                                                        </div>
+                                                    </div>
+                                                    <div class="col-12">
+                                                        <div class="d-flex align-items-center gap-1">
+                                                            <span class="text-muted small me-1"><i class="bi bi-signpost-split"></i></span>
+                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-primary':'btn-outline-secondary'" @click="n.routing_rules=''">通用</button>
+                                                            <template v-for="d in topDomains.slice(0,6)" :key="d.domain">
+                                                                <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)">[[ formatDomainLabel(d.domain) ]]</button>
+                                                            </template>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
                                             <div class="card-body" v-show="n.expanded">
                                                 <div class="row g-2">
                                                     <div class="col-12">
