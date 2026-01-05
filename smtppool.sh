@@ -1748,9 +1748,12 @@ EOF
                     const speed = this.getNodeSpeed(name);
                     const seconds = pending / speed;
                     const finish = new Date(Date.now() + seconds * 1000);
+                    const y = finish.getFullYear();
+                    const mo = (finish.getMonth() + 1).toString().padStart(2, '0');
+                    const da = finish.getDate().toString().padStart(2, '0');
                     const h = finish.getHours().toString().padStart(2, '0');
                     const m = finish.getMinutes().toString().padStart(2, '0');
-                    return `${h}:${m}`;
+                    return `${y}-${mo}-${da} ${h}:${m}`;
                 },
                 getNodeSpeed(name) {
                     const node = this.config.downstream_pool.find(n => n.name === name);
