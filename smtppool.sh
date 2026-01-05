@@ -1584,11 +1584,12 @@ EOF
                                                         </div>
                                                     </div>
                                                     <div class="col-12">
-                                                        <div class="d-flex align-items-center gap-1">
+                                                        <div class="d-flex align-items-center gap-1 flex-wrap">
                                                             <span class="text-muted small me-1"><i class="bi bi-signpost-split"></i></span>
                                                             <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-primary':'btn-outline-secondary'" @click="n.routing_rules=''">通用</button>
-                                                            <template v-for="d in topDomains.slice(0,6)" :key="d.domain">
+                                                            <template v-for="d in topDomains" :key="d.domain">
                                                                 <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)">[[ formatDomainLabel(d.domain) ]]</button>
+                                                                <span v-else class="btn btn-sm py-0 px-1 btn-outline-secondary" style="font-size: 0.7rem; cursor: default;" :title="d.count + '封'"><i class="bi bi-three-dots"></i></span>
                                                             </template>
                                                         </div>
                                                     </div>
