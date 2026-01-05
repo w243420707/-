@@ -88,7 +88,7 @@ LOG_FILE = '/var/log/smtp-relay/app.log'
 
 # --- Database ---
 def get_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -132,6 +132,8 @@ def init_db():
             conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON queue (status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_node_status ON queue (assigned_node, status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON queue (created_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_source ON queue (source)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_tracking ON queue (tracking_id)")
         except: pass
 
         conn.execute('''CREATE TABLE IF NOT EXISTS contacts (
@@ -230,29 +232,42 @@ def worker_thread():
     node_next_send_time = {}  # { 'node_name': timestamp }
     node_hourly_counts = {}   # { 'node_name': { 'hour': 10, 'count': 50 } }
     last_cleanup_time = 0
+    last_stuck_check_time = 0
 
     while True:
         try:
             cfg = load_config()
+            now = time.time()
+            
+            # --- Reset stuck 'processing' items (every 2 minutes) ---
+            if now - last_stuck_check_time > 120:
+                try:
+                    with get_db() as conn:
+                        stuck = conn.execute("UPDATE queue SET status='pending' WHERE status='processing' AND updated_at < datetime('now', '+08:00', '-5 minutes')").rowcount
+                        if stuck > 0:
+                            logger.info(f"🔄 Reset {stuck} stuck 'processing' items to 'pending'")
+                except Exception as e:
+                    logger.error(f"Stuck check failed: {e}")
+                last_stuck_check_time = now
             
             # --- Auto Cleanup (Once per hour) ---
-            if time.time() - last_cleanup_time > 3600:
+            if now - last_cleanup_time > 3600:
                 try:
                     days = int(cfg.get('log_config', {}).get('retention_days', 7))
                     if days > 0:
+                        # Calculate cutoff date in Python to avoid SQL injection
+                        cutoff = (datetime.utcnow() + timedelta(hours=8) - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
                         with get_db() as conn:
-                            conn.execute(f"DELETE FROM queue WHERE status IN ('sent', 'failed') AND updated_at < datetime('now', '+08:00', '-{days} days')")
+                            conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed') AND updated_at < ?", (cutoff,))
                         logger.info(f"🧹 Auto-cleaned records older than {days} days")
                 except Exception as e:
                     logger.error(f"Cleanup failed: {e}")
-                last_cleanup_time = time.time()
+                last_cleanup_time = now
 
             pool_cfg = {n['name']: n for n in cfg.get('downstream_pool', [])}
             
             # Global Bulk Control
             bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
-            
-            now = time.time()
             
             # 1. Identify nodes that are currently cooling down (for BULK only)
             # If a node is cooling, we should NOT fetch BULK tasks for it, 
@@ -365,10 +380,23 @@ def worker_thread():
                             msg_content = msg.as_bytes()
                         except: pass
 
-                    with smtplib.SMTP(node['host'], int(node['port']), timeout=20) as s:
-                        if node.get('encryption') in ['tls', 'ssl']: s.starttls()
-                        if node.get('username') and node.get('password'): s.login(node['username'], node['password'])
-                        s.sendmail(sender, rcpt_tos, msg_content)
+                    # Handle different encryption modes
+                    encryption = node.get('encryption', 'none')
+                    host = node['host']
+                    port = int(node['port'])
+                    
+                    if encryption == 'ssl':
+                        # SSL mode (usually port 465) - use SMTP_SSL
+                        with smtplib.SMTP_SSL(host, port, timeout=30) as s:
+                            if node.get('username') and node.get('password'): s.login(node['username'], node['password'])
+                            s.sendmail(sender, rcpt_tos, msg_content)
+                    else:
+                        # None or TLS mode (usually port 25/587) - use SMTP with optional STARTTLS
+                        with smtplib.SMTP(host, port, timeout=30) as s:
+                            if encryption == 'tls':
+                                s.starttls()
+                            if node.get('username') and node.get('password'): s.login(node['username'], node['password'])
+                            s.sendmail(sender, rcpt_tos, msg_content)
                     
                     success = True
                     logger.info(f"✅ Sent ID:{row_id} via {node_name} (Source: {source})")
@@ -483,11 +511,13 @@ def api_save():
     save_config(request.json)
     global logger
     logger = setup_logging()
-    # Auto rebalance after save
-    try:
-        rebalance_queue_internal()
-    except Exception as e:
-        logger.error(f"Auto-rebalance failed: {e}")
+    # Auto rebalance after save (in background thread to avoid blocking)
+    def async_rebalance():
+        try:
+            rebalance_queue_internal()
+        except Exception as e:
+            logger.error(f"Auto-rebalance failed: {e}")
+    threading.Thread(target=async_rebalance, daemon=True).start()
     return jsonify({"status": "ok"})
 
 @app.route('/api/restart', methods=['POST'])
@@ -544,7 +574,8 @@ def api_queue_list():
 def api_domain_stats():
     """Get top 9 recipient domains by count, rest as 'other'"""
     with get_db() as conn:
-        rows = conn.execute("SELECT rcpt_tos FROM queue").fetchall()
+        # Only count pending emails for routing relevance
+        rows = conn.execute("SELECT rcpt_tos FROM queue WHERE status='pending'").fetchall()
     
     domain_count = {}
     for row in rows:
@@ -987,12 +1018,45 @@ def rebalance_queue_internal():
     pool_by_name = {n['name']: n for n in pool}
     bulk_pool = [n for n in pool if n.get('allow_bulk', True)]
     
+    # If no bulk-enabled nodes, we can't rebalance bulk mails
+    if not bulk_pool:
+        bulk_pool = pool  # Fallback to all enabled nodes
+    
     count = 0
     limit_cfg = cfg.get('limit_config', {})
     
+    # Get list of valid node names for quick check
+    valid_node_names = set(pool_by_name.keys())
+    bulk_disabled_nodes = set(n['name'] for n in pool if not n.get('allow_bulk', True))
+    
     with get_db() as conn:
-        cursor = conn.execute("SELECT id, rcpt_tos, source, assigned_node FROM queue WHERE status='pending'")
-        rows = cursor.fetchall()
+        # Only fetch items that NEED reassignment (optimized query)
+        # 1. Node doesn't exist in current pool
+        # 2. Bulk mail assigned to a bulk-disabled node
+        placeholders = ','.join(['?'] * len(valid_node_names)) if valid_node_names else "''"
+        
+        # First: get items with invalid/missing nodes
+        if valid_node_names:
+            query1 = f"SELECT id, rcpt_tos, source, assigned_node FROM queue WHERE status='pending' AND assigned_node NOT IN ({placeholders})"
+            rows1 = conn.execute(query1, tuple(valid_node_names)).fetchall()
+        else:
+            rows1 = conn.execute("SELECT id, rcpt_tos, source, assigned_node FROM queue WHERE status='pending'").fetchall()
+        
+        # Second: get bulk items on bulk-disabled nodes
+        rows2 = []
+        if bulk_disabled_nodes:
+            placeholders2 = ','.join(['?'] * len(bulk_disabled_nodes))
+            query2 = f"SELECT id, rcpt_tos, source, assigned_node FROM queue WHERE status='pending' AND source='bulk' AND assigned_node IN ({placeholders2})"
+            rows2 = conn.execute(query2, tuple(bulk_disabled_nodes)).fetchall()
+        
+        # Combine and deduplicate
+        seen_ids = set()
+        rows = []
+        for r in list(rows1) + list(rows2):
+            if r['id'] not in seen_ids:
+                seen_ids.add(r['id'])
+                rows.append(r)
+        
         if not rows: return 0
         
         updates = []
@@ -1003,26 +1067,15 @@ def rebalance_queue_internal():
             except: rcpt = ''
             
             source = r['source']
-            current_node = pool_by_name.get(r['assigned_node'])
-            
-            # Check if current assignment is invalid
-            needs_reassign = False
-            if not current_node:
-                needs_reassign = True
-            elif source == 'bulk' and not current_node.get('allow_bulk', True):
-                # Bulk mail on a node that disabled allow_bulk
-                needs_reassign = True
-            
-            if needs_reassign:
-                # For bulk, only use bulk-enabled nodes
-                target_pool = bulk_pool if source == 'bulk' else pool
-                node = select_node_for_recipient(target_pool, rcpt, limit_cfg, source=source)
-                if node:
-                    updates.append((node['name'], r['id']))
+            target_pool = bulk_pool if source == 'bulk' else pool
+            node = select_node_for_recipient(target_pool, rcpt, limit_cfg, source=source)
+            if node:
+                updates.append((node['name'], r['id']))
         
         if updates:
             conn.executemany("UPDATE queue SET assigned_node=? WHERE id=?", updates)
             count = len(updates)
+            logger.info(f"🔄 Rebalanced {count} items")
     return count
 
 @app.route('/api/queue/rebalance', methods=['POST'])
@@ -1840,6 +1893,10 @@ EOF
                     this.fetchQueue();
                     this.fetchBulkStatus();
                 }, 5000);
+                // Refresh domain stats less frequently (every 30 seconds)
+                setInterval(() => {
+                    this.fetchTopDomains();
+                }, 30000);
             },
             watch: {
                 bulk: {
@@ -2152,9 +2209,9 @@ EOF
                     const newIndex = i + direction;
                     if (newIndex < 0 || newIndex >= this.config.downstream_pool.length) return;
                     const pool = this.config.downstream_pool;
-                    const temp = pool[i];
-                    this.$set(pool, i, pool[newIndex]);
-                    this.$set(pool, newIndex, temp);
+                    // Swap elements using splice (Vue 3 compatible)
+                    const item = pool.splice(i, 1)[0];
+                    pool.splice(newIndex, 0, item);
                 },
                 onDragStart(e, i) {
                     this.draggingIndex = i;
