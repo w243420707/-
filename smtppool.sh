@@ -1098,6 +1098,13 @@ EOF
         .text-processing { color: #3b82f6; } .bg-processing-subtle { background: #eff6ff; }
         .text-sent { color: #10b981; } .bg-sent-subtle { background: #ecfdf5; }
         .text-failed { color: #ef4444; } .bg-failed-subtle { background: #fef2f2; }
+        
+        /* Drag & Drop */
+        [draggable="true"] { cursor: grab; }
+        [draggable="true"]:active { cursor: grabbing; }
+        .dragging { opacity: 0.5; }
+        .drag-over { position: relative; }
+        .drag-over::before { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; border: 2px dashed var(--primary-color); border-radius: 12px; background: rgba(67, 97, 238, 0.1); z-index: 10; pointer-events: none; }
 
         [data-bs-theme="dark"] .bg-pending-subtle { background: #451a03; }
         [data-bs-theme="dark"] .bg-processing-subtle { background: #172554; }
@@ -1504,8 +1511,14 @@ EOF
                                     暂无节点，请点击右上角添加
                                 </div>
                                 <div class="row g-3">
-                                    <div v-for="(n, i) in config.downstream_pool" :key="i" class="col-md-6 col-xl-4">
-                                        <div class="card h-100 shadow-sm">
+                                    <div v-for="(n, i) in config.downstream_pool" :key="i" class="col-md-6 col-xl-4"
+                                         draggable="true"
+                                         @dragstart="onDragStart($event, i)"
+                                         @dragover.prevent="onDragOver($event, i)"
+                                         @drop="onDrop($event, i)"
+                                         @dragend="onDragEnd"
+                                         :class="{'dragging': draggingIndex === i, 'drag-over': dragOverIndex === i && draggingIndex !== i}">
+                                        <div class="card h-100 shadow-sm" :style="draggingIndex === i ? 'opacity: 0.5' : ''">
                                             <div class="card-header d-flex justify-content-between align-items-center py-2 bg-transparent">
                                                 <div class="d-flex align-items-center gap-2 flex-grow-1" style="cursor:pointer; min-width: 0;" @click="n.expanded = !n.expanded">
                                                     <i class="bi text-muted" :class="n.expanded ? 'bi-chevron-down' : 'bi-chevron-right'"></i>
@@ -1518,6 +1531,8 @@ EOF
                                                     <span class="fw-bold text-truncate" :title="n.name">[[ n.name ]]</span>
                                                 </div>
                                                 <div class="d-flex gap-1 flex-shrink-0">
+                                                    <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click.stop="moveNode(i, -1)" :disabled="i === 0" title="上移"><i class="bi bi-arrow-up"></i></button>
+                                                    <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click.stop="moveNode(i, 1)" :disabled="i === config.downstream_pool.length - 1" title="下移"><i class="bi bi-arrow-down"></i></button>
                                                     <button class="btn btn-sm btn-outline-primary py-0 px-2" @click.stop="save" title="保存配置"><i class="bi bi-save"></i></button>
                                                     <button class="btn btn-sm btn-outline-danger py-0 px-2" @click.stop="delNode(i)" title="删除节点"><i class="bi bi-trash"></i></button>
                                                 </div>
@@ -1616,7 +1631,9 @@ EOF
                     contactCount: 0,
                     bulkStatus: 'running',
                     rebalancing: false,
-                    theme: 'auto'
+                    theme: 'auto',
+                    draggingIndex: null,
+                    dragOverIndex: null
                 }
             },
             computed: {
@@ -1884,6 +1901,35 @@ EOF
                     this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true, allow_bulk: true, routing_rules: '', expanded: true }); 
                 },
                 delNode(i) { if(confirm('删除此节点?')) this.config.downstream_pool.splice(i, 1); },
+                moveNode(i, direction) {
+                    const newIndex = i + direction;
+                    if (newIndex < 0 || newIndex >= this.config.downstream_pool.length) return;
+                    const pool = this.config.downstream_pool;
+                    const temp = pool[i];
+                    this.$set(pool, i, pool[newIndex]);
+                    this.$set(pool, newIndex, temp);
+                },
+                onDragStart(e, i) {
+                    this.draggingIndex = i;
+                    e.dataTransfer.effectAllowed = 'move';
+                    e.dataTransfer.setData('text/plain', i);
+                },
+                onDragOver(e, i) {
+                    this.dragOverIndex = i;
+                },
+                onDrop(e, targetIndex) {
+                    const sourceIndex = this.draggingIndex;
+                    if (sourceIndex === null || sourceIndex === targetIndex) return;
+                    const pool = this.config.downstream_pool;
+                    const item = pool.splice(sourceIndex, 1)[0];
+                    pool.splice(targetIndex, 0, item);
+                    this.draggingIndex = null;
+                    this.dragOverIndex = null;
+                },
+                onDragEnd() {
+                    this.draggingIndex = null;
+                    this.dragOverIndex = null;
+                },
                 async save() {
                     this.saving = true;
                     try {
