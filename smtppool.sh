@@ -470,6 +470,11 @@ def api_save():
     save_config(request.json)
     global logger
     logger = setup_logging()
+    # Auto rebalance after save
+    try:
+        rebalance_queue_internal()
+    except Exception as e:
+        logger.error(f"Auto-rebalance failed: {e}")
     return jsonify({"status": "ok"})
 
 @app.route('/api/restart', methods=['POST'])
@@ -929,58 +934,40 @@ def api_queue_clear():
         conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed', 'processing')")
     return jsonify({"status": "ok"})
 
+def rebalance_queue_internal():
+    cfg = load_config()
+    pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
+    if not pool: return 0
+    
+    count = 0
+    limit_cfg = cfg.get('limit_config', {})
+    
+    with get_db() as conn:
+        cursor = conn.execute("SELECT id, rcpt_tos, source FROM queue WHERE status='pending'")
+        rows = cursor.fetchall()
+        if not rows: return 0
+        
+        updates = []
+        for r in rows:
+            try:
+                rcpts = json.loads(r['rcpt_tos'])
+                rcpt = rcpts[0] if rcpts else ''
+            except: rcpt = ''
+            
+            node = select_node_for_recipient(pool, rcpt, limit_cfg, source=r['source'])
+            if node:
+                updates.append((node['name'], r['id']))
+        
+        if updates:
+            conn.executemany("UPDATE queue SET assigned_node=? WHERE id=?", updates)
+            count = len(updates)
+    return count
+
 @app.route('/api/queue/rebalance', methods=['POST'])
 @login_required
 def api_queue_rebalance():
     try:
-        cfg = load_config()
-        # Get enabled nodes (Full objects)
-        pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
-        if not pool: return jsonify({"error": "No enabled nodes available"}), 400
-        
-        count = 0
-        limit_cfg = cfg.get('limit_config', {})
-        
-        with get_db() as conn:
-            # 1. Get all pending IDs and recipients to re-route correctly
-            cursor = conn.execute("SELECT id, rcpt_tos FROM queue WHERE status='pending'")
-            rows = cursor.fetchall()
-            if not rows: return jsonify({"count": 0})
-            
-            # 2. Prepare updates
-            updates = []
-            for r in rows:
-                try:
-                    rcpts = json.loads(r['rcpt_tos'])
-                    rcpt = rcpts[0] if rcpts else ''
-                except: rcpt = ''
-                
-                # Determine source from queue row if possible, but here we assume 'bulk' if rebalancing bulk queue?
-                # Actually rebalance is generic. We should check the source column.
-                # But we didn't select source in step 1. Let's fix step 1.
-                pass 
-
-            # 1. Get all pending IDs and recipients to re-route correctly
-            cursor = conn.execute("SELECT id, rcpt_tos, source FROM queue WHERE status='pending'")
-            rows = cursor.fetchall()
-            if not rows: return jsonify({"count": 0})
-            
-            # 2. Prepare updates
-            updates = []
-            for r in rows:
-                try:
-                    rcpts = json.loads(r['rcpt_tos'])
-                    rcpt = rcpts[0] if rcpts else ''
-                except: rcpt = ''
-                
-                node = select_node_for_recipient(pool, rcpt, limit_cfg, source=r['source'])
-                if node:
-                    updates.append((node['name'], r['id']))
-            
-            # 3. Execute batch update
-            conn.executemany("UPDATE queue SET assigned_node=? WHERE id=?", updates)
-            count = len(updates)
-            
+        count = rebalance_queue_internal()
         return jsonify({"status": "ok", "count": count})
     except Exception as e:
         logger.error(f"Rebalance error: {e}")
@@ -1321,7 +1308,8 @@ EOF
                         <table class="table table-custom table-hover mb-0">
                             <thead><tr><th>节点名称</th><th class="text-center">堆积</th><th class="text-center">成功</th><th class="text-center">失败</th><th>预计时长</th><th>预计结束</th></tr></thead>
                             <tbody>
-                                <tr v-for="(s, name) in qStats.nodes" :key="name">
+                                <template v-for="(s, name) in qStats.nodes" :key="name">
+                                <tr v-if="(s.pending || 0) > 0">
                                     <td class="fw-medium">[[ name ]]</td>
                                     <td class="text-center"><span class="badge bg-warning text-dark">[[ s.pending || 0 ]]</span></td>
                                     <td class="text-center text-success">[[ s.sent || 0 ]]</td>
@@ -1329,7 +1317,8 @@ EOF
                                     <td class="text-muted small">[[ getEstDuration(name, s.pending) ]]</td>
                                     <td class="text-muted small">[[ getEstFinishTime(name, s.pending) ]]</td>
                                 </tr>
-                                <tr v-if="Object.keys(qStats.nodes).length === 0"><td colspan="6" class="text-center text-muted py-4">暂无节点数据</td></tr>
+                                </template>
+                                <tr v-if="!hasPendingNodes"><td colspan="6" class="text-center text-muted py-4">暂无待发任务节点</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -1624,6 +1613,9 @@ EOF
                 }
             },
             computed: {
+                hasPendingNodes() {
+                    return Object.values(this.qStats.nodes).some(n => (n.pending || 0) > 0);
+                },
                 clickRate() {
                     const sent = (this.qStats.total.sent || 0) + (this.qStats.total.failed || 0); // Use sent+failed or just sent? Usually sent.
                     // Actually, click rate is usually Opens / Delivered.
