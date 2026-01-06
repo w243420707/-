@@ -2663,12 +2663,6 @@ EOF
                 statusClass() {
                     if(this.bulkStatus === 'paused') return 'bg-warning-subtle text-warning';
                     if(this.isFinished) return 'bg-success-subtle text-success';
-                },
-                // Check if a node exists in current config
-                nodeExists() {
-                    const nodeNames = new Set(this.config.downstream_pool.map(n => n.name));
-                    return name => nodeNames.has(name);
-                }
                     return 'bg-primary-subtle text-primary';
                 },
                 statusIcon() {
@@ -2715,6 +2709,10 @@ EOF
                 }
             },
             methods: {
+                nodeExists(name) {
+                    const nodeNames = new Set(this.config.downstream_pool.map(n => n.name));
+                    return nodeNames.has(name);
+                },
                 async fetchSmtpUsers() {
                     try {
                         const res = await fetch('/api/smtp-users');
