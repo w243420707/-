@@ -1121,7 +1121,7 @@ def api_send_bulk():
 @login_required
 def api_smtp_users_list():
     with get_db() as conn:
-        rows = conn.execute("SELECT id, username, hourly_limit, hourly_sent, hourly_reset_at, expires_at, enabled, created_at, last_used_at, user_type FROM smtp_users ORDER BY id DESC").fetchall()
+        rows = conn.execute("SELECT id, username, COALESCE(hourly_limit, 0) as hourly_limit, COALESCE(hourly_sent, 0) as hourly_sent, hourly_reset_at, expires_at, enabled, created_at, last_used_at, COALESCE(user_type, 'free') as user_type FROM smtp_users ORDER BY id DESC").fetchall()
     return jsonify([dict(r) for r in rows])
 
 @app.route('/api/smtp-users', methods=['POST'])
@@ -1978,10 +1978,10 @@ EOF
                                 <tr v-for="u in smtpUsers" :key="u.id">
                                     <td><strong>[[ u.username ]]</strong></td>
                                     <td><span class="badge" :class="getUserTypeBadge(u.user_type)">[[ getUserTypeLabel(u.user_type) ]]</span></td>
-                                    <td>[[ u.hourly_limit == 0 ? '无限制' : u.hourly_limit.toLocaleString() + '/小时' ]]</td>
+                                    <td>[[ (u.hourly_limit || 0) == 0 ? '无限制' : (u.hourly_limit || 0).toLocaleString() + '/小时' ]]</td>
                                     <td>
-                                        <span :class="{'text-danger': u.hourly_limit > 0 && u.hourly_sent >= u.hourly_limit}">[[ u.hourly_sent.toLocaleString() ]]</span>
-                                        <span v-if="u.hourly_limit > 0" class="text-muted"> / [[ u.hourly_limit.toLocaleString() ]]</span>
+                                        <span :class="{'text-danger': (u.hourly_limit || 0) > 0 && (u.hourly_sent || 0) >= (u.hourly_limit || 0)}">[[ (u.hourly_sent || 0).toLocaleString() ]]</span>
+                                        <span v-if="(u.hourly_limit || 0) > 0" class="text-muted"> / [[ (u.hourly_limit || 0).toLocaleString() ]]</span>
                                         <div class="small text-muted">重置: [[ formatHourlyReset(u.hourly_reset_at) ]]</div>
                                     </td>
                                     <td>
@@ -2536,7 +2536,7 @@ EOF
                     this.userForm = { 
                         username: u.username, 
                         password: '', 
-                        hourly_limit: u.hourly_limit, 
+                        hourly_limit: u.hourly_limit || 0, 
                         expires_at: u.expires_at ? u.expires_at.replace(' ', 'T') : '',
                         enabled: u.enabled 
                     };
