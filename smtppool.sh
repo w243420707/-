@@ -1987,7 +1987,7 @@ EOF
                 this.config.downstream_pool.forEach(n => { 
                     if(n.enabled === undefined) n.enabled = true; 
                     if(n.allow_bulk === undefined) n.allow_bulk = true;
-                    if(n.expanded === undefined) n.expanded = false;
+                    n.expanded = false; // Always start collapsed on page load
                 });
                 
                 // Auto-load draft
