@@ -78,6 +78,7 @@ from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
 from logging.handlers import RotatingFileHandler
 from aiosmtpd.controller import Controller
+from aiosmtpd.smtp import SMTP as SMTPServer, AuthResult, LoginPassword
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 from functools import wraps
 
@@ -199,22 +200,23 @@ def send_telegram(msg):
         except: pass
 
 # --- SMTP Authenticator ---
-from aiosmtpd.smtp import AuthResult, LoginPassword
-
 class SMTPAuthenticator:
     def __call__(self, server, session, envelope, mechanism, auth_data):
         fail_result = AuthResult(success=False, handled=True)
+        logger.info(f"🔐 SMTP Auth attempt: mechanism={mechanism}, auth_data type={type(auth_data)}")
         try:
             # Decode auth data
             if isinstance(auth_data, LoginPassword):
                 username = auth_data.login.decode('utf-8') if isinstance(auth_data.login, bytes) else auth_data.login
                 password = auth_data.password.decode('utf-8') if isinstance(auth_data.password, bytes) else auth_data.password
+                logger.info(f"🔐 LoginPassword: username={username}")
             elif mechanism == 'PLAIN':
                 # PLAIN format: \0username\0password
                 data = auth_data.decode('utf-8') if isinstance(auth_data, bytes) else auth_data
                 parts = data.split('\x00')
                 username = parts[1] if len(parts) > 1 else ''
                 password = parts[2] if len(parts) > 2 else ''
+                logger.info(f"🔐 PLAIN: username={username}")
             else:
                 logger.warning(f"❌ SMTP Auth unsupported mechanism: {mechanism}")
                 return fail_result
@@ -1369,21 +1371,46 @@ def track_email(tid):
         logger.error(f"Tracking error: {e}")
     return TRACKING_GIF, 200, {'Content-Type': 'image/gif', 'Cache-Control': 'no-cache, no-store, must-revalidate'}
 
+# --- Custom SMTP class with authentication ---
+class AuthSMTP(SMTPServer):
+    def __init__(self, handler, require_auth=True, **kwargs):
+        self.authenticator = SMTPAuthenticator()
+        self._require_auth = require_auth
+        if require_auth:
+            super().__init__(
+                handler,
+                auth_required=True,
+                auth_require_tls=False,
+                authenticator=self.authenticator,
+                **kwargs
+            )
+        else:
+            super().__init__(handler, **kwargs)
+
+class AuthController(Controller):
+    def __init__(self, handler, require_auth=True, **kwargs):
+        self._require_auth = require_auth
+        super().__init__(handler, **kwargs)
+    
+    def factory(self):
+        return AuthSMTP(self.handler, require_auth=self._require_auth)
+
 def start_services():
     init_db()
     cfg = load_config()
     port = int(cfg.get('server_config', {}).get('port', 587))
-    print(f"SMTP Port: {port}")
+    # Check if any SMTP users exist - if not, disable auth requirement
+    with get_db() as conn:
+        user_count = conn.execute("SELECT COUNT(*) FROM smtp_users WHERE enabled=1").fetchone()[0]
+    require_auth = user_count > 0
+    print(f"SMTP Port: {port}, Auth Required: {require_auth}")
     
-    # Start SMTP Server with authentication
-    authenticator = SMTPAuthenticator()
-    controller = Controller(
+    # Start SMTP Server
+    controller = AuthController(
         RelayHandler(), 
         hostname='0.0.0.0', 
         port=port,
-        authenticator=authenticator,
-        auth_required=True,
-        auth_require_tls=False
+        require_auth=require_auth
     )
     controller.start()
     
