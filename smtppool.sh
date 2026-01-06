@@ -1726,31 +1726,42 @@ EOF
                                 </div>
                                 <div class="row g-3">
                                     <div v-for="(n, i) in config.downstream_pool" :key="i" class="col-md-6 col-xl-4"
-                                         draggable="true"
-                                         @dragstart="onDragStart($event, i)"
                                          @dragover.prevent="onDragOver($event, i)"
                                          @drop="onDrop($event, i)"
-                                         @dragend="onDragEnd"
-                                         :class="{'dragging': draggingIndex === i, 'drag-over': dragOverIndex === i && draggingIndex !== i}">
+                                         :class="{'drag-over': dragOverIndex === i && draggingIndex !== i}">
                                         <div class="card h-100 shadow-sm" :style="draggingIndex === i ? 'opacity: 0.5' : ''">
-                                            <div class="card-header d-flex justify-content-between align-items-center py-2 bg-transparent">
-                                                <div class="d-flex align-items-center gap-2 flex-grow-1" style="cursor:pointer; min-width: 0;" @click="n.expanded = !n.expanded">
-                                                    <input v-if="showBatchEdit" type="checkbox" v-model="n.batchSelected" class="form-check-input" style="width: 1.2em; height: 1.2em;" @click.stop title="选择此节点">
-                                                    <i class="bi text-muted" :class="n.expanded ? 'bi-chevron-down' : 'bi-chevron-right'"></i>
-                                                    <div class="form-check form-switch" @click.stop title="启用/禁用节点">
-                                                        <input class="form-check-input" type="checkbox" v-model="n.enabled" style="width: 2em; height: 1em;">
+                                            <div class="card-header py-2 bg-transparent">
+                                                <!-- Node name row -->
+                                                <div class="d-flex justify-content-between align-items-center mb-1" style="cursor:pointer;" @click="n.expanded = !n.expanded">
+                                                    <div class="d-flex align-items-center gap-2 flex-grow-1" style="min-width: 0;">
+                                                        <input v-if="showBatchEdit" type="checkbox" v-model="n.batchSelected" class="form-check-input" style="width: 1.2em; height: 1.2em;" @click.stop title="选择此节点">
+                                                        <i class="bi text-muted" :class="n.expanded ? 'bi-chevron-down' : 'bi-chevron-right'"></i>
+                                                        <span class="fw-bold" style="word-break: break-all;">[[ n.name ]]</span>
                                                     </div>
-                                                    <div class="form-check form-switch" @click.stop title="允许群发 (Bulk)">
-                                                        <input class="form-check-input" :class="n.allow_bulk ? 'bg-warning border-warning' : ''" type="checkbox" v-model="n.allow_bulk" style="width: 2em; height: 1em;">
-                                                    </div>
-                                                    <span class="fw-bold text-truncate" :title="n.name">[[ n.name ]]</span>
                                                 </div>
-                                                <div class="d-flex gap-1 flex-shrink-0">
-                                                    <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click.stop="moveNode(i, -1)" :disabled="i === 0" title="上移"><i class="bi bi-arrow-up"></i></button>
-                                                    <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click.stop="moveNode(i, 1)" :disabled="i === config.downstream_pool.length - 1" title="下移"><i class="bi bi-arrow-down"></i></button>
-                                                    <button class="btn btn-sm btn-outline-success py-0 px-2" @click.stop="copyNode(i)" title="复制节点"><i class="bi bi-copy"></i></button>
-                                                    <button class="btn btn-sm btn-outline-primary py-0 px-2" @click.stop="save" title="保存配置"><i class="bi bi-save"></i></button>
-                                                    <button class="btn btn-sm btn-outline-danger py-0 px-2" @click.stop="delNode(i)" title="删除节点"><i class="bi bi-trash"></i></button>
+                                                <!-- Switches and buttons row -->
+                                                <div class="d-flex align-items-center justify-content-between">
+                                                    <div class="d-flex align-items-center gap-2">
+                                                        <div class="form-check form-switch mb-0" @click.stop title="启用/禁用节点">
+                                                            <input class="form-check-input" type="checkbox" v-model="n.enabled" style="width: 2em; height: 1em;">
+                                                            <label class="form-check-label small text-muted">启用</label>
+                                                        </div>
+                                                        <div class="form-check form-switch mb-0" @click.stop title="允许群发 (Bulk)">
+                                                            <input class="form-check-input" :class="n.allow_bulk ? 'bg-warning border-warning' : ''" type="checkbox" v-model="n.allow_bulk" style="width: 2em; height: 1em;">
+                                                            <label class="form-check-label small text-muted">群发</label>
+                                                        </div>
+                                                    </div>
+                                                    <div class="d-flex gap-1 flex-shrink-0">
+                                                        <span class="btn btn-sm btn-outline-secondary py-0 px-2" 
+                                                              draggable="true"
+                                                              @dragstart="onDragStart($event, i)"
+                                                              @dragend="onDragEnd"
+                                                              style="cursor: grab;"
+                                                              title="按住拖拽移动"><i class="bi bi-grip-vertical"></i></span>
+                                                        <button class="btn btn-sm btn-outline-success py-0 px-2" @click.stop="copyNode(i)" title="复制节点"><i class="bi bi-copy"></i></button>
+                                                        <button class="btn btn-sm btn-outline-primary py-0 px-2" @click.stop="save" title="保存配置"><i class="bi bi-save"></i></button>
+                                                        <button class="btn btn-sm btn-outline-danger py-0 px-2" @click.stop="delNode(i)" title="删除节点"><i class="bi bi-trash"></i></button>
+                                                    </div>
                                                 </div>
                                             </div>
                                             <!-- Collapsed quick edit -->
@@ -2363,12 +2374,6 @@ EOF
                     pool.splice(newIndex, 0, item);
                 },
                 onDragStart(e, i) {
-                    // Prevent drag when clicking on input, textarea, select, or button elements
-                    const tagName = e.target.tagName.toLowerCase();
-                    if (['input', 'textarea', 'select', 'button'].includes(tagName) || e.target.isContentEditable) {
-                        e.preventDefault();
-                        return;
-                    }
                     this.draggingIndex = i;
                     e.dataTransfer.effectAllowed = 'move';
                     e.dataTransfer.setData('text/plain', i);
