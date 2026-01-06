@@ -1565,7 +1565,7 @@ def track_email(tid):
 
 # --- Custom SMTP class with authentication ---
 class AuthSMTP(SMTPServer):
-    def __init__(self, handler, require_auth=True, **kwargs):
+    def __init__(self, handler, require_auth=True, hostname=None, **kwargs):
         self.authenticator = SMTPAuthenticator()
         self._require_auth = require_auth
         if require_auth:
@@ -1574,10 +1574,11 @@ class AuthSMTP(SMTPServer):
                 auth_required=True,
                 auth_require_tls=False,
                 authenticator=self.authenticator,
+                hostname=hostname,
                 **kwargs
             )
         else:
-            super().__init__(handler, **kwargs)
+            super().__init__(handler, hostname=hostname, **kwargs)
 
 class AuthController(Controller):
     def __init__(self, handler, require_auth=True, **kwargs):
@@ -1585,31 +1586,44 @@ class AuthController(Controller):
         super().__init__(handler, **kwargs)
     
     def factory(self):
-        return AuthSMTP(self.handler, require_auth=self._require_auth)
+        return AuthSMTP(self.handler, require_auth=self._require_auth, hostname=self.hostname)
 
 def start_services():
     init_db()
     cfg = load_config()
     port = int(cfg.get('server_config', {}).get('port', 587))
     # Check if any SMTP users exist - if not, disable auth requirement
-    with get_db() as conn:
-        user_count = conn.execute("SELECT COUNT(*) FROM smtp_users WHERE enabled=1").fetchone()[0]
-    require_auth = user_count > 0
-    print(f"SMTP Port: {port}, Auth Required: {require_auth}")
+    try:
+        with get_db() as conn:
+            user_count = conn.execute("SELECT COUNT(*) FROM smtp_users WHERE enabled=1").fetchone()[0]
+        require_auth = user_count > 0
+    except Exception as e:
+        print(f"⚠️ Warning: Could not check smtp_users table: {e}")
+        require_auth = False
+    
+    print(f"🚀 Starting SMTP Server on port {port}, Auth Required: {require_auth}")
     
     # Start SMTP Server
-    controller = AuthController(
-        RelayHandler(), 
-        hostname='0.0.0.0', 
-        port=port,
-        require_auth=require_auth
-    )
-    controller.start()
+    try:
+        controller = AuthController(
+            RelayHandler(), 
+            hostname='0.0.0.0', 
+            port=port,
+            require_auth=require_auth
+        )
+        controller.start()
+        print(f"✅ SMTP Server started successfully on 0.0.0.0:{port}")
+    except Exception as e:
+        print(f"❌ Failed to start SMTP Server: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Start Worker
     t = threading.Thread(target=worker_thread, daemon=True)
     t.start()
+    print("✅ Worker thread started")
     
+    print(f"🌐 Starting Web UI on port 8080")
     app.run(host='0.0.0.0', port=8080, debug=False, use_reloader=False)
 
 if __name__ == '__main__':
