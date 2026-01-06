@@ -77,7 +77,8 @@ from datetime import datetime, timedelta
 from email import message_from_bytes
 from email.header import decode_header
 from email.mime.text import MIMEText
-from email.utils import formatdate, make_msgid
+from email.mime.multipart import MIMEMultipart
+from email.utils import formatdate, make_msgid, formataddr
 from logging.handlers import RotatingFileHandler
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import SMTP as SMTPServer, AuthResult, LoginPassword
@@ -1047,10 +1048,10 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool):
         
         for rcpt in recipients:
             try:
-                # Randomize
-                rand_sub = ''.join(random.choices(charset, k=6))
-                # Select 5-10 random sentences to simulate normal chat
-                rand_chat = ' '.join(random.choices(chat_corpus, k=random.randint(5, 10)))
+                # === Anti-Spam Randomization ===
+                rand_sub = ''.join(random.choices(charset, k=random.randint(4, 8)))
+                # Select random sentences to simulate normal chat
+                rand_chat = ' '.join(random.choices(chat_corpus, k=random.randint(5, 12)))
                 
                 # Randomly select subject and body
                 current_subject = random.choice(subjects) if subjects else "(No Subject)"
@@ -1060,19 +1061,94 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool):
                 tracking_html = ""
                 if tracking_base:
                     tracking_url = f"{tracking_base}/track/{tracking_id}"
-                    tracking_html = f"<img src='{tracking_url}' width='1' height='1' style='display:none;'>"
+                    tracking_html = f"<img src='{tracking_url}' width='1' height='1' alt='' style='display:none;border:0;'>"
 
-                # footer removed
-                final_subject = f"{current_subject} {rand_sub}"
-                # Insert hidden chat content
-                final_body = f"{current_body}<div style='display:none;opacity:0;font-size:0;line-height:0;max-height:0;overflow:hidden;'>{rand_chat}</div>{tracking_html}"
+                # === Enhanced Subject Randomization ===
+                # Randomly choose subject format
+                subject_formats = [
+                    f"{current_subject} {rand_sub}",
+                    f"{current_subject} - {rand_sub}",
+                    f"Re: {current_subject}",
+                    f"Fwd: {current_subject}",
+                    f"{current_subject}",
+                    f"{current_subject} #{rand_sub[:4]}",
+                ]
+                final_subject = random.choice(subject_formats)
+                
+                # === Build More Natural Email ===
+                # Extract recipient name from email for personalization
+                rcpt_name = rcpt.split('@')[0].replace('.', ' ').replace('_', ' ').replace('-', ' ').title()[:20]
+                
+                # Random greetings and closings
+                greetings = ['', f'Hi,', f'Hello,', f'Hey,', f'{rcpt_name},', f'Hi {rcpt_name},', f'Dear {rcpt_name},', '你好，', '您好，', '']
+                closings = ['', 'Best,', 'Thanks,', 'Cheers,', 'Regards,', '祝好', '谢谢', '']
+                
+                greeting = random.choice(greetings)
+                closing = random.choice(closings)
+                
+                # Build HTML with more natural structure
+                # Hidden content placed more naturally throughout
+                hidden_style = 'color:transparent;font-size:1px;line-height:1px;max-height:0;opacity:0;overflow:hidden;mso-hide:all;'
+                hidden_words = rand_chat.split()
+                hidden_chunks = [' '.join(hidden_words[i:i+3]) for i in range(0, len(hidden_words), 3)]
+                
+                # Interleave hidden content with visible content
+                body_parts = current_body.split('</p>')
+                enhanced_body = ""
+                for i, part in enumerate(body_parts):
+                    enhanced_body += part
+                    if part.strip() and i < len(hidden_chunks):
+                        enhanced_body += f'<span style="{hidden_style}">{hidden_chunks[i]}</span>'
+                    if part.strip() and '<p' in part.lower():
+                        enhanced_body += '</p>'
+                
+                # Build final body with natural wrapping
+                final_body = f'''<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;">
+{f"<p>{greeting}</p>" if greeting else ""}
+{enhanced_body if enhanced_body else current_body}
+<span style="{hidden_style}">{random.choice(hidden_chunks) if hidden_chunks else rand_chat[:50]}</span>
+{f"<p>{closing}</p>" if closing else ""}
+{tracking_html}
+</div>'''
 
-                msg = MIMEText(final_body, 'html', 'utf-8')
+                # === Create Multipart Email (HTML + Plain Text) ===
+                # Plain text version makes it look more like a normal email
+                plain_text = f"{greeting}\n\n{current_body.replace('<br>', chr(10)).replace('<br/>', chr(10)).replace('</p>', chr(10))}\n\n{closing}".strip()
+                # Remove HTML tags from plain text
+                import re
+                plain_text = re.sub(r'<[^>]+>', '', plain_text)
+                
+                msg = MIMEMultipart('alternative')
                 msg['Subject'] = final_subject
                 msg['From'] = '' # Placeholder, worker will fill
                 msg['To'] = rcpt
-                msg['Date'] = formatdate(localtime=True)
-                msg['Message-ID'] = make_msgid()
+                
+                # Randomize date slightly (within last few minutes)
+                date_offset = random.randint(0, 180)  # 0-3 minutes ago
+                msg['Date'] = formatdate(localtime=True, timeval=time.time() - date_offset)
+                
+                # More natural Message-ID format
+                msg_domain = rcpt.split('@')[-1] if '@' in rcpt else 'mail.local'
+                msg['Message-ID'] = f"<{uuid.uuid4().hex[:16]}.{int(time.time())}.{random.randint(1000,9999)}@{msg_domain}>"
+                
+                # Add common headers that normal emails have
+                msg['MIME-Version'] = '1.0'
+                user_agents = [
+                    'Mozilla/5.0', 
+                    'Microsoft Outlook 16.0', 
+                    'Apple Mail (2.3654)',
+                    'Thunderbird/102.0',
+                    None  # Sometimes no User-Agent
+                ]
+                ua = random.choice(user_agents)
+                if ua:
+                    msg['X-Mailer'] = ua
+                
+                # Attach plain text first, then HTML (standard order)
+                part1 = MIMEText(plain_text, 'plain', 'utf-8')
+                part2 = MIMEText(final_body, 'html', 'utf-8')
+                msg.attach(part1)
+                msg.attach(part2)
 
                 node = select_node_for_recipient(pool, rcpt, limit_cfg, source='bulk')
                 if not node:
