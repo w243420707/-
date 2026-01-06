@@ -1824,14 +1824,23 @@ EOF
                 <!-- Recent Logs -->
                 <div class="card">
                     <div class="card-header d-flex justify-content-between align-items-center">
-                        <span>最近投递记录 <span class="text-muted small fw-normal ms-2" v-if="totalMails > 100">(仅显示最新 100 条 / 共 [[ totalMails ]] 条)</span></span>
+                        <div class="d-flex align-items-center gap-2">
+                            <span>最近投递记录</span>
+                            <div class="btn-group btn-group-sm">
+                                <button class="btn" :class="queueFilter===''?'btn-primary':'btn-outline-secondary'" @click="queueFilter=''">全部</button>
+                                <button class="btn" :class="queueFilter==='sent'?'btn-success':'btn-outline-secondary'" @click="queueFilter='sent'">已发送</button>
+                                <button class="btn" :class="queueFilter==='pending'?'btn-warning':'btn-outline-secondary'" @click="queueFilter='pending'">待发送</button>
+                                <button class="btn" :class="queueFilter==='failed'?'btn-danger':'btn-outline-secondary'" @click="queueFilter='failed'">失败</button>
+                            </div>
+                            <span class="text-muted small fw-normal" v-if="totalMails > 100">(最新 100 条 / 共 [[ totalMails ]] 条)</span>
+                        </div>
                         <button class="btn btn-sm btn-outline-danger" @click="clearQueue">清理历史</button>
                     </div>
                     <div class="table-responsive" style="max-height: 550px; overflow-y: auto;">
                         <table class="table table-custom table-hover mb-0">
                             <thead style="position: sticky; top: 0; background: var(--card-bg); z-index: 1;"><tr><th class="ps-4">ID</th><th>用户/主题</th><th>详情</th><th>节点</th><th>状态</th><th>时间</th></tr></thead>
                             <tbody>
-                                <tr v-for="m in qList" :key="m.id">
+                                <tr v-for="m in filteredQList" :key="m.id">
                                     <td class="ps-4 text-muted">#[[ m.id ]]</td>
                                     <td>
                                         <div v-if="m.smtp_user" class="small"><span class="badge bg-info-subtle text-info">[[ m.smtp_user ]]</span></div>
@@ -1843,12 +1852,12 @@ EOF
                                     </td>
                                     <td><span class="badge bg-theme-light text-theme-main border border-theme">[[ m.assigned_node ]]</span></td>
                                     <td>
-                                        <span class="badge" :class="'bg-'+m.status+'-subtle text-'+m.status">[[ m.status ]]</span>
+                                        <span class="badge" :class="statusBadgeClass(m.status)">[[ m.status ]]</span>
                                         <div v-if="m.last_error" class="text-danger small mt-1" style="font-size: 0.7rem;">[[ m.last_error ]]</div>
                                     </td>
                                     <td class="text-muted small">[[ m.created_at ]]</td>
                                 </tr>
-                                <tr v-if="qList.length===0"><td colspan="6" class="text-center py-5 text-muted">暂无记录</td></tr>
+                                <tr v-if="filteredQList.length===0"><td colspan="6" class="text-center py-5 text-muted">暂无记录</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -2398,6 +2407,7 @@ EOF
                     showPwd: false,
                     qStats: { total: {}, nodes: {} },
                     qList: [],
+                    queueFilter: '',
                     bulk: { sender: '', subject: '', recipients: '', body: '', bodyList: [''] },
                     sending: false,
                     contactCount: 0,
@@ -2421,6 +2431,10 @@ EOF
                 }
             },
             computed: {
+                filteredQList() {
+                    if (!this.queueFilter) return this.qList;
+                    return this.qList.filter(m => m.status === this.queueFilter);
+                },
                 hasPendingNodes() {
                     return Object.values(this.qStats.nodes).some(n => (n.pending || 0) > 0);
                 },
@@ -2723,6 +2737,15 @@ EOF
                         const res = await fetch('/api/domain/stats');
                         this.topDomains = await res.json();
                     } catch(e) { this.topDomains = []; }
+                },
+                statusBadgeClass(status) {
+                    const map = {
+                        'pending': 'bg-warning-subtle text-warning',
+                        'processing': 'bg-info-subtle text-info',
+                        'sent': 'bg-success-subtle text-success',
+                        'failed': 'bg-danger-subtle text-danger'
+                    };
+                    return map[status] || 'bg-secondary-subtle text-secondary';
                 },
                 formatDomainLabel(domain) {
                     const map = {
