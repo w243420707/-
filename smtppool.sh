@@ -1770,6 +1770,9 @@ EOF
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <style>
+        /* Hide Vue templates until compiled */
+        [v-cloak] { display: none !important; }
+        
         :root { --sidebar-width: 240px; --primary-color: #4361ee; }
         
         [data-bs-theme="light"] {
@@ -2368,7 +2371,7 @@ EOF
                         </div>
                     </div>
                 </div>
-                <div class="modal-backdrop fade show" v-if="showUserModal" @click="showUserModal=false"></div>
+                <div class="modal-backdrop fade show" v-cloak v-if="showUserModal" @click="showUserModal=false"></div>
 
                 <!-- Batch Generate Modal -->
                 <div class="modal fade" :class="{show: showBatchUserModal}" :style="{display: showBatchUserModal ? 'block' : 'none'}" tabindex="-1">
@@ -2412,7 +2415,7 @@ EOF
                         </div>
                     </div>
                 </div>
-                <div class="modal-backdrop fade show" v-if="showBatchUserModal" @click="showBatchUserModal=false"></div>
+                <div class="modal-backdrop fade show" v-cloak v-if="showBatchUserModal" @click="showBatchUserModal=false"></div>
             </div>
 
             <!-- Settings Tab -->
@@ -2595,7 +2598,7 @@ EOF
                         </div>
                     </div>
                 </div>
-                <div class="modal-backdrop fade show" v-if="showGroupModal" @click="showGroupModal = false"></div>
+                <div class="modal-backdrop fade show" v-cloak v-if="showGroupModal" @click="showGroupModal = false"></div>
 
                 <!-- Table View -->
                 <div v-if="nodeViewMode === 'table'" class="card">
