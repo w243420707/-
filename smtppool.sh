@@ -367,16 +367,30 @@ def worker_thread():
                 success = False
                 
                 try:
-                    sender = node.get('sender_email') or row['mail_from'] or node.get('username')
+                    # Build sender address
+                    sender = None
+                    if node.get('sender_domain'):
+                        domain = node['sender_domain']
+                        if node.get('sender_random'):
+                            # Random 6-char prefix
+                            prefix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
+                        else:
+                            prefix = node.get('sender_prefix', 'mail')
+                        sender = f"{prefix}@{domain}"
+                    elif node.get('sender_email'):
+                        sender = node['sender_email']
+                    else:
+                        sender = row['mail_from'] or node.get('username')
+                    
                     rcpt_tos = json.loads(row['rcpt_tos'])
                     msg_content = row['content']
 
                     # Header rewrite
-                    if node.get('sender_email'):
+                    if sender and (node.get('sender_domain') or node.get('sender_email')):
                         try:
                             msg = message_from_bytes(msg_content)
                             if 'From' in msg: del msg['From']
-                            msg['From'] = node['sender_email']
+                            msg['From'] = sender
                             msg_content = msg.as_bytes()
                         except: pass
 
@@ -632,29 +646,26 @@ def select_node_for_recipient(pool, recipient, global_limit, source='relay'):
     except:
         domain = ""
         
-    specific_nodes = []
-    wildcard_nodes = []
+    candidates = []
     
     for node in pool:
         # Filter by source capability
         if source == 'bulk' and not node.get('allow_bulk', True):
             continue
 
+        # routing_rules now contains EXCLUDED domains
         rules = node.get('routing_rules', '')
         if not rules or not rules.strip():
-            wildcard_nodes.append(node)
+            # No exclusion rules, this node accepts all domains
+            candidates.append(node)
         else:
-            # Check if domain matches any rule
-            allowed = [d.strip().lower() for d in rules.split(',') if d.strip()]
-            if domain in allowed:
-                specific_nodes.append(node)
+            # Check if domain is in the exclusion list
+            excluded = [d.strip().lower() for d in rules.split(',') if d.strip()]
+            if domain not in excluded:
+                # Domain is NOT excluded, so this node can handle it
+                candidates.append(node)
     
-    # Priority: Specific > Wildcard > All (Fallback)
-    candidates = specific_nodes if specific_nodes else wildcard_nodes
-    
-    # If no candidates found (e.g. all nodes are bulk-disabled but source is bulk), 
-    # we might return None or fallback to pool (but respecting allow_bulk).
-    # Let's filter the original pool by allow_bulk just in case.
+    # If no candidates found, fallback to all enabled nodes (ignoring exclusion rules)
     if not candidates:
         candidates = [n for n in pool if (source != 'bulk' or n.get('allow_bulk', True))]
     
@@ -1708,12 +1719,12 @@ EOF
                                         </div>
                                     </div>
                                     <div class="col-md-6">
-                                        <label class="form-label small mb-1"><i class="bi bi-signpost-split"></i> 批量设置分流</label>
+                                        <label class="form-label small mb-1"><i class="bi bi-signpost-split"></i> 批量设置排除规则</label>
                                         <div class="d-flex align-items-center gap-1 flex-wrap">
-                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchEdit.routing_rules===''?'btn-primary':'btn-outline-secondary'" @click="batchEdit.routing_rules=''">通用</button>
+                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchEdit.routing_rules===''?'btn-success':'btn-outline-secondary'" @click="batchEdit.routing_rules=''" title="不排除任何域名">全部</button>
                                             <template v-for="d in topDomains" :key="'batch-'+d.domain">
-                                                <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchHasDomain(d.domain)?'btn-success':'btn-outline-secondary'" @click="batchToggleDomain(d.domain)">[[ formatDomainLabel(d.domain) ]]</button>
-                                                <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchHasAllOther(d.domains)?'btn-success':'btn-outline-secondary'" @click="batchToggleOther(d.domains)"><i class="bi bi-three-dots"></i></button>
+                                                <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchHasDomain(d.domain)?'btn-danger':'btn-outline-secondary'" @click="batchToggleDomain(d.domain)">[[ formatDomainLabel(d.domain) ]]</button>
+                                                <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchHasAllOther(d.domains)?'btn-danger':'btn-outline-secondary'" @click="batchToggleOther(d.domains)">其他</button>
                                             </template>
                                             <button class="btn btn-sm btn-primary ms-2" @click="applyBatchRouting">应用</button>
                                         </div>
@@ -1780,11 +1791,11 @@ EOF
                                                     </div>
                                                     <div class="col-12">
                                                         <div class="d-flex align-items-center gap-1 flex-wrap">
-                                                            <span class="text-muted small me-1"><i class="bi bi-signpost-split"></i></span>
-                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-primary':'btn-outline-secondary'" @click="n.routing_rules=''">通用</button>
+                                                            <span class="text-muted small me-1" title="选中的域名将不会通过此节点发送"><i class="bi bi-signpost-split"></i>排除:</span>
+                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-success':'btn-outline-secondary'" @click="n.routing_rules=''" title="不排除任何域名">全部</button>
                                                             <template v-for="d in topDomains" :key="d.domain">
-                                                                <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)">[[ formatDomainLabel(d.domain) ]]</button>
-                                                                <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasAllOtherDomains(n, d.domains)?'btn-success':'btn-outline-secondary'" @click="toggleOtherDomains(n, d.domains)" :title="d.count + '封 (' + (d.domains||[]).length + '个域名)'"><i class="bi bi-three-dots"></i></button>
+                                                                <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-danger':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)" :title="hasDomain(n, d.domain)?'点击取消排除 '+d.domain:'点击排除 '+d.domain">[[ formatDomainLabel(d.domain) ]]</button>
+                                                                <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasAllOtherDomains(n, d.domains)?'btn-danger':'btn-outline-secondary'" @click="toggleOtherDomains(n, d.domains)" :title="d.count + '封 (' + (d.domains||[]).length + '个域名)'">其他</button>
                                                             </template>
                                                         </div>
                                                     </div>
@@ -1813,8 +1824,21 @@ EOF
                                                         </select>
                                                     </div>
                                                     <div class="col-6">
-                                                        <label class="small text-muted">Sender Rewrite</label>
-                                                        <input v-model="n.sender_email" class="form-control form-control-sm" placeholder="可选">
+                                                        <label class="small text-muted">Sender Domain</label>
+                                                        <input v-model="n.sender_domain" class="form-control form-control-sm" placeholder="域名，如 mail.example.com">
+                                                    </div>
+                                                    <div class="col-6">
+                                                        <label class="small text-muted">Sender Prefix</label>
+                                                        <div class="input-group input-group-sm">
+                                                            <div class="input-group-text">
+                                                                <input type="checkbox" v-model="n.sender_random" class="form-check-input mt-0" title="随机生成">
+                                                                <span class="ms-1 small">随机</span>
+                                                            </div>
+                                                            <input v-model="n.sender_prefix" class="form-control" placeholder="如 mail" :disabled="n.sender_random">
+                                                        </div>
+                                                        <div class="small text-muted mt-1" v-if="n.sender_domain">
+                                                            预览: [[ n.sender_random ? '(6位随机)' : (n.sender_prefix || 'mail') ]]@[[ n.sender_domain ]]
+                                                        </div>
                                                     </div>
                                                     <div class="col-12">
                                                         <label class="small text-muted">Username</label>
@@ -1844,16 +1868,16 @@ EOF
                                                         </div>
                                                     </div>
                                                     <div class="col-12">
-                                                        <label class="small text-muted">分流规则</label>
+                                                        <label class="small text-muted">排除规则 <span class="text-danger">(选中的域名不发送)</span></label>
                                                         <div class="d-flex flex-wrap gap-1 mb-1">
-                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-primary':'btn-outline-secondary'" @click="n.routing_rules=''">通用</button>
+                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-success':'btn-outline-secondary'" @click="n.routing_rules=''" title="不排除任何域名">全部</button>
                                                             <template v-for="d in topDomains" :key="d.domain">
-                                                                <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-success':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)" :title="d.count + '封'">[[ formatDomainLabel(d.domain) ]]</button>
-                                                                <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasAllOtherDomains(n, d.domains)?'btn-success':'btn-outline-secondary'" @click="toggleOtherDomains(n, d.domains)" :title="d.count + '封 (' + (d.domains||[]).length + '个域名)'"><i class="bi bi-three-dots"></i> 其他</button>
+                                                                <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-danger':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)" :title="d.count + '封'">[[ formatDomainLabel(d.domain) ]]</button>
+                                                                <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasAllOtherDomains(n, d.domains)?'btn-danger':'btn-outline-secondary'" @click="toggleOtherDomains(n, d.domains)" :title="d.count + '封 (' + (d.domains||[]).length + '个域名)'">其他</button>
                                                             </template>
                                                             <span v-if="topDomains.length === 0" class="text-muted small">暂无数据</span>
                                                         </div>
-                                                        <input v-model="n.routing_rules" class="form-control form-control-sm" placeholder="域名...">
+                                                        <input v-model="n.routing_rules" class="form-control form-control-sm" placeholder="排除的域名，逗号分隔...">
                                                     </div>
                                                 </div>
                                             </div>
@@ -2355,7 +2379,7 @@ EOF
                     alert(`已应用到 ${selected.length} 个节点`);
                 },
                 addNode() { 
-                    this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', enabled: true, allow_bulk: true, routing_rules: '', expanded: true }); 
+                    this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', sender_domain: '', sender_prefix: '', sender_random: false, enabled: true, allow_bulk: true, routing_rules: '', expanded: true }); 
                 },
                 delNode(i) { if(confirm('删除此节点?')) this.config.downstream_pool.splice(i, 1); },
                 copyNode(i) {
