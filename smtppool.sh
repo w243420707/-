@@ -199,20 +199,25 @@ def send_telegram(msg):
         except: pass
 
 # --- SMTP Authenticator ---
+from aiosmtpd.smtp import AuthResult, LoginPassword
+
 class SMTPAuthenticator:
     def __call__(self, server, session, envelope, mechanism, auth_data):
+        fail_result = AuthResult(success=False, handled=True)
         try:
-            # Decode auth data (LOGIN mechanism)
-            if mechanism == 'LOGIN':
-                username = auth_data.login.decode('utf-8') if hasattr(auth_data, 'login') else ''
-                password = auth_data.password.decode('utf-8') if hasattr(auth_data, 'password') else ''
+            # Decode auth data
+            if isinstance(auth_data, LoginPassword):
+                username = auth_data.login.decode('utf-8') if isinstance(auth_data.login, bytes) else auth_data.login
+                password = auth_data.password.decode('utf-8') if isinstance(auth_data.password, bytes) else auth_data.password
             elif mechanism == 'PLAIN':
                 # PLAIN format: \0username\0password
-                parts = auth_data.decode('utf-8').split('\x00')
+                data = auth_data.decode('utf-8') if isinstance(auth_data, bytes) else auth_data
+                parts = data.split('\x00')
                 username = parts[1] if len(parts) > 1 else ''
                 password = parts[2] if len(parts) > 2 else ''
             else:
-                return False
+                logger.warning(f"❌ SMTP Auth unsupported mechanism: {mechanism}")
+                return fail_result
             
             # Verify user
             with get_db() as conn:
@@ -223,7 +228,7 @@ class SMTPAuthenticator:
                 
                 if not user:
                     logger.warning(f"❌ SMTP Auth failed: {username}")
-                    return False
+                    return fail_result
                 
                 # Check expiry
                 if user['expires_at']:
@@ -231,21 +236,21 @@ class SMTPAuthenticator:
                     expires = datetime.strptime(user['expires_at'], '%Y-%m-%d %H:%M:%S')
                     if datetime.now() > expires:
                         logger.warning(f"❌ SMTP Auth expired: {username}")
-                        return False
+                        return fail_result
                 
                 # Check limit
                 if user['email_limit'] > 0 and user['email_sent'] >= user['email_limit']:
                     logger.warning(f"❌ SMTP Auth limit reached: {username} ({user['email_sent']}/{user['email_limit']})")
-                    return False
+                    return fail_result
                 
                 # Store username in session for later use
                 session.smtp_user = username
                 session.smtp_user_id = user['id']
                 logger.info(f"✅ SMTP Auth success: {username}")
-                return True
+                return AuthResult(success=True)
         except Exception as e:
             logger.error(f"SMTP Auth error: {e}")
-            return False
+            return fail_result
 
 # --- SMTP Handler (Producer) ---
 class RelayHandler:
