@@ -2371,7 +2371,7 @@ EOF
                         </div>
                     </div>
                 </div>
-                <div class="modal-backdrop fade show" v-cloak v-if="showUserModal" @click="showUserModal=false"></div>
+                <div class="modal-backdrop fade" :class="{show: showUserModal}" :style="{display: showUserModal ? 'block' : 'none'}" @click="showUserModal=false"></div>
 
                 <!-- Batch Generate Modal -->
                 <div class="modal fade" :class="{show: showBatchUserModal}" :style="{display: showBatchUserModal ? 'block' : 'none'}" tabindex="-1">
@@ -2415,7 +2415,7 @@ EOF
                         </div>
                     </div>
                 </div>
-                <div class="modal-backdrop fade show" v-cloak v-if="showBatchUserModal" @click="showBatchUserModal=false"></div>
+                <div class="modal-backdrop fade" :class="{show: showBatchUserModal}" :style="{display: showBatchUserModal ? 'block' : 'none'}" @click="showBatchUserModal=false"></div>
             </div>
 
             <!-- Settings Tab -->
@@ -2598,7 +2598,7 @@ EOF
                         </div>
                     </div>
                 </div>
-                <div class="modal-backdrop fade show" v-cloak v-if="showGroupModal" @click="showGroupModal = false"></div>
+                <div class="modal-backdrop fade" :class="{show: showGroupModal}" :style="{display: showGroupModal ? 'block' : 'none'}" @click="showGroupModal = false"></div>
 
                 <!-- Table View -->
                 <div v-if="nodeViewMode === 'table'" class="card">
