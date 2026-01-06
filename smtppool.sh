@@ -159,6 +159,8 @@ def init_db():
             password TEXT NOT NULL,
             email_limit INTEGER DEFAULT 0,
             email_sent INTEGER DEFAULT 0,
+            hourly_sent INTEGER DEFAULT 0,
+            hourly_reset_at TIMESTAMP,
             expires_at TIMESTAMP,
             enabled INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT (datetime('now', '+08:00')),
@@ -171,6 +173,10 @@ def init_db():
             cols = [c[1] for c in cursor.fetchall()]
             if 'last_used_at' not in cols:
                 conn.execute("ALTER TABLE smtp_users ADD COLUMN last_used_at TIMESTAMP")
+            if 'hourly_sent' not in cols:
+                conn.execute("ALTER TABLE smtp_users ADD COLUMN hourly_sent INTEGER DEFAULT 0")
+            if 'hourly_reset_at' not in cols:
+                conn.execute("ALTER TABLE smtp_users ADD COLUMN hourly_reset_at TIMESTAMP")
         except: pass
 
 # --- Config & Logging ---
@@ -238,21 +244,34 @@ class SMTPAuthenticator:
                 
                 # Check expiry
                 if user['expires_at']:
-                    from datetime import datetime
                     expires = datetime.strptime(user['expires_at'], '%Y-%m-%d %H:%M:%S')
                     if datetime.now() > expires:
                         logger.warning(f"❌ SMTP Auth expired: {username}")
                         return fail_result
                 
-                # Check limit
-                if user['email_limit'] > 0 and user['email_sent'] >= user['email_limit']:
-                    logger.warning(f"❌ SMTP Auth limit reached: {username} ({user['email_sent']}/{user['email_limit']})")
+                # Check hourly limit - reset if hour changed
+                now = datetime.now()
+                current_hour = now.strftime('%Y-%m-%d %H:00:00')
+                hourly_sent = user['hourly_sent'] or 0
+                hourly_reset_at = user['hourly_reset_at']
+                
+                # Reset hourly count if hour changed
+                if hourly_reset_at != current_hour:
+                    hourly_sent = 0
+                    conn.execute(
+                        "UPDATE smtp_users SET hourly_sent=0, hourly_reset_at=? WHERE id=?",
+                        (current_hour, user['id'])
+                    )
+                
+                # Check hourly limit
+                if user['email_limit'] > 0 and hourly_sent >= user['email_limit']:
+                    logger.warning(f"❌ SMTP Auth hourly limit reached: {username} ({hourly_sent}/{user['email_limit']}/h)")
                     return fail_result
                 
                 # Store username in session for later use
                 session.smtp_user = username
                 session.smtp_user_id = user['id']
-                logger.info(f"✅ SMTP Auth success: {username}")
+                logger.info(f"✅ SMTP Auth success: {username} (hourly: {hourly_sent}/{user['email_limit']})")
                 return AuthResult(success=True)
         except Exception as e:
             logger.error(f"SMTP Auth error: {e}")
@@ -318,11 +337,17 @@ class RelayHandler:
                         except sqlite3.IntegrityError:
                             pass  # Already exists, ignore
                 
-                # Update SMTP user sent count
+                # Update SMTP user sent count (both total and hourly)
                 if hasattr(session, 'smtp_user_id'):
+                    current_hour = datetime.now().strftime('%Y-%m-%d %H:00:00')
                     conn.execute(
-                        "UPDATE smtp_users SET email_sent = email_sent + ?, last_used_at = datetime('now', '+08:00') WHERE id = ?",
-                        (len(envelope.rcpt_tos), session.smtp_user_id)
+                        """UPDATE smtp_users SET 
+                           email_sent = email_sent + ?, 
+                           hourly_sent = CASE WHEN hourly_reset_at = ? THEN hourly_sent + ? ELSE ? END,
+                           hourly_reset_at = ?,
+                           last_used_at = datetime('now', '+08:00') 
+                           WHERE id = ?""",
+                        (len(envelope.rcpt_tos), current_hour, len(envelope.rcpt_tos), len(envelope.rcpt_tos), current_hour, session.smtp_user_id)
                     )
                             
             return '250 OK: Queued for redundant delivery'
@@ -1091,7 +1116,7 @@ def api_send_bulk():
 @login_required
 def api_smtp_users_list():
     with get_db() as conn:
-        rows = conn.execute("SELECT id, username, email_limit, email_sent, expires_at, enabled, created_at, last_used_at FROM smtp_users ORDER BY id DESC").fetchall()
+        rows = conn.execute("SELECT id, username, email_limit, email_sent, hourly_sent, hourly_reset_at, expires_at, enabled, created_at, last_used_at FROM smtp_users ORDER BY id DESC").fetchall()
     return jsonify([dict(r) for r in rows])
 
 @app.route('/api/smtp-users', methods=['POST'])
@@ -1171,10 +1196,10 @@ def api_smtp_users_batch():
     
     # Determine limit and expiry based on type
     limit_map = {
-        'free': (user_limits.get('free', 100), None),
-        'monthly': (user_limits.get('monthly', 10000), 30),
-        'quarterly': (user_limits.get('quarterly', 30000), 90),
-        'yearly': (user_limits.get('yearly', 100000), 365)
+        'free': (user_limits.get('free', 10), None),
+        'monthly': (user_limits.get('monthly', 100), 30),
+        'quarterly': (user_limits.get('quarterly', 500), 90),
+        'yearly': (user_limits.get('yearly', 1000), 365)
     }
     email_limit, days = limit_map.get(user_type, (100, None))
     
@@ -1939,11 +1964,11 @@ EOF
                             <thead>
                                 <tr>
                                     <th>用户名</th>
-                                    <th>发送限额</th>
-                                    <th>已发送</th>
+                                    <th>限额/小时</th>
+                                    <th>本小时</th>
+                                    <th>累计</th>
                                     <th>到期时间</th>
                                     <th>状态</th>
-                                    <th>最后使用</th>
                                     <th style="width:180px">操作</th>
                                 </tr>
                             </thead>
@@ -1953,11 +1978,12 @@ EOF
                                 </tr>
                                 <tr v-for="u in smtpUsers" :key="u.id">
                                     <td><strong>[[ u.username ]]</strong></td>
-                                    <td>[[ u.email_limit == 0 ? '无限制' : u.email_limit.toLocaleString() ]]</td>
+                                    <td>[[ u.email_limit == 0 ? '无限制' : u.email_limit.toLocaleString() + '/h' ]]</td>
                                     <td>
-                                        <span :class="{'text-danger': u.email_limit > 0 && u.email_sent >= u.email_limit}">[[ u.email_sent.toLocaleString() ]]</span>
-                                        <span v-if="u.email_limit > 0" class="text-muted"> / [[ u.email_limit.toLocaleString() ]]</span>
+                                        <span :class="{'text-danger': u.email_limit > 0 && (u.hourly_sent||0) >= u.email_limit}">[[ (u.hourly_sent||0).toLocaleString() ]]</span>
+                                        <span v-if="u.email_limit > 0" class="text-muted"> / [[ u.email_limit ]]</span>
                                     </td>
+                                    <td class="text-muted">[[ (u.email_sent||0).toLocaleString() ]]</td>
                                     <td>
                                         <span v-if="!u.expires_at" class="text-muted">永不过期</span>
                                         <span v-else :class="{'text-danger': new Date(u.expires_at) < new Date()}">[[ u.expires_at ]]</span>
@@ -1965,7 +1991,6 @@ EOF
                                     <td>
                                         <span class="badge" :class="u.enabled ? 'bg-success' : 'bg-secondary'">[[ u.enabled ? '启用' : '禁用' ]]</span>
                                     </td>
-                                    <td><small class="text-muted">[[ u.last_used_at || '从未使用' ]]</small></td>
                                     <td>
                                         <button class="btn btn-sm btn-outline-secondary me-1" @click="resetUserCount(u)" title="重置计数">
                                             <i class="bi bi-arrow-counterclockwise"></i>
@@ -2001,9 +2026,9 @@ EOF
                                     <input type="password" class="form-control" v-model="userForm.password" :placeholder="editingUser ? '留空则不修改密码' : 'SMTP登录密码'">
                                 </div>
                                 <div class="mb-3">
-                                    <label class="form-label">发送限额</label>
+                                    <label class="form-label">发送限额 (每小时)</label>
                                     <input type="number" class="form-control" v-model.number="userForm.email_limit" min="0" placeholder="0表示无限制">
-                                    <div class="form-text">允许发送的邮件总数，0为不限制</div>
+                                    <div class="form-text">每小时允许发送的邮件数量，0为不限制</div>
                                 </div>
                                 <div class="mb-3">
                                     <label class="form-label">到期时间</label>
@@ -2036,10 +2061,10 @@ EOF
                                 <div class="mb-3">
                                     <label class="form-label">用户类型 <span class="text-danger">*</span></label>
                                     <select class="form-select" v-model="batchUserForm.type">
-                                        <option value="free">免费用户 (限额: [[ config.user_limits?.free || 100 ]] 封)</option>
-                                        <option value="monthly">月度用户 (限额: [[ config.user_limits?.monthly || 10000 ]] 封)</option>
-                                        <option value="quarterly">季度用户 (限额: [[ config.user_limits?.quarterly || 30000 ]] 封)</option>
-                                        <option value="yearly">年度用户 (限额: [[ config.user_limits?.yearly || 100000 ]] 封)</option>
+                                        <option value="free">免费用户 (限额: [[ config.user_limits?.free || 10 ]] 封/小时)</option>
+                                        <option value="monthly">月度用户 (限额: [[ config.user_limits?.monthly || 100 ]] 封/小时)</option>
+                                        <option value="quarterly">季度用户 (限额: [[ config.user_limits?.quarterly || 500 ]] 封/小时)</option>
+                                        <option value="yearly">年度用户 (限额: [[ config.user_limits?.yearly || 1000 ]] 封/小时)</option>
                                     </select>
                                 </div>
                                 <div class="mb-3">
@@ -2132,23 +2157,23 @@ EOF
                             <div class="card-body">
                                 <div class="row g-3">
                                     <div class="col-md-3 col-6">
-                                        <label class="form-label">免费用户 (封/月)</label>
-                                        <input type="number" v-model.number="config.user_limits.free" class="form-control" placeholder="100">
+                                        <label class="form-label">免费用户 (封/小时)</label>
+                                        <input type="number" v-model.number="config.user_limits.free" class="form-control" placeholder="10">
                                     </div>
                                     <div class="col-md-3 col-6">
-                                        <label class="form-label">月度用户 (封/月)</label>
-                                        <input type="number" v-model.number="config.user_limits.monthly" class="form-control" placeholder="10000">
+                                        <label class="form-label">月度用户 (封/小时)</label>
+                                        <input type="number" v-model.number="config.user_limits.monthly" class="form-control" placeholder="100">
                                     </div>
                                     <div class="col-md-3 col-6">
-                                        <label class="form-label">季度用户 (封/月)</label>
-                                        <input type="number" v-model.number="config.user_limits.quarterly" class="form-control" placeholder="30000">
+                                        <label class="form-label">季度用户 (封/小时)</label>
+                                        <input type="number" v-model.number="config.user_limits.quarterly" class="form-control" placeholder="500">
                                     </div>
                                     <div class="col-md-3 col-6">
-                                        <label class="form-label">年度用户 (封/月)</label>
-                                        <input type="number" v-model.number="config.user_limits.yearly" class="form-control" placeholder="100000">
+                                        <label class="form-label">年度用户 (封/小时)</label>
+                                        <input type="number" v-model.number="config.user_limits.yearly" class="form-control" placeholder="1000">
                                     </div>
                                 </div>
-                                <div class="form-text mt-2">批量生成用户时将使用这些限额设置</div>
+                                <div class="form-text mt-2">批量生成用户时将使用这些每小时发送限额</div>
                             </div>
                         </div>
                     </div>
@@ -2459,7 +2484,7 @@ EOF
             mounted() {
                 if(!this.config.limit_config) this.config.limit_config = { max_per_hour: 0, min_interval: 1, max_interval: 5 };
                 if(!this.config.log_config) this.config.log_config = { max_mb: 50, backups: 3, retention_days: 7 };
-                if(!this.config.user_limits) this.config.user_limits = { free: 100, monthly: 10000, quarterly: 30000, yearly: 100000 };
+                if(!this.config.user_limits) this.config.user_limits = { free: 10, monthly: 100, quarterly: 500, yearly: 1000 };
                 this.config.downstream_pool.forEach(n => { 
                     if(n.enabled === undefined) n.enabled = true; 
                     if(n.allow_bulk === undefined) n.allow_bulk = true;
