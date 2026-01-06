@@ -1383,32 +1383,32 @@ def api_contacts_remove_small_domains():
     except:
         return jsonify({"error": "Invalid threshold"}), 400
     
-    # First get domain counts
+    # Use SQL to efficiently find and delete emails from small domains
     with get_db() as conn:
-        rows = conn.execute("SELECT email FROM contacts").fetchall()
+        # Get count before deletion
+        before_count = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+        
+        # Create a subquery to find emails from domains with count >= threshold (to keep)
+        # Then delete everything else
+        # This is more efficient than iterating through thousands of domains
+        conn.execute("""
+            DELETE FROM contacts WHERE id NOT IN (
+                SELECT c.id FROM contacts c
+                INNER JOIN (
+                    SELECT LOWER(SUBSTR(email, INSTR(email, '@') + 1)) as domain
+                    FROM contacts
+                    GROUP BY LOWER(SUBSTR(email, INSTR(email, '@') + 1))
+                    HAVING COUNT(*) >= ?
+                ) keep_domains
+                ON LOWER(SUBSTR(c.email, INSTR(c.email, '@') + 1)) = keep_domains.domain
+            )
+        """, (threshold,))
+        
+        # Get count after deletion
+        after_count = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+        deleted = before_count - after_count
     
-    domain_count = {}
-    for row in rows:
-        email = row['email']
-        if '@' in email:
-            domain = email.split('@')[-1].lower().strip()
-            if domain:
-                domain_count[domain] = domain_count.get(domain, 0) + 1
-    
-    # Find domains below threshold
-    small_domains = [d for d, c in domain_count.items() if c < threshold]
-    
-    if not small_domains:
-        return jsonify({"status": "ok", "deleted": 0, "domains": [], "threshold": threshold})
-    
-    # Delete emails from small domains
-    total_deleted = 0
-    with get_db() as conn:
-        for domain in small_domains:
-            result = conn.execute("DELETE FROM contacts WHERE LOWER(email) LIKE ?", ('%@' + domain,))
-            total_deleted += result.rowcount
-    
-    return jsonify({"status": "ok", "deleted": total_deleted, "domains": small_domains, "threshold": threshold})
+    return jsonify({"status": "ok", "deleted": deleted, "threshold": threshold})
 
 @app.route('/api/draft', methods=['GET', 'POST'])
 @login_required
@@ -3162,10 +3162,10 @@ EOF
                         const data = await res.json();
                         if (data.deleted > 0) {
                             // Also remove from current input if present
-                            if (this.bulk.recipients && data.domains) {
+                            if (this.bulk.recipients) {
                                 let emails = this.bulk.recipients.split('\n').filter(r => r.trim());
-                                data.domains.forEach(domain => {
-                                    emails = emails.filter(e => !e.trim().toLowerCase().endsWith('@' + domain.toLowerCase()));
+                                smallDomains.forEach(ds => {
+                                    emails = emails.filter(e => !e.trim().toLowerCase().endsWith('@' + ds.domain.toLowerCase()));
                                 });
                                 this.bulk.recipients = emails.join('\n');
                             }
