@@ -124,6 +124,10 @@ def init_db():
                 conn.execute("ALTER TABLE queue ADD COLUMN opened_at TIMESTAMP")
             if 'open_count' not in cols:
                 conn.execute("ALTER TABLE queue ADD COLUMN open_count INTEGER DEFAULT 0")
+            if 'subject' not in cols:
+                conn.execute("ALTER TABLE queue ADD COLUMN subject TEXT")
+            if 'smtp_user' not in cols:
+                conn.execute("ALTER TABLE queue ADD COLUMN smtp_user TEXT")
         except Exception as e:
             print(f"DB Init Warning: {e}")
 
@@ -286,14 +290,23 @@ class RelayHandler:
 
         logger.info(f"📥 Received | From: {envelope.mail_from} | To: {envelope.rcpt_tos} | Redundant Nodes: {[n['name'] for n in selected_nodes]}")
         
+        # Extract subject from email content
+        subject = ''
+        smtp_user = getattr(session, 'smtp_user', None)
+        try:
+            msg = message_from_bytes(envelope.content)
+            subject = msg.get('Subject', '')[:100]  # Limit to 100 chars
+        except:
+            pass
+        
         # 3. Queue for all selected nodes (No Direct Send anymore to ensure async redundancy)
         try:
             with get_db() as conn:
                 for node in selected_nodes:
                     node_name = node.get('name', 'Unknown')
                     conn.execute(
-                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+08:00'), datetime('now', '+08:00'))",
-                        (envelope.mail_from, json.dumps(envelope.rcpt_tos), envelope.content, node_name, 'pending', 'relay', None)
+                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, last_error, subject, smtp_user, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+08:00'), datetime('now', '+08:00'))",
+                        (envelope.mail_from, json.dumps(envelope.rcpt_tos), envelope.content, node_name, 'pending', 'relay', None, subject, smtp_user)
                     )
                 
                 # Auto-save relay recipients to contacts list
@@ -697,7 +710,7 @@ def api_queue_list():
         limit = int(request.args.get('limit', 50))
     except: limit = 50
     with get_db() as conn:
-        rows = conn.execute("SELECT id, mail_from, rcpt_tos, assigned_node, status, retry_count, last_error, created_at FROM queue ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        rows = conn.execute("SELECT id, mail_from, rcpt_tos, assigned_node, status, retry_count, last_error, created_at, subject, smtp_user FROM queue ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return jsonify([dict(r) for r in rows])
 
 @app.route('/api/domain/stats')
@@ -1139,6 +1152,62 @@ def api_smtp_users_delete(user_id):
     with get_db() as conn:
         conn.execute("DELETE FROM smtp_users WHERE id=?", (user_id,))
     return jsonify({"status": "ok"})
+
+@app.route('/api/smtp-users/batch', methods=['POST'])
+@login_required
+def api_smtp_users_batch():
+    """Batch generate SMTP users"""
+    import secrets
+    import string
+    
+    data = request.json
+    user_type = data.get('type', 'free')
+    count = min(int(data.get('count', 1)), 1000)  # Max 1000
+    prefix = data.get('prefix', '').strip() or 'user_'
+    
+    # Load config for limits
+    cfg = load_config()
+    user_limits = cfg.get('user_limits', {})
+    
+    # Determine limit and expiry based on type
+    limit_map = {
+        'free': (user_limits.get('free', 100), None),
+        'monthly': (user_limits.get('monthly', 10000), 30),
+        'quarterly': (user_limits.get('quarterly', 30000), 90),
+        'yearly': (user_limits.get('yearly', 100000), 365)
+    }
+    email_limit, days = limit_map.get(user_type, (100, None))
+    
+    # Generate users
+    generated = []
+    with get_db() as conn:
+        for i in range(count):
+            # Generate unique username and password
+            suffix = secrets.token_hex(4)
+            username = f"{prefix}{suffix}"
+            password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
+            
+            # Calculate expiry
+            expires_at = None
+            if days:
+                expires_at = (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+            
+            try:
+                conn.execute(
+                    "INSERT INTO smtp_users (username, password, email_limit, expires_at, enabled) VALUES (?, ?, ?, ?, 1)",
+                    (username, password, email_limit, expires_at)
+                )
+                generated.append({
+                    'username': username,
+                    'password': password,
+                    'email_limit': email_limit,
+                    'expires_at': expires_at or '永久有效',
+                    'type': user_type
+                })
+            except sqlite3.IntegrityError:
+                continue  # Skip duplicates
+    
+    return jsonify({"status": "ok", "users": generated, "count": len(generated)})
 
 @app.route('/api/contacts/import', methods=['POST'])
 @login_required
@@ -1735,13 +1804,17 @@ EOF
                     </div>
                     <div class="table-responsive" style="max-height: 550px; overflow-y: auto;">
                         <table class="table table-custom table-hover mb-0">
-                            <thead style="position: sticky; top: 0; background: var(--card-bg); z-index: 1;"><tr><th class="ps-4">ID</th><th>详情</th><th>节点</th><th>状态</th><th>时间</th></tr></thead>
+                            <thead style="position: sticky; top: 0; background: var(--card-bg); z-index: 1;"><tr><th class="ps-4">ID</th><th>用户/主题</th><th>详情</th><th>节点</th><th>状态</th><th>时间</th></tr></thead>
                             <tbody>
                                 <tr v-for="m in qList" :key="m.id">
                                     <td class="ps-4 text-muted">#[[ m.id ]]</td>
                                     <td>
+                                        <div v-if="m.smtp_user" class="small"><span class="badge bg-info-subtle text-info">[[ m.smtp_user ]]</span></div>
+                                        <div class="text-muted small text-truncate" style="max-width: 150px;" :title="m.subject">[[ m.subject || '-' ]]</div>
+                                    </td>
+                                    <td>
                                         <div class="fw-bold text-theme-main">[[ m.mail_from ]]</div>
-                                        <div class="text-muted small text-truncate" style="max-width: 250px;">[[ m.rcpt_tos ]]</div>
+                                        <div class="text-muted small text-truncate" style="max-width: 200px;">[[ m.rcpt_tos ]]</div>
                                     </td>
                                     <td><span class="badge bg-theme-light text-theme-main border border-theme">[[ m.assigned_node ]]</span></td>
                                     <td>
@@ -1750,7 +1823,7 @@ EOF
                                     </td>
                                     <td class="text-muted small">[[ m.created_at ]]</td>
                                 </tr>
-                                <tr v-if="qList.length===0"><td colspan="5" class="text-center py-5 text-muted">暂无记录</td></tr>
+                                <tr v-if="qList.length===0"><td colspan="6" class="text-center py-5 text-muted">暂无记录</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -1850,9 +1923,14 @@ EOF
             <div v-if="tab=='users'" class="fade-in">
                 <div class="d-flex justify-content-between align-items-center mb-4">
                     <h4 class="fw-bold mb-0">SMTP 用户管理</h4>
-                    <button class="btn btn-primary" @click="showAddUserModal">
-                        <i class="bi bi-plus-lg me-1"></i>添加用户
-                    </button>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-outline-primary" @click="showBatchUserModal=true">
+                            <i class="bi bi-people-fill me-1"></i>批量生成
+                        </button>
+                        <button class="btn btn-primary" @click="showAddUserModal">
+                            <i class="bi bi-plus-lg me-1"></i>添加用户
+                        </button>
+                    </div>
                 </div>
 
                 <div class="card">
@@ -1945,6 +2023,50 @@ EOF
                     </div>
                 </div>
                 <div class="modal-backdrop fade show" v-if="showUserModal" @click="showUserModal=false"></div>
+
+                <!-- Batch Generate Modal -->
+                <div class="modal fade" :class="{show: showBatchUserModal}" :style="{display: showBatchUserModal ? 'block' : 'none'}" tabindex="-1">
+                    <div class="modal-dialog">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h5 class="modal-title">批量生成用户</h5>
+                                <button type="button" class="btn-close" @click="showBatchUserModal=false"></button>
+                            </div>
+                            <div class="modal-body">
+                                <div class="mb-3">
+                                    <label class="form-label">用户类型 <span class="text-danger">*</span></label>
+                                    <select class="form-select" v-model="batchUserForm.type">
+                                        <option value="free">免费用户 (限额: [[ config.user_limits?.free || 100 ]] 封)</option>
+                                        <option value="monthly">月度用户 (限额: [[ config.user_limits?.monthly || 10000 ]] 封)</option>
+                                        <option value="quarterly">季度用户 (限额: [[ config.user_limits?.quarterly || 30000 ]] 封)</option>
+                                        <option value="yearly">年度用户 (限额: [[ config.user_limits?.yearly || 100000 ]] 封)</option>
+                                    </select>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">生成数量 <span class="text-danger">*</span></label>
+                                    <input type="number" class="form-control" v-model.number="batchUserForm.count" min="1" max="1000" placeholder="输入生成数量 (1-1000)">
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">用户名前缀</label>
+                                    <input type="text" class="form-control" v-model="batchUserForm.prefix" placeholder="留空使用默认前缀 (user_)">
+                                </div>
+                                <div class="alert alert-info small mb-0">
+                                    <i class="bi bi-info-circle me-1"></i>
+                                    生成后将自动下载包含用户名和密码的 CSV 文件。
+                                    <br>用户有效期: 免费=永久, 月度=30天, 季度=90天, 年度=365天
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn btn-secondary" @click="showBatchUserModal=false">取消</button>
+                                <button type="button" class="btn btn-primary" @click="batchGenerateUsers" :disabled="batchGenerating">
+                                    <span v-if="batchGenerating" class="spinner-border spinner-border-sm me-1"></span>
+                                    生成并下载
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-backdrop fade show" v-if="showBatchUserModal" @click="showBatchUserModal=false"></div>
             </div>
 
             <!-- Settings Tab -->
@@ -2000,6 +2122,33 @@ EOF
                                     <input type="text" v-model="config.web_config.public_domain" class="form-control" placeholder="http://YOUR_IP:8080">
                                     <div class="form-text">用于生成邮件打开追踪链接，请填写公网可访问地址。</div>
                                 </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="col-12">
+                        <div class="card">
+                            <div class="card-header">用户套餐限额配置</div>
+                            <div class="card-body">
+                                <div class="row g-3">
+                                    <div class="col-md-3 col-6">
+                                        <label class="form-label">免费用户 (封/月)</label>
+                                        <input type="number" v-model.number="config.user_limits.free" class="form-control" placeholder="100">
+                                    </div>
+                                    <div class="col-md-3 col-6">
+                                        <label class="form-label">月度用户 (封/月)</label>
+                                        <input type="number" v-model.number="config.user_limits.monthly" class="form-control" placeholder="10000">
+                                    </div>
+                                    <div class="col-md-3 col-6">
+                                        <label class="form-label">季度用户 (封/月)</label>
+                                        <input type="number" v-model.number="config.user_limits.quarterly" class="form-control" placeholder="30000">
+                                    </div>
+                                    <div class="col-md-3 col-6">
+                                        <label class="form-label">年度用户 (封/月)</label>
+                                        <input type="number" v-model.number="config.user_limits.yearly" class="form-control" placeholder="100000">
+                                    </div>
+                                </div>
+                                <div class="form-text mt-2">批量生成用户时将使用这些限额设置</div>
                             </div>
                         </div>
                     </div>
@@ -2240,7 +2389,10 @@ EOF
                     smtpUsers: [],
                     showUserModal: false,
                     editingUser: null,
-                    userForm: { username: '', password: '', email_limit: 0, expires_at: '', enabled: true }
+                    userForm: { username: '', password: '', email_limit: 0, expires_at: '', enabled: true },
+                    showBatchUserModal: false,
+                    batchUserForm: { type: 'monthly', count: 10, prefix: '' },
+                    batchGenerating: false
                 }
             },
             computed: {
@@ -2307,6 +2459,7 @@ EOF
             mounted() {
                 if(!this.config.limit_config) this.config.limit_config = { max_per_hour: 0, min_interval: 1, max_interval: 5 };
                 if(!this.config.log_config) this.config.log_config = { max_mb: 50, backups: 3, retention_days: 7 };
+                if(!this.config.user_limits) this.config.user_limits = { free: 100, monthly: 10000, quarterly: 30000, yearly: 100000 };
                 this.config.downstream_pool.forEach(n => { 
                     if(n.enabled === undefined) n.enabled = true; 
                     if(n.allow_bulk === undefined) n.allow_bulk = true;
@@ -2402,6 +2555,42 @@ EOF
                         });
                         this.fetchSmtpUsers();
                     } catch(e) { alert('重置失败: ' + e.message); }
+                },
+                async batchGenerateUsers() {
+                    if (!this.batchUserForm.count || this.batchUserForm.count < 1) {
+                        alert('请输入有效的生成数量'); return;
+                    }
+                    this.batchGenerating = true;
+                    try {
+                        const res = await fetch('/api/smtp-users/batch', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(this.batchUserForm)
+                        });
+                        const data = await res.json();
+                        if (data.users && data.users.length > 0) {
+                            // Generate CSV content
+                            const typeNames = { free: '免费用户', monthly: '月度用户', quarterly: '季度用户', yearly: '年度用户' };
+                            let csv = 'Username,Password,Type,EmailLimit,ExpiresAt\n';
+                            data.users.forEach(u => {
+                                csv += `${u.username},${u.password},${typeNames[u.type] || u.type},${u.email_limit},${u.expires_at}\n`;
+                            });
+                            // Download CSV
+                            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                            const link = document.createElement('a');
+                            link.href = URL.createObjectURL(blob);
+                            link.download = `smtp_users_${this.batchUserForm.type}_${new Date().toISOString().slice(0,10)}.csv`;
+                            link.click();
+                            URL.revokeObjectURL(link.href);
+                            
+                            alert(`成功生成 ${data.count} 个用户，CSV 文件已下载`);
+                            this.showBatchUserModal = false;
+                            this.fetchSmtpUsers();
+                        } else {
+                            alert('生成失败，请重试');
+                        }
+                    } catch(e) { alert('生成失败: ' + e.message); }
+                    this.batchGenerating = false;
                 },
                 setTheme(t) {
                     this.theme = t;
