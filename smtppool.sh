@@ -2551,7 +2551,7 @@ EOF
                 </div>
 
                 <!-- Group Management Modal -->
-                <div v-if="showGroupModal" class="modal d-block" style="background: rgba(0,0,0,0.5);" @click.self="showGroupModal = false">
+                <div class="modal fade" :class="{show: showGroupModal}" :style="{display: showGroupModal ? 'block' : 'none'}" tabindex="-1" @click.self="showGroupModal = false">
                     <div class="modal-dialog modal-dialog-centered">
                         <div class="modal-content">
                             <div class="modal-header">
@@ -2595,6 +2595,7 @@ EOF
                         </div>
                     </div>
                 </div>
+                <div class="modal-backdrop fade show" v-if="showGroupModal" @click="showGroupModal = false"></div>
 
                 <!-- Table View -->
                 <div v-if="nodeViewMode === 'table'" class="card">
