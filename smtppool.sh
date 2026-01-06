@@ -1793,6 +1793,9 @@ EOF
                 <div class="nav-item" :class="{active: tab=='send'}" @click="tab='send'; mobileMenu=false">
                     <i class="bi bi-envelope-paper-fill"></i> <span>邮件群发</span>
                 </div>
+                <div class="nav-item" :class="{active: tab=='nodes'}" @click="tab='nodes'; mobileMenu=false">
+                    <i class="bi bi-diagram-3-fill"></i> <span>节点池</span>
+                </div>
                 <div class="nav-item" :class="{active: tab=='users'}" @click="tab='users'; fetchSmtpUsers(); mobileMenu=false">
                     <i class="bi bi-people-fill"></i> <span>用户管理</span>
                 </div>
@@ -2357,206 +2360,298 @@ EOF
                             </div>
                         </div>
                     </div>
+                </div>
+            </div>
+
+            <!-- Nodes Tab -->
+            <div v-if="tab=='nodes'" class="fade-in">
+                <div class="d-flex justify-content-between align-items-center mb-4">
+                    <h4 class="fw-bold mb-0">下游节点池</h4>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-outline-secondary" @click="showBatchEdit = !showBatchEdit"><i class="bi bi-pencil-square"></i> 批量编辑</button>
+                        <button class="btn btn-outline-primary" @click="addNode"><i class="bi bi-plus-lg"></i> 添加节点</button>
+                        <button class="btn btn-primary" @click="save" :disabled="saving">
+                            <span v-if="saving" class="spinner-border spinner-border-sm me-2"></span>
+                            保存配置
+                        </button>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <!-- Batch Edit Panel -->
+                    <div v-if="showBatchEdit" class="card-body border-bottom" style="background: var(--hover-bg);">
+                        <div class="row g-3 align-items-end">
+                            <div class="col-12">
+                                <div class="d-flex align-items-center gap-2 flex-wrap">
+                                    <span class="text-muted small fw-bold">选择节点:</span>
+                                    <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click="batchSelectAll">全选</button>
+                                    <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click="batchSelectNone">全不选</button>
+                                    <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click="batchSelectEnabled">仅启用</button>
+                                    <span class="badge bg-primary-subtle text-primary ms-2">[[ batchSelectedCount ]] 个已选</span>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small mb-1"><i class="bi bi-speedometer2"></i> 批量设置速度</label>
+                                <div class="d-flex align-items-center gap-2">
+                                    <input v-model.number="batchEdit.max_per_hour" type="number" class="form-control form-control-sm" style="width: 80px;" placeholder="Max/Hr">
+                                    <span class="text-muted small">/h</span>
+                                    <input v-model.number="batchEdit.min_interval" type="number" class="form-control form-control-sm" style="width: 60px;" placeholder="Min">
+                                    <span class="text-muted small">~</span>
+                                    <input v-model.number="batchEdit.max_interval" type="number" class="form-control form-control-sm" style="width: 60px;" placeholder="Max">
+                                    <span class="text-muted small">s</span>
+                                    <button class="btn btn-sm btn-primary" @click="applyBatchSpeed">应用</button>
+                                </div>
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label small mb-1"><i class="bi bi-signpost-split"></i> 批量设置排除规则</label>
+                                <div class="d-flex align-items-center gap-1 flex-wrap">
+                                    <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchEdit.routing_rules===''?'btn-success':'btn-outline-secondary'" @click="batchEdit.routing_rules=''" title="不排除任何域名">全部</button>
+                                    <template v-for="d in topDomains" :key="'batch-'+d.domain">
+                                        <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchHasDomain(d.domain)?'btn-danger':'btn-outline-secondary'" @click="batchToggleDomain(d.domain)">[[ formatDomainLabel(d.domain) ]]</button>
+                                        <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchHasAllOther(d.domains)?'btn-danger':'btn-outline-secondary'" @click="batchToggleOther(d.domains)">其他</button>
+                                    </template>
+                                    <button class="btn btn-sm btn-primary ms-2" @click="applyBatchRouting">应用</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card-body bg-theme-light">
+                        <div v-if="config.downstream_pool.length === 0" class="text-center py-5 text-muted">
+                            暂无节点，请点击右上角添加
+                        </div>
+                        <div class="row g-3">
+                            <div v-for="(n, i) in config.downstream_pool" :key="i" class="col-md-6 col-xl-4"
+                                 @dragover.prevent="onDragOver($event, i)"
+                                 @drop="onDrop($event, i)"
+                                 :class="{'drag-over': dragOverIndex === i && draggingIndex !== i}">
+                                <div class="card h-100 shadow-sm" :style="draggingIndex === i ? 'opacity: 0.5' : ''">
+                                    <div class="card-header py-2 bg-transparent">
+                                        <!-- Node name row -->
+                                        <div class="d-flex justify-content-between align-items-center mb-1" style="cursor:pointer;" @click="n.expanded = !n.expanded">
+                                            <div class="d-flex align-items-center gap-2 flex-grow-1" style="min-width: 0;">
+                                                <input v-if="showBatchEdit" type="checkbox" v-model="n.batchSelected" class="form-check-input" style="width: 1.2em; height: 1.2em;" @click.stop title="选择此节点">
+                                                <i class="bi text-muted" :class="n.expanded ? 'bi-chevron-down' : 'bi-chevron-right'"></i>
+                                                <span class="fw-bold" style="word-break: break-all;">[[ n.name ]]</span>
+                                            </div>
+                                        </div>
+                                        <!-- Switches and buttons row -->
+                                        <div class="d-flex align-items-center justify-content-between">
+                                            <div class="d-flex align-items-center gap-2">
+                                                <div class="form-check form-switch mb-0" @click.stop title="启用/禁用节点">
+                                                    <input class="form-check-input" type="checkbox" v-model="n.enabled" style="width: 2em; height: 1em;">
+                                                    <label class="form-check-label small text-muted">启用</label>
+                                                </div>
+                                                <div class="form-check form-switch mb-0" @click.stop title="允许群发 (Bulk)">
+                                                    <input class="form-check-input" :class="n.allow_bulk ? 'bg-warning border-warning' : ''" type="checkbox" v-model="n.allow_bulk" style="width: 2em; height: 1em;">
+                                                    <label class="form-check-label small text-muted">群发</label>
+                                                </div>
+                                            </div>
+                                            <div class="d-flex gap-1 flex-shrink-0">
+                                                <span class="btn btn-sm btn-outline-secondary py-0 px-2" 
+                                                      draggable="true"
+                                                      @dragstart="onDragStart($event, i)"
+                                                      @dragend="onDragEnd"
+                                                      style="cursor: grab;"
+                                                      title="按住拖拽移动"><i class="bi bi-grip-vertical"></i></span>
+                                                <button class="btn btn-sm btn-outline-success py-0 px-2" @click.stop="copyNode(i)" title="复制节点"><i class="bi bi-copy"></i></button>
+                                                <button class="btn btn-sm btn-outline-primary py-0 px-2" @click.stop="save" title="保存配置"><i class="bi bi-save"></i></button>
+                                                <button class="btn btn-sm btn-outline-danger py-0 px-2" @click.stop="delNode(i)" title="删除节点"><i class="bi bi-trash"></i></button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <!-- Collapsed quick edit -->
+                                    <div class="card-body py-2 px-3 border-top" v-show="!n.expanded" style="background: var(--hover-bg);">
+                                        <div class="row g-2">
+                                            <div class="col-12">
+                                                <div class="d-flex align-items-center gap-2">
+                                                    <span class="text-muted small"><i class="bi bi-speedometer2"></i></span>
+                                                    <input v-model.number="n.max_per_hour" type="number" class="form-control form-control-sm" style="width: 70px;" placeholder="0" title="Max/Hr">
+                                                    <span class="text-muted small">/h</span>
+                                                    <input v-model.number="n.min_interval" type="number" class="form-control form-control-sm" style="width: 50px;" placeholder="1" title="Min(s)">
+                                                    <span class="text-muted small">~</span>
+                                                    <input v-model.number="n.max_interval" type="number" class="form-control form-control-sm" style="width: 50px;" placeholder="5" title="Max(s)">
+                                                    <span class="text-muted small">s</span>
+                                                </div>
+                                            </div>
+                                            <div class="col-12">
+                                                <div class="d-flex align-items-center gap-1 flex-wrap">
+                                                    <span class="text-muted small me-1" title="选中的域名将不会通过此节点发送"><i class="bi bi-signpost-split"></i>排除:</span>
+                                                    <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-success':'btn-outline-secondary'" @click="n.routing_rules=''" title="不排除任何域名">全部</button>
+                                                    <template v-for="d in topDomains" :key="d.domain">
+                                                        <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-danger':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)" :title="hasDomain(n, d.domain)?'点击取消排除 '+d.domain:'点击排除 '+d.domain">[[ formatDomainLabel(d.domain) ]]</button>
+                                                        <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasAllOtherDomains(n, d.domains)?'btn-danger':'btn-outline-secondary'" @click="toggleOtherDomains(n, d.domains)" :title="d.count + '封 (' + (d.domains||[]).length + '个域名)'">其他</button>
+                                                    </template>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div class="card-body" v-show="n.expanded">
+                                        <div class="row g-2">
+                                            <div class="col-12">
+                                                <label class="small text-muted">备注名称</label>
+                                                <input v-model="n.name" class="form-control form-control-sm" placeholder="备注">
+                                            </div>
+                                            <div class="col-8">
+                                                <label class="small text-muted">Host</label>
+                                                <input v-model="n.host" class="form-control form-control-sm" placeholder="smtp.example.com">
+                                            </div>
+                                            <div class="col-4">
+                                                <label class="small text-muted">Port</label>
+                                                <input v-model.number="n.port" class="form-control form-control-sm" placeholder="587">
+                                            </div>
+                                            <div class="col-6">
+                                                <label class="small text-muted">加密</label>
+                                                <select v-model="n.encryption" class="form-select form-select-sm">
+                                                    <option value="none">None</option>
+                                                    <option value="tls">TLS</option>
+                                                    <option value="ssl">SSL</option>
+                                                </select>
+                                            </div>
+                                            <div class="col-6">
+                                                <label class="small text-muted">Sender Domain</label>
+                                                <input v-model="n.sender_domain" class="form-control form-control-sm" placeholder="域名，如 mail.example.com">
+                                            </div>
+                                            <div class="col-6">
+                                                <label class="small text-muted">Sender Prefix</label>
+                                                <div class="input-group input-group-sm">
+                                                    <div class="input-group-text">
+                                                        <input type="checkbox" v-model="n.sender_random" class="form-check-input mt-0" title="随机生成">
+                                                        <span class="ms-1 small">随机</span>
+                                                    </div>
+                                                    <input v-model="n.sender_prefix" class="form-control" placeholder="如 mail" :disabled="n.sender_random">
+                                                </div>
+                                                <div class="small text-muted mt-1" v-if="n.sender_domain">
+                                                    预览: [[ n.sender_random ? '(6位随机)' : (n.sender_prefix || 'mail') ]]@[[ n.sender_domain ]]
+                                                </div>
+                                            </div>
+                                            <div class="col-12">
+                                                <label class="small text-muted">Username</label>
+                                                <input v-model="n.username" class="form-control form-control-sm">
+                                            </div>
+                                            <div class="col-12">
+                                                <label class="small text-muted">Password</label>
+                                                <input v-model="n.password" type="text" class="form-control form-control-sm">
+                                            </div>
+                                            <div class="col-12"><hr class="my-2"></div>
+                                            <div class="col-4">
+                                                <label class="small text-muted">Max/Hr</label>
+                                                <input v-model.number="n.max_per_hour" type="number" class="form-control form-control-sm" placeholder="0">
+                                            </div>
+                                            <div class="col-4">
+                                                <label class="small text-muted">Min(s)</label>
+                                                <input v-model.number="n.min_interval" type="number" class="form-control form-control-sm" placeholder="1">
+                                            </div>
+                                            <div class="col-4">
+                                                <label class="small text-muted">Max(s)</label>
+                                                <input v-model.number="n.max_interval" type="number" class="form-control form-control-sm" placeholder="5">
+                                            </div>
+                                            <div class="col-12">
+                                                <div class="form-check form-switch my-1">
+                                                    <input class="form-check-input" type="checkbox" v-model="n.allow_bulk" :id="'allowBulk'+i">
+                                                    <label class="form-check-label small" :for="'allowBulk'+i">允许群发 (Allow Bulk)</label>
+                                                </div>
+                                            </div>
+                                            <div class="col-12">
+                                                <label class="small text-muted">排除规则 <span class="text-danger">(选中的域名不发送)</span></label>
+                                                <div class="d-flex flex-wrap gap-1 mb-1">
+                                                    <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-success':'btn-outline-secondary'" @click="n.routing_rules=''" title="不排除任何域名">全部</button>
+                                                    <template v-for="d in topDomains" :key="d.domain">
+                                                        <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-danger':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)" :title="d.count + '封'">[[ formatDomainLabel(d.domain) ]]</button>
+                                                        <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasAllOtherDomains(n, d.domains)?'btn-danger':'btn-outline-secondary'" @click="toggleOtherDomains(n, d.domains)" :title="d.count + '封 (' + (d.domains||[]).length + '个域名)'">其他</button>
+                                                    </template>
+                                                    <span v-if="topDomains.length === 0" class="text-muted small">暂无数据</span>
+                                                </div>
+                                                <input v-model="n.routing_rules" class="form-control form-control-sm" placeholder="排除的域名，逗号分隔...">
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings Tab -->
+            <div v-if="tab=='settings'" class="fade-in">
+                <div class="d-flex justify-content-between align-items-center mb-4">
+                    <h4 class="fw-bold mb-0">系统设置</h4>
+                    <button class="btn btn-primary" @click="save" :disabled="saving">
+                        <span v-if="saving" class="spinner-border spinner-border-sm me-2"></span>
+                        保存配置
+                    </button>
+                </div>
+
+                <div class="row g-4">
+                    <div class="col-md-6">
+                        <div class="card h-100">
+                            <div class="card-header">数据与日志 (Storage)</div>
+                            <div class="card-body">
+                                <div class="mb-3">
+                                    <label class="form-label">历史记录保留天数</label>
+                                    <div class="input-group">
+                                        <input type="number" v-model.number="config.log_config.retention_days" class="form-control" placeholder="7">
+                                        <span class="input-group-text">天</span>
+                                    </div>
+                                    <div class="form-text">超过此时间的成功/失败记录将被自动删除 (0=不删除)</div>
+                                </div>
+                                <div class="row g-3">
+                                    <div class="col-6">
+                                        <label class="form-label">日志文件大小</label>
+                                        <div class="input-group">
+                                            <input type="number" v-model.number="config.log_config.max_mb" class="form-control" placeholder="50">
+                                            <span class="input-group-text">MB</span>
+                                        </div>
+                                    </div>
+                                    <div class="col-6">
+                                        <label class="form-label">日志备份数</label>
+                                        <input type="number" v-model.number="config.log_config.backups" class="form-control" placeholder="3">
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="col-md-6">
+                        <div class="card h-100">
+                            <div class="card-header">基础配置</div>
+                            <div class="card-body">
+                                <div class="mb-3">
+                                    <label class="form-label">监听端口</label>
+                                    <input type="number" v-model.number="config.server_config.port" class="form-control">
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">追踪域名 (Tracking URL)</label>
+                                    <input type="text" v-model="config.web_config.public_domain" class="form-control" placeholder="http://YOUR_IP:8080">
+                                    <div class="form-text">用于生成邮件打开追踪链接，请填写公网可访问地址。</div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
 
                     <div class="col-12">
                         <div class="card">
-                            <div class="card-header d-flex justify-content-between align-items-center">
-                                <span>下游节点池 (Load Balancing)</span>
-                                <div class="d-flex gap-2">
-                                    <button class="btn btn-sm btn-outline-secondary" @click="showBatchEdit = !showBatchEdit"><i class="bi bi-pencil-square"></i> 批量编辑</button>
-                                    <button class="btn btn-sm btn-outline-primary" @click="addNode"><i class="bi bi-plus-lg"></i> 添加节点</button>
-                                </div>
-                            </div>
-                            <!-- Batch Edit Panel -->
-                            <div v-if="showBatchEdit" class="card-body border-bottom" style="background: var(--hover-bg);">
-                                <div class="row g-3 align-items-end">
-                                    <div class="col-12">
-                                        <div class="d-flex align-items-center gap-2 flex-wrap">
-                                            <span class="text-muted small fw-bold">选择节点:</span>
-                                            <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click="batchSelectAll">全选</button>
-                                            <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click="batchSelectNone">全不选</button>
-                                            <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click="batchSelectEnabled">仅启用</button>
-                                            <span class="badge bg-primary-subtle text-primary ms-2">[[ batchSelectedCount ]] 个已选</span>
-                                        </div>
-                                    </div>
-                                    <div class="col-md-6">
-                                        <label class="form-label small mb-1"><i class="bi bi-speedometer2"></i> 批量设置速度</label>
-                                        <div class="d-flex align-items-center gap-2">
-                                            <input v-model.number="batchEdit.max_per_hour" type="number" class="form-control form-control-sm" style="width: 80px;" placeholder="Max/Hr">
-                                            <span class="text-muted small">/h</span>
-                                            <input v-model.number="batchEdit.min_interval" type="number" class="form-control form-control-sm" style="width: 60px;" placeholder="Min">
-                                            <span class="text-muted small">~</span>
-                                            <input v-model.number="batchEdit.max_interval" type="number" class="form-control form-control-sm" style="width: 60px;" placeholder="Max">
-                                            <span class="text-muted small">s</span>
-                                            <button class="btn btn-sm btn-primary" @click="applyBatchSpeed">应用</button>
-                                        </div>
-                                    </div>
-                                    <div class="col-md-6">
-                                        <label class="form-label small mb-1"><i class="bi bi-signpost-split"></i> 批量设置排除规则</label>
-                                        <div class="d-flex align-items-center gap-1 flex-wrap">
-                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchEdit.routing_rules===''?'btn-success':'btn-outline-secondary'" @click="batchEdit.routing_rules=''" title="不排除任何域名">全部</button>
-                                            <template v-for="d in topDomains" :key="'batch-'+d.domain">
-                                                <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchHasDomain(d.domain)?'btn-danger':'btn-outline-secondary'" @click="batchToggleDomain(d.domain)">[[ formatDomainLabel(d.domain) ]]</button>
-                                                <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchHasAllOther(d.domains)?'btn-danger':'btn-outline-secondary'" @click="batchToggleOther(d.domains)">其他</button>
-                                            </template>
-                                            <button class="btn btn-sm btn-primary ms-2" @click="applyBatchRouting">应用</button>
-                                        </div>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="card-body bg-theme-light">
-                                <div v-if="config.downstream_pool.length === 0" class="text-center py-5 text-muted">
-                                    暂无节点，请点击右上角添加
-                                </div>
+                            <div class="card-header">用户套餐限额配置</div>
+                            <div class="card-body">
                                 <div class="row g-3">
-                                    <div v-for="(n, i) in config.downstream_pool" :key="i" class="col-md-6 col-xl-4"
-                                         @dragover.prevent="onDragOver($event, i)"
-                                         @drop="onDrop($event, i)"
-                                         :class="{'drag-over': dragOverIndex === i && draggingIndex !== i}">
-                                        <div class="card h-100 shadow-sm" :style="draggingIndex === i ? 'opacity: 0.5' : ''">
-                                            <div class="card-header py-2 bg-transparent">
-                                                <!-- Node name row -->
-                                                <div class="d-flex justify-content-between align-items-center mb-1" style="cursor:pointer;" @click="n.expanded = !n.expanded">
-                                                    <div class="d-flex align-items-center gap-2 flex-grow-1" style="min-width: 0;">
-                                                        <input v-if="showBatchEdit" type="checkbox" v-model="n.batchSelected" class="form-check-input" style="width: 1.2em; height: 1.2em;" @click.stop title="选择此节点">
-                                                        <i class="bi text-muted" :class="n.expanded ? 'bi-chevron-down' : 'bi-chevron-right'"></i>
-                                                        <span class="fw-bold" style="word-break: break-all;">[[ n.name ]]</span>
-                                                    </div>
-                                                </div>
-                                                <!-- Switches and buttons row -->
-                                                <div class="d-flex align-items-center justify-content-between">
-                                                    <div class="d-flex align-items-center gap-2">
-                                                        <div class="form-check form-switch mb-0" @click.stop title="启用/禁用节点">
-                                                            <input class="form-check-input" type="checkbox" v-model="n.enabled" style="width: 2em; height: 1em;">
-                                                            <label class="form-check-label small text-muted">启用</label>
-                                                        </div>
-                                                        <div class="form-check form-switch mb-0" @click.stop title="允许群发 (Bulk)">
-                                                            <input class="form-check-input" :class="n.allow_bulk ? 'bg-warning border-warning' : ''" type="checkbox" v-model="n.allow_bulk" style="width: 2em; height: 1em;">
-                                                            <label class="form-check-label small text-muted">群发</label>
-                                                        </div>
-                                                    </div>
-                                                    <div class="d-flex gap-1 flex-shrink-0">
-                                                        <span class="btn btn-sm btn-outline-secondary py-0 px-2" 
-                                                              draggable="true"
-                                                              @dragstart="onDragStart($event, i)"
-                                                              @dragend="onDragEnd"
-                                                              style="cursor: grab;"
-                                                              title="按住拖拽移动"><i class="bi bi-grip-vertical"></i></span>
-                                                        <button class="btn btn-sm btn-outline-success py-0 px-2" @click.stop="copyNode(i)" title="复制节点"><i class="bi bi-copy"></i></button>
-                                                        <button class="btn btn-sm btn-outline-primary py-0 px-2" @click.stop="save" title="保存配置"><i class="bi bi-save"></i></button>
-                                                        <button class="btn btn-sm btn-outline-danger py-0 px-2" @click.stop="delNode(i)" title="删除节点"><i class="bi bi-trash"></i></button>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                            <!-- Collapsed quick edit -->
-                                            <div class="card-body py-2 px-3 border-top" v-show="!n.expanded" style="background: var(--hover-bg);">
-                                                <div class="row g-2">
-                                                    <div class="col-12">
-                                                        <div class="d-flex align-items-center gap-2">
-                                                            <span class="text-muted small"><i class="bi bi-speedometer2"></i></span>
-                                                            <input v-model.number="n.max_per_hour" type="number" class="form-control form-control-sm" style="width: 70px;" placeholder="0" title="Max/Hr">
-                                                            <span class="text-muted small">/h</span>
-                                                            <input v-model.number="n.min_interval" type="number" class="form-control form-control-sm" style="width: 50px;" placeholder="1" title="Min(s)">
-                                                            <span class="text-muted small">~</span>
-                                                            <input v-model.number="n.max_interval" type="number" class="form-control form-control-sm" style="width: 50px;" placeholder="5" title="Max(s)">
-                                                            <span class="text-muted small">s</span>
-                                                        </div>
-                                                    </div>
-                                                    <div class="col-12">
-                                                        <div class="d-flex align-items-center gap-1 flex-wrap">
-                                                            <span class="text-muted small me-1" title="选中的域名将不会通过此节点发送"><i class="bi bi-signpost-split"></i>排除:</span>
-                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-success':'btn-outline-secondary'" @click="n.routing_rules=''" title="不排除任何域名">全部</button>
-                                                            <template v-for="d in topDomains" :key="d.domain">
-                                                                <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-danger':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)" :title="hasDomain(n, d.domain)?'点击取消排除 '+d.domain:'点击排除 '+d.domain">[[ formatDomainLabel(d.domain) ]]</button>
-                                                                <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasAllOtherDomains(n, d.domains)?'btn-danger':'btn-outline-secondary'" @click="toggleOtherDomains(n, d.domains)" :title="d.count + '封 (' + (d.domains||[]).length + '个域名)'">其他</button>
-                                                            </template>
-                                                        </div>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                            <div class="card-body" v-show="n.expanded">
-                                                <div class="row g-2">
-                                                    <div class="col-12">
-                                                        <label class="small text-muted">备注名称</label>
-                                                        <input v-model="n.name" class="form-control form-control-sm" placeholder="备注">
-                                                    </div>
-                                                    <div class="col-8">
-                                                        <label class="small text-muted">Host</label>
-                                                        <input v-model="n.host" class="form-control form-control-sm" placeholder="smtp.example.com">
-                                                    </div>
-                                                    <div class="col-4">
-                                                        <label class="small text-muted">Port</label>
-                                                        <input v-model.number="n.port" class="form-control form-control-sm" placeholder="587">
-                                                    </div>
-                                                    <div class="col-6">
-                                                        <label class="small text-muted">加密</label>
-                                                        <select v-model="n.encryption" class="form-select form-select-sm">
-                                                            <option value="none">None</option>
-                                                            <option value="tls">TLS</option>
-                                                            <option value="ssl">SSL</option>
-                                                        </select>
-                                                    </div>
-                                                    <div class="col-6">
-                                                        <label class="small text-muted">Sender Domain</label>
-                                                        <input v-model="n.sender_domain" class="form-control form-control-sm" placeholder="域名，如 mail.example.com">
-                                                    </div>
-                                                    <div class="col-6">
-                                                        <label class="small text-muted">Sender Prefix</label>
-                                                        <div class="input-group input-group-sm">
-                                                            <div class="input-group-text">
-                                                                <input type="checkbox" v-model="n.sender_random" class="form-check-input mt-0" title="随机生成">
-                                                                <span class="ms-1 small">随机</span>
-                                                            </div>
-                                                            <input v-model="n.sender_prefix" class="form-control" placeholder="如 mail" :disabled="n.sender_random">
-                                                        </div>
-                                                        <div class="small text-muted mt-1" v-if="n.sender_domain">
-                                                            预览: [[ n.sender_random ? '(6位随机)' : (n.sender_prefix || 'mail') ]]@[[ n.sender_domain ]]
-                                                        </div>
-                                                    </div>
-                                                    <div class="col-12">
-                                                        <label class="small text-muted">Username</label>
-                                                        <input v-model="n.username" class="form-control form-control-sm">
-                                                    </div>
-                                                    <div class="col-12">
-                                                        <label class="small text-muted">Password</label>
-                                                        <input v-model="n.password" type="text" class="form-control form-control-sm">
-                                                    </div>
-                                                    <div class="col-12"><hr class="my-2"></div>
-                                                    <div class="col-4">
-                                                        <label class="small text-muted">Max/Hr</label>
-                                                        <input v-model.number="n.max_per_hour" type="number" class="form-control form-control-sm" placeholder="0">
-                                                    </div>
-                                                    <div class="col-4">
-                                                        <label class="small text-muted">Min(s)</label>
-                                                        <input v-model.number="n.min_interval" type="number" class="form-control form-control-sm" placeholder="1">
-                                                    </div>
-                                                    <div class="col-4">
-                                                        <label class="small text-muted">Max(s)</label>
-                                                        <input v-model.number="n.max_interval" type="number" class="form-control form-control-sm" placeholder="5">
-                                                    </div>
-                                                    <div class="col-12">
-                                                        <div class="form-check form-switch my-1">
-                                                            <input class="form-check-input" type="checkbox" v-model="n.allow_bulk" :id="'allowBulk'+i">
-                                                            <label class="form-check-label small" :for="'allowBulk'+i">允许群发 (Allow Bulk)</label>
-                                                        </div>
-                                                    </div>
-                                                    <div class="col-12">
-                                                        <label class="small text-muted">排除规则 <span class="text-danger">(选中的域名不发送)</span></label>
-                                                        <div class="d-flex flex-wrap gap-1 mb-1">
-                                                            <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="(!n.routing_rules)?'btn-success':'btn-outline-secondary'" @click="n.routing_rules=''" title="不排除任何域名">全部</button>
-                                                            <template v-for="d in topDomains" :key="d.domain">
-                                                                <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasDomain(n, d.domain)?'btn-danger':'btn-outline-secondary'" @click="toggleDomain(n, d.domain)" :title="d.count + '封'">[[ formatDomainLabel(d.domain) ]]</button>
-                                                                <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="hasAllOtherDomains(n, d.domains)?'btn-danger':'btn-outline-secondary'" @click="toggleOtherDomains(n, d.domains)" :title="d.count + '封 (' + (d.domains||[]).length + '个域名)'">其他</button>
-                                                            </template>
-                                                            <span v-if="topDomains.length === 0" class="text-muted small">暂无数据</span>
-                                                        </div>
-                                                        <input v-model="n.routing_rules" class="form-control form-control-sm" placeholder="排除的域名，逗号分隔...">
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        </div>
+                                    <div class="col-md-3 col-6">
+                                        <label class="form-label">免费用户 (封/小时)</label>
+                                        <input type="number" v-model.number="config.user_limits.free" class="form-control" placeholder="10">
+                                    </div>
+                                    <div class="col-md-3 col-6">
+                                        <label class="form-label">月度用户 (封/小时)</label>
+                                        <input type="number" v-model.number="config.user_limits.monthly" class="form-control" placeholder="100">
+                                    </div>
+                                    <div class="col-md-3 col-6">
+                                        <label class="form-label">季度用户 (封/小时)</label>
+                                        <input type="number" v-model.number="config.user_limits.quarterly" class="form-control" placeholder="500">
+                                    </div>
+                                    <div class="col-md-3 col-6">
+                                        <label class="form-label">年度用户 (封/小时)</label>
+                                        <input type="number" v-model.number="config.user_limits.yearly" class="form-control" placeholder="1000">
                                     </div>
                                 </div>
+                                <div class="form-text mt-2">批量生成用户时将使用这些每小时发送限额</div>
                             </div>
                         </div>
                     </div>
