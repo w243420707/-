@@ -54,7 +54,8 @@ install_smtp() {
     "log_config": { "max_mb": 50, "backups": 3, "retention_days": 7 },
     "limit_config": { "max_per_hour": 0, "min_interval": 1, "max_interval": 5 },
     "bulk_control": { "status": "running" },
-    "downstream_pool": []
+    "downstream_pool": [],
+    "node_groups": []
 }
 EOF
     fi
@@ -2368,12 +2369,75 @@ EOF
                 <div class="d-flex justify-content-between align-items-center mb-4">
                     <h4 class="fw-bold mb-0">下游节点池</h4>
                     <div class="d-flex gap-2">
+                        <button class="btn btn-outline-secondary" @click="showGroupModal = true" title="管理分组"><i class="bi bi-folder-plus"></i> 分组</button>
                         <button class="btn btn-outline-secondary" @click="showBatchEdit = !showBatchEdit"><i class="bi bi-pencil-square"></i> 批量编辑</button>
                         <button class="btn btn-outline-primary" @click="addNode"><i class="bi bi-plus-lg"></i> 添加节点</button>
                         <button class="btn btn-primary" @click="save" :disabled="saving">
                             <span v-if="saving" class="spinner-border spinner-border-sm me-2"></span>
                             保存配置
                         </button>
+                    </div>
+                </div>
+
+                <!-- Group Filter Tabs -->
+                <div v-if="config.node_groups && config.node_groups.length > 0" class="mb-3">
+                    <div class="d-flex flex-wrap gap-2 align-items-center">
+                        <span class="text-muted small"><i class="bi bi-filter"></i> 筛选:</span>
+                        <button class="btn btn-sm" :class="nodeGroupFilter === '' ? 'btn-primary' : 'btn-outline-secondary'" @click="nodeGroupFilter = ''">
+                            全部 <span class="badge bg-light text-dark ms-1">[[ config.downstream_pool.length ]]</span>
+                        </button>
+                        <button class="btn btn-sm" :class="nodeGroupFilter === '__ungrouped__' ? 'btn-primary' : 'btn-outline-secondary'" @click="nodeGroupFilter = '__ungrouped__'">
+                            未分组 <span class="badge bg-light text-dark ms-1">[[ ungroupedNodeCount ]]</span>
+                        </button>
+                        <button v-for="g in config.node_groups" :key="g" class="btn btn-sm" :class="nodeGroupFilter === g ? 'btn-primary' : 'btn-outline-secondary'" @click="nodeGroupFilter = g">
+                            [[ g ]] <span class="badge bg-light text-dark ms-1">[[ nodeCountByGroup(g) ]]</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Group Management Modal -->
+                <div v-if="showGroupModal" class="modal d-block" style="background: rgba(0,0,0,0.5);" @click.self="showGroupModal = false">
+                    <div class="modal-dialog modal-dialog-centered">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h5 class="modal-title"><i class="bi bi-folder"></i> 分组管理</h5>
+                                <button type="button" class="btn-close" @click="showGroupModal = false"></button>
+                            </div>
+                            <div class="modal-body">
+                                <div class="mb-3">
+                                    <label class="form-label">添加新分组</label>
+                                    <div class="input-group">
+                                        <input v-model="newGroupName" class="form-control" placeholder="输入分组名称" @keyup.enter="addNodeGroup">
+                                        <button class="btn btn-primary" @click="addNodeGroup" :disabled="!newGroupName.trim()">添加</button>
+                                    </div>
+                                </div>
+                                <div v-if="config.node_groups && config.node_groups.length > 0">
+                                    <label class="form-label">现有分组</label>
+                                    <ul class="list-group">
+                                        <li v-for="(g, idx) in config.node_groups" :key="idx" class="list-group-item d-flex justify-content-between align-items-center">
+                                            <div class="d-flex align-items-center gap-2 flex-grow-1">
+                                                <i class="bi bi-folder-fill text-warning"></i>
+                                                <template v-if="editingGroupIndex === idx">
+                                                    <input v-model="config.node_groups[idx]" class="form-control form-control-sm" style="max-width: 200px;" @keyup.enter="editingGroupIndex = null" @blur="editingGroupIndex = null">
+                                                </template>
+                                                <template v-else>
+                                                    <span>[[ g ]]</span>
+                                                    <span class="badge bg-secondary">[[ nodeCountByGroup(g) ]] 节点</span>
+                                                </template>
+                                            </div>
+                                            <div class="d-flex gap-1">
+                                                <button class="btn btn-sm btn-outline-primary py-0 px-2" @click="editingGroupIndex = idx" title="重命名"><i class="bi bi-pencil"></i></button>
+                                                <button class="btn btn-sm btn-outline-danger py-0 px-2" @click="deleteNodeGroup(idx)" title="删除分组"><i class="bi bi-trash"></i></button>
+                                            </div>
+                                        </li>
+                                    </ul>
+                                </div>
+                                <div v-else class="text-muted text-center py-3">暂无分组</div>
+                            </div>
+                            <div class="modal-footer">
+                                <button class="btn btn-secondary" @click="showGroupModal = false">关闭</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -2413,18 +2477,29 @@ EOF
                                     <button class="btn btn-sm btn-primary ms-2" @click="applyBatchRouting">应用</button>
                                 </div>
                             </div>
+                            <div class="col-md-6" v-if="config.node_groups && config.node_groups.length > 0">
+                                <label class="form-label small mb-1"><i class="bi bi-folder"></i> 批量分配分组</label>
+                                <div class="d-flex align-items-center gap-2">
+                                    <select v-model="batchEdit.group" class="form-select form-select-sm" style="max-width: 200px;">
+                                        <option value="">未分组</option>
+                                        <option v-for="g in config.node_groups" :key="g" :value="g">[[ g ]]</option>
+                                    </select>
+                                    <button class="btn btn-sm btn-primary" @click="applyBatchGroup">应用</button>
+                                </div>
+                            </div>
                         </div>
                     </div>
                     <div class="card-body bg-theme-light">
-                        <div v-if="config.downstream_pool.length === 0" class="text-center py-5 text-muted">
-                            暂无节点，请点击右上角添加
+                        <div v-if="filteredNodes.length === 0" class="text-center py-5 text-muted">
+                            <template v-if="nodeGroupFilter">当前分组暂无节点</template>
+                            <template v-else>暂无节点，请点击右上角添加</template>
                         </div>
                         <div class="row g-3">
-                            <div v-for="(n, i) in config.downstream_pool" :key="i" class="col-md-6 col-xl-4"
-                                 @dragover.prevent="onDragOver($event, i)"
-                                 @drop="onDrop($event, i)"
-                                 :class="{'drag-over': dragOverIndex === i && draggingIndex !== i}">
-                                <div class="card h-100 shadow-sm" :style="draggingIndex === i ? 'opacity: 0.5' : ''">
+                            <div v-for="(n, i) in filteredNodes" :key="getNodeIndex(n)" class="col-md-6 col-xl-4"
+                                 @dragover.prevent="onDragOver($event, getNodeIndex(n))"
+                                 @drop="onDrop($event, getNodeIndex(n))"
+                                 :class="{'drag-over': dragOverIndex === getNodeIndex(n) && draggingIndex !== getNodeIndex(n)}">
+                                <div class="card h-100 shadow-sm" :style="draggingIndex === getNodeIndex(n) ? 'opacity: 0.5' : ''">
                                     <div class="card-header py-2 bg-transparent">
                                         <!-- Node name row -->
                                         <div class="d-flex justify-content-between align-items-center mb-1" style="cursor:pointer;" @click="n.expanded = !n.expanded">
@@ -2432,6 +2507,7 @@ EOF
                                                 <input v-if="showBatchEdit" type="checkbox" v-model="n.batchSelected" class="form-check-input" style="width: 1.2em; height: 1.2em;" @click.stop title="选择此节点">
                                                 <i class="bi text-muted" :class="n.expanded ? 'bi-chevron-down' : 'bi-chevron-right'"></i>
                                                 <span class="fw-bold" style="word-break: break-all;">[[ n.name ]]</span>
+                                                <span v-if="n.group" class="badge bg-warning-subtle text-warning" style="font-size: 0.65rem;">[[ n.group ]]</span>
                                             </div>
                                         </div>
                                         <!-- Switches and buttons row -->
@@ -2449,13 +2525,13 @@ EOF
                                             <div class="d-flex gap-1 flex-shrink-0">
                                                 <span class="btn btn-sm btn-outline-secondary py-0 px-2" 
                                                       draggable="true"
-                                                      @dragstart="onDragStart($event, i)"
+                                                      @dragstart="onDragStart($event, getNodeIndex(n))"
                                                       @dragend="onDragEnd"
                                                       style="cursor: grab;"
                                                       title="按住拖拽移动"><i class="bi bi-grip-vertical"></i></span>
-                                                <button class="btn btn-sm btn-outline-success py-0 px-2" @click.stop="copyNode(i)" title="复制节点"><i class="bi bi-copy"></i></button>
+                                                <button class="btn btn-sm btn-outline-success py-0 px-2" @click.stop="copyNode(getNodeIndex(n))" title="复制节点"><i class="bi bi-copy"></i></button>
                                                 <button class="btn btn-sm btn-outline-primary py-0 px-2" @click.stop="save" title="保存配置"><i class="bi bi-save"></i></button>
-                                                <button class="btn btn-sm btn-outline-danger py-0 px-2" @click.stop="delNode(i)" title="删除节点"><i class="bi bi-trash"></i></button>
+                                                <button class="btn btn-sm btn-outline-danger py-0 px-2" @click.stop="delNode(getNodeIndex(n))" title="删除节点"><i class="bi bi-trash"></i></button>
                                             </div>
                                         </div>
                                     </div>
@@ -2487,9 +2563,16 @@ EOF
                                     </div>
                                     <div class="card-body" v-show="n.expanded">
                                         <div class="row g-2">
-                                            <div class="col-12">
+                                            <div class="col-8">
                                                 <label class="small text-muted">备注名称</label>
                                                 <input v-model="n.name" class="form-control form-control-sm" placeholder="备注">
+                                            </div>
+                                            <div class="col-4">
+                                                <label class="small text-muted">分组</label>
+                                                <select v-model="n.group" class="form-select form-select-sm">
+                                                    <option value="">未分组</option>
+                                                    <option v-for="g in config.node_groups" :key="g" :value="g">[[ g ]]</option>
+                                                </select>
                                             </div>
                                             <div class="col-8">
                                                 <label class="small text-muted">Host</label>
@@ -2684,7 +2767,7 @@ EOF
                     dragOverIndex: null,
                     topDomains: [],
                     showBatchEdit: false,
-                    batchEdit: { max_per_hour: null, min_interval: null, max_interval: null, routing_rules: '' },
+                    batchEdit: { max_per_hour: null, min_interval: null, max_interval: null, routing_rules: '', group: '' },
                     shufflingContacts: false,
                     removeEmail: '',
                     removeDomain: '',
@@ -2698,7 +2781,11 @@ EOF
                     userForm: { username: '', password: '', email_limit: 0, expires_at: '', enabled: true },
                     showBatchUserModal: false,
                     batchUserForm: { type: 'monthly', count: 10, prefix: '' },
-                    batchGenerating: false
+                    batchGenerating: false,
+                    nodeGroupFilter: '',
+                    showGroupModal: false,
+                    newGroupName: '',
+                    editingGroupIndex: null
                 }
             },
             computed: {
@@ -2764,15 +2851,27 @@ EOF
                     if(this.bulkStatus === 'paused') return 'bi-pause-circle-fill';
                     if(this.isFinished) return 'bi-check-circle-fill';
                     return 'bi-lightning-charge-fill';
+                },
+                filteredNodes() {
+                    if (!this.nodeGroupFilter) return this.config.downstream_pool;
+                    if (this.nodeGroupFilter === '__ungrouped__') {
+                        return this.config.downstream_pool.filter(n => !n.group);
+                    }
+                    return this.config.downstream_pool.filter(n => n.group === this.nodeGroupFilter);
+                },
+                ungroupedNodeCount() {
+                    return this.config.downstream_pool.filter(n => !n.group).length;
                 }
             },
             mounted() {
                 if(!this.config.limit_config) this.config.limit_config = { max_per_hour: 0, min_interval: 1, max_interval: 5 };
                 if(!this.config.log_config) this.config.log_config = { max_mb: 50, backups: 3, retention_days: 7 };
                 if(!this.config.user_limits) this.config.user_limits = { free: 10, monthly: 100, quarterly: 500, yearly: 1000 };
+                if(!this.config.node_groups) this.config.node_groups = [];
                 this.config.downstream_pool.forEach(n => { 
                     if(n.enabled === undefined) n.enabled = true; 
                     if(n.allow_bulk === undefined) n.allow_bulk = true;
+                    if(n.group === undefined) n.group = '';
                     n.expanded = false; // Always start collapsed on page load
                 });
                 
@@ -2804,6 +2903,35 @@ EOF
                 }
             },
             methods: {
+                getNodeIndex(node) {
+                    return this.config.downstream_pool.indexOf(node);
+                },
+                nodeCountByGroup(groupName) {
+                    return this.config.downstream_pool.filter(n => n.group === groupName).length;
+                },
+                addNodeGroup() {
+                    const name = this.newGroupName.trim();
+                    if (!name) return;
+                    if (!this.config.node_groups) this.config.node_groups = [];
+                    if (this.config.node_groups.includes(name)) {
+                        alert('分组名称已存在');
+                        return;
+                    }
+                    this.config.node_groups.push(name);
+                    this.newGroupName = '';
+                },
+                deleteNodeGroup(idx) {
+                    const groupName = this.config.node_groups[idx];
+                    const count = this.nodeCountByGroup(groupName);
+                    if (count > 0) {
+                        if (!confirm(`该分组下有 ${count} 个节点，删除分组后这些节点将变为"未分组"，确定继续？`)) return;
+                        this.config.downstream_pool.forEach(n => {
+                            if (n.group === groupName) n.group = '';
+                        });
+                    }
+                    this.config.node_groups.splice(idx, 1);
+                    if (this.nodeGroupFilter === groupName) this.nodeGroupFilter = '';
+                },
                 nodeExists(name) {
                     const nodeNames = new Set(this.config.downstream_pool.map(n => n.name));
                     return nodeNames.has(name);
@@ -3417,8 +3545,16 @@ EOF
                     });
                     alert(`已应用到 ${selected.length} 个节点`);
                 },
+                applyBatchGroup() {
+                    const selected = this.config.downstream_pool.filter(n => n.batchSelected);
+                    if(selected.length === 0) { alert('请先选择要编辑的节点'); return; }
+                    selected.forEach(n => {
+                        n.group = this.batchEdit.group;
+                    });
+                    alert(`已将 ${selected.length} 个节点分配到"${this.batchEdit.group || '未分组'}"`);
+                },
                 addNode() { 
-                    this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', sender_domain: '', sender_prefix: '', sender_random: false, enabled: true, allow_bulk: true, routing_rules: '', expanded: true }); 
+                    this.config.downstream_pool.push({ name: 'Node-'+Math.floor(Math.random()*1000), host: '', port: 587, encryption: 'none', username: '', password: '', sender_email: '', sender_domain: '', sender_prefix: '', sender_random: false, enabled: true, allow_bulk: true, routing_rules: '', group: '', expanded: true }); 
                 },
                 delNode(i) { if(confirm('删除此节点?')) this.config.downstream_pool.splice(i, 1); },
                 copyNode(i) {
