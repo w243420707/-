@@ -306,11 +306,18 @@ def worker_thread():
                 
                 node = pool_cfg.get(node_name)
                 
+                # Get recipient domain for routing check
+                try:
+                    rcpt_tos = json.loads(row['rcpt_tos'])
+                    rcpt_domain = rcpt_tos[0].split('@')[-1].lower().strip() if rcpt_tos else ''
+                except:
+                    rcpt_domain = ''
+                
                 # Re-route if node removed or disabled
                 if not node or not node.get('enabled', True):
                     active_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
-                    if active_nodes:
-                        new_node = random.choice(active_nodes)
+                    new_node = select_node_for_recipient(active_nodes, rcpt_tos[0] if rcpt_tos else '', cfg.get('limit_config', {}), source=source) if active_nodes else None
+                    if new_node:
                         logger.info(f"🔄 Re-routing ID:{row_id} from '{node_name}' to '{new_node['name']}'")
                         with get_db() as conn:
                             conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
@@ -322,8 +329,8 @@ def worker_thread():
                 # Re-route bulk mails if node's allow_bulk is disabled
                 if is_bulk and not node.get('allow_bulk', True):
                     bulk_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True) and n.get('allow_bulk', True)]
-                    if bulk_nodes:
-                        new_node = random.choice(bulk_nodes)
+                    new_node = select_node_for_recipient(bulk_nodes, rcpt_tos[0] if rcpt_tos else '', cfg.get('limit_config', {}), source=source) if bulk_nodes else None
+                    if new_node:
                         logger.info(f"🔄 Re-routing bulk ID:{row_id} from '{node_name}' (allow_bulk=False) to '{new_node['name']}'")
                         with get_db() as conn:
                             conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
@@ -331,6 +338,23 @@ def worker_thread():
                         with get_db() as conn:
                             conn.execute("UPDATE queue SET status='failed', last_error='No bulk-enabled nodes available' WHERE id=?", (row_id,))
                     continue
+
+                # Re-route if domain is excluded by current node's routing rules
+                rules = node.get('routing_rules', '')
+                if rules and rules.strip():
+                    excluded = [d.strip().lower() for d in rules.split(',') if d.strip()]
+                    if rcpt_domain in excluded:
+                        # Find another node that doesn't exclude this domain
+                        available_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True) and (not is_bulk or n.get('allow_bulk', True))]
+                        new_node = select_node_for_recipient(available_nodes, rcpt_tos[0] if rcpt_tos else '', cfg.get('limit_config', {}), source=source)
+                        if new_node:
+                            logger.info(f"🔄 Re-routing ID:{row_id} from '{node_name}' (domain {rcpt_domain} excluded) to '{new_node['name']}'")
+                            with get_db() as conn:
+                                conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
+                        else:
+                            with get_db() as conn:
+                                conn.execute("UPDATE queue SET status='failed', last_error='No node available for domain: ' || ? WHERE id=?", (rcpt_domain, row_id))
+                        continue
 
                 # --- Rate Limiting Checks (BULK ONLY) ---
                 if is_bulk:
@@ -665,9 +689,9 @@ def select_node_for_recipient(pool, recipient, global_limit, source='relay'):
                 # Domain is NOT excluded, so this node can handle it
                 candidates.append(node)
     
-    # If no candidates found, fallback to all enabled nodes (ignoring exclusion rules)
+    # If no candidates found, return None (don't force assign to excluded nodes)
     if not candidates:
-        candidates = [n for n in pool if (source != 'bulk' or n.get('allow_bulk', True))]
+        return None
     
     return select_weighted_node(candidates, global_limit)
 
@@ -886,7 +910,11 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool):
                 msg['Message-ID'] = make_msgid()
 
                 node = select_node_for_recipient(pool, rcpt, limit_cfg, source='bulk')
-                node_name = node.get('name', 'Unknown') if node else 'No_Node_Available'
+                if not node:
+                    # No node available for this domain (all nodes exclude it)
+                    logger.warning(f"⚠️ Skipping {rcpt}: No node available for this domain")
+                    continue
+                node_name = node.get('name', 'Unknown')
                 
                 tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8)))
                 count += 1
@@ -1083,32 +1111,8 @@ def rebalance_queue_internal():
     bulk_disabled_nodes = set(n['name'] for n in pool if not n.get('allow_bulk', True))
     
     with get_db() as conn:
-        # Only fetch items that NEED reassignment (optimized query)
-        # 1. Node doesn't exist in current pool
-        # 2. Bulk mail assigned to a bulk-disabled node
-        placeholders = ','.join(['?'] * len(valid_node_names)) if valid_node_names else "''"
-        
-        # First: get items with invalid/missing nodes
-        if valid_node_names:
-            query1 = f"SELECT id, rcpt_tos, source, assigned_node FROM queue WHERE status='pending' AND assigned_node NOT IN ({placeholders})"
-            rows1 = conn.execute(query1, tuple(valid_node_names)).fetchall()
-        else:
-            rows1 = conn.execute("SELECT id, rcpt_tos, source, assigned_node FROM queue WHERE status='pending'").fetchall()
-        
-        # Second: get bulk items on bulk-disabled nodes
-        rows2 = []
-        if bulk_disabled_nodes:
-            placeholders2 = ','.join(['?'] * len(bulk_disabled_nodes))
-            query2 = f"SELECT id, rcpt_tos, source, assigned_node FROM queue WHERE status='pending' AND source='bulk' AND assigned_node IN ({placeholders2})"
-            rows2 = conn.execute(query2, tuple(bulk_disabled_nodes)).fetchall()
-        
-        # Combine and deduplicate
-        seen_ids = set()
-        rows = []
-        for r in list(rows1) + list(rows2):
-            if r['id'] not in seen_ids:
-                seen_ids.add(r['id'])
-                rows.append(r)
+        # Fetch ALL pending items to check routing rules
+        rows = conn.execute("SELECT id, rcpt_tos, source, assigned_node FROM queue WHERE status='pending'").fetchall()
         
         if not rows: return 0
         
@@ -1120,10 +1124,37 @@ def rebalance_queue_internal():
             except: rcpt = ''
             
             source = r['source']
-            target_pool = bulk_pool if source == 'bulk' else pool
-            node = select_node_for_recipient(target_pool, rcpt, limit_cfg, source=source)
-            if node:
-                updates.append((node['name'], r['id']))
+            current_node_name = r['assigned_node']
+            current_node = pool_by_name.get(current_node_name)
+            
+            # Check if current assignment is valid
+            needs_reassign = False
+            
+            # 1. Node doesn't exist or is disabled
+            if not current_node or not current_node.get('enabled', True):
+                needs_reassign = True
+            # 2. Bulk mail on bulk-disabled node
+            elif source == 'bulk' and not current_node.get('allow_bulk', True):
+                needs_reassign = True
+            # 3. Domain is excluded by current node's routing rules
+            else:
+                try:
+                    domain = rcpt.split('@')[-1].lower().strip()
+                except: domain = ''
+                rules = current_node.get('routing_rules', '')
+                if rules and rules.strip():
+                    excluded = [d.strip().lower() for d in rules.split(',') if d.strip()]
+                    if domain in excluded:
+                        needs_reassign = True
+            
+            if needs_reassign:
+                target_pool = bulk_pool if source == 'bulk' else pool
+                node = select_node_for_recipient(target_pool, rcpt, limit_cfg, source=source)
+                if node and node['name'] != current_node_name:
+                    updates.append((node['name'], r['id']))
+                elif not node:
+                    # No valid node found, mark as failed
+                    conn.execute("UPDATE queue SET status='failed', last_error='No node available for this domain' WHERE id=?", (r['id'],))
         
         if updates:
             conn.executemany("UPDATE queue SET assigned_node=? WHERE id=?", updates)
