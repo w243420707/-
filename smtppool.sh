@@ -1733,9 +1733,9 @@ EOF
                         <span>最近投递记录 <span class="text-muted small fw-normal ms-2" v-if="totalMails > 100">(仅显示最新 100 条 / 共 [[ totalMails ]] 条)</span></span>
                         <button class="btn btn-sm btn-outline-danger" @click="clearQueue">清理历史</button>
                     </div>
-                    <div class="table-responsive">
+                    <div class="table-responsive" style="max-height: 550px; overflow-y: auto;">
                         <table class="table table-custom table-hover mb-0">
-                            <thead><tr><th class="ps-4">ID</th><th>详情</th><th>节点</th><th>状态</th><th>时间</th></tr></thead>
+                            <thead style="position: sticky; top: 0; background: var(--card-bg); z-index: 1;"><tr><th class="ps-4">ID</th><th>详情</th><th>节点</th><th>状态</th><th>时间</th></tr></thead>
                             <tbody>
                                 <tr v-for="m in qList" :key="m.id">
                                     <td class="ps-4 text-muted">#[[ m.id ]]</td>
