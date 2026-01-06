@@ -1968,16 +1968,6 @@ EOF
                                     <input type="text" v-model="config.web_config.public_domain" class="form-control" placeholder="http://YOUR_IP:8080">
                                     <div class="form-text">用于生成邮件打开追踪链接，请填写公网可访问地址。</div>
                                 </div>
-                                <div class="row g-3">
-                                    <div class="col-6">
-                                        <label class="form-label">认证账号</label>
-                                        <input v-model="config.server_config.username" class="form-control">
-                                    </div>
-                                    <div class="col-6">
-                                        <label class="form-label">认证密码</label>
-                                        <input v-model="config.server_config.password" class="form-control">
-                                    </div>
-                                </div>
                             </div>
                         </div>
                     </div>
