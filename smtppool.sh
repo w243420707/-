@@ -3054,6 +3054,13 @@ EOF
                             headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify({ domain: domain })
                         });
+                        // Check for session expiry
+                        const ct = res.headers.get("content-type");
+                        if (ct && ct.indexOf("application/json") === -1) {
+                            alert('会话已过期，请刷新页面重新登录');
+                            window.location.reload();
+                            return;
+                        }
                         const data = await res.json();
                         if (data.deleted > 0) {
                             this.removeDomain = '';
@@ -3104,6 +3111,13 @@ EOF
                             headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify({ domains: this.selectedDomains })
                         });
+                        // Check for session expiry
+                        const ct = res.headers.get("content-type");
+                        if (ct && ct.indexOf("application/json") === -1) {
+                            alert('会话已过期，请刷新页面重新登录');
+                            window.location.reload();
+                            return;
+                        }
                         const data = await res.json();
                         if (data.deleted > 0) {
                             // Also remove from current input if present
@@ -3138,6 +3152,13 @@ EOF
                             headers: {'Content-Type': 'application/json'},
                             body: JSON.stringify({ threshold: threshold })
                         });
+                        // Check for session expiry
+                        const ct = res.headers.get("content-type");
+                        if (ct && ct.indexOf("application/json") === -1) {
+                            alert('会话已过期，请刷新页面重新登录');
+                            window.location.reload();
+                            return;
+                        }
                         const data = await res.json();
                         if (data.deleted > 0) {
                             // Also remove from current input if present
