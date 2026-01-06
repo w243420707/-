@@ -2365,32 +2365,50 @@ EOF
             </div>
 
             <!-- Nodes Tab -->
-            <div v-if="tab=='nodes'" class="fade-in">
-                <div class="d-flex justify-content-between align-items-center mb-4">
-                    <h4 class="fw-bold mb-0">下游节点池</h4>
-                    <div class="d-flex gap-2">
-                        <button class="btn btn-outline-secondary" @click="showGroupModal = true" title="管理分组"><i class="bi bi-folder-plus"></i> 分组</button>
-                        <button class="btn btn-outline-secondary" @click="showBatchEdit = !showBatchEdit"><i class="bi bi-pencil-square"></i> 批量编辑</button>
-                        <button class="btn btn-outline-primary" @click="addNode"><i class="bi bi-plus-lg"></i> 添加节点</button>
-                        <button class="btn btn-primary" @click="save" :disabled="saving">
-                            <span v-if="saving" class="spinner-border spinner-border-sm me-2"></span>
-                            保存配置
+            <div v-if="tab=='nodes'" class="fade-in" style="padding-bottom: 80px;">
+                <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
+                    <div class="d-flex align-items-center gap-3">
+                        <h4 class="fw-bold mb-0">下游节点池</h4>
+                        <span class="badge bg-secondary">[[ filteredNodes.length ]] / [[ config.downstream_pool.length ]]</span>
+                    </div>
+                    <div class="d-flex gap-2 flex-wrap">
+                        <!-- 搜索框 -->
+                        <div class="input-group input-group-sm" style="width: 200px;">
+                            <span class="input-group-text"><i class="bi bi-search"></i></span>
+                            <input v-model="nodeSearch" class="form-control" placeholder="搜索节点..." @input="nodeGroupFilter = ''">
+                            <button v-if="nodeSearch" class="btn btn-outline-secondary" @click="nodeSearch = ''" type="button"><i class="bi bi-x"></i></button>
+                        </div>
+                        <!-- 视图切换 -->
+                        <div class="btn-group btn-group-sm">
+                            <button class="btn" :class="nodeViewMode === 'card' ? 'btn-primary' : 'btn-outline-secondary'" @click="nodeViewMode = 'card'" title="卡片视图"><i class="bi bi-grid-3x3-gap"></i></button>
+                            <button class="btn" :class="nodeViewMode === 'table' ? 'btn-primary' : 'btn-outline-secondary'" @click="nodeViewMode = 'table'" title="表格视图"><i class="bi bi-table"></i></button>
+                        </div>
+                        <button class="btn btn-sm btn-outline-secondary" @click="showGroupModal = true" title="管理分组"><i class="bi bi-folder-plus"></i></button>
+                        <button class="btn btn-sm btn-outline-primary" @click="addNode"><i class="bi bi-plus-lg"></i> 添加</button>
+                        <button class="btn btn-sm btn-primary" @click="save" :disabled="saving">
+                            <span v-if="saving" class="spinner-border spinner-border-sm me-1"></span>
+                            <i v-else class="bi bi-save"></i> 保存
                         </button>
                     </div>
                 </div>
 
-                <!-- Group Filter Tabs -->
-                <div v-if="config.node_groups && config.node_groups.length > 0" class="mb-3">
+                <!-- Group Filter Tabs with colors -->
+                <div class="mb-3">
                     <div class="d-flex flex-wrap gap-2 align-items-center">
-                        <span class="text-muted small"><i class="bi bi-filter"></i> 筛选:</span>
-                        <button class="btn btn-sm" :class="nodeGroupFilter === '' ? 'btn-primary' : 'btn-outline-secondary'" @click="nodeGroupFilter = ''">
+                        <button class="btn btn-sm" :class="nodeGroupFilter === '' && !nodeSearch ? 'btn-dark' : 'btn-outline-secondary'" @click="nodeGroupFilter = ''; nodeSearch = ''">
                             全部 <span class="badge bg-light text-dark ms-1">[[ config.downstream_pool.length ]]</span>
                         </button>
-                        <button class="btn btn-sm" :class="nodeGroupFilter === '__ungrouped__' ? 'btn-primary' : 'btn-outline-secondary'" @click="nodeGroupFilter = '__ungrouped__'">
-                            未分组 <span class="badge bg-light text-dark ms-1">[[ ungroupedNodeCount ]]</span>
+                        <button class="btn btn-sm" :class="nodeGroupFilter === '__ungrouped__' ? 'btn-secondary' : 'btn-outline-secondary'" @click="nodeGroupFilter = '__ungrouped__'; nodeSearch = ''">
+                            <i class="bi bi-folder"></i> 未分组 <span class="badge bg-light text-dark ms-1">[[ ungroupedNodeCount ]]</span>
                         </button>
-                        <button v-for="g in config.node_groups" :key="g" class="btn btn-sm" :class="nodeGroupFilter === g ? 'btn-primary' : 'btn-outline-secondary'" @click="nodeGroupFilter = g">
-                            [[ g ]] <span class="badge bg-light text-dark ms-1">[[ nodeCountByGroup(g) ]]</span>
+                        <button v-for="(g, gi) in config.node_groups" :key="g" class="btn btn-sm" 
+                            :class="nodeGroupFilter === g ? 'text-white' : ''" 
+                            :style="nodeGroupFilter === g ? 'background-color:' + getGroupColor(gi) + ';border-color:' + getGroupColor(gi) : 'border-color:' + getGroupColor(gi) + ';color:' + getGroupColor(gi)" 
+                            @click="nodeGroupFilter = g; nodeSearch = ''">
+                            <i class="bi bi-folder-fill"></i> [[ g ]] <span class="badge bg-light text-dark ms-1">[[ nodeCountByGroup(g) ]]</span>
+                        </button>
+                        <button v-if="!config.node_groups || config.node_groups.length === 0" class="btn btn-sm btn-outline-secondary" @click="showGroupModal = true">
+                            <i class="bi bi-plus"></i> 添加分组
                         </button>
                     </div>
                 </div>
@@ -2441,100 +2459,104 @@ EOF
                     </div>
                 </div>
 
-                <div class="card">
-                    <!-- Batch Edit Panel -->
-                    <div v-if="showBatchEdit" class="card-body border-bottom" style="background: var(--hover-bg);">
-                        <div class="row g-3 align-items-end">
-                            <div class="col-12">
-                                <div class="d-flex align-items-center gap-2 flex-wrap">
-                                    <span class="text-muted small fw-bold">选择节点:</span>
-                                    <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click="batchSelectAll">全选</button>
-                                    <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click="batchSelectNone">全不选</button>
-                                    <button class="btn btn-sm btn-outline-secondary py-0 px-2" @click="batchSelectEnabled">仅启用</button>
-                                    <span class="badge bg-primary-subtle text-primary ms-2">[[ batchSelectedCount ]] 个已选</span>
-                                </div>
-                            </div>
-                            <div class="col-md-6">
-                                <label class="form-label small mb-1"><i class="bi bi-speedometer2"></i> 批量设置速度</label>
-                                <div class="d-flex align-items-center gap-2">
-                                    <input v-model.number="batchEdit.max_per_hour" type="number" class="form-control form-control-sm" style="width: 80px;" placeholder="Max/Hr">
-                                    <span class="text-muted small">/h</span>
-                                    <input v-model.number="batchEdit.min_interval" type="number" class="form-control form-control-sm" style="width: 60px;" placeholder="Min">
-                                    <span class="text-muted small">~</span>
-                                    <input v-model.number="batchEdit.max_interval" type="number" class="form-control form-control-sm" style="width: 60px;" placeholder="Max">
-                                    <span class="text-muted small">s</span>
-                                    <button class="btn btn-sm btn-primary" @click="applyBatchSpeed">应用</button>
-                                </div>
-                            </div>
-                            <div class="col-md-6">
-                                <label class="form-label small mb-1"><i class="bi bi-signpost-split"></i> 批量设置排除规则</label>
-                                <div class="d-flex align-items-center gap-1 flex-wrap">
-                                    <button class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchEdit.routing_rules===''?'btn-success':'btn-outline-secondary'" @click="batchEdit.routing_rules=''" title="不排除任何域名">全部</button>
-                                    <template v-for="d in topDomains" :key="'batch-'+d.domain">
-                                        <button v-if="d.domain !== '__other__'" class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchHasDomain(d.domain)?'btn-danger':'btn-outline-secondary'" @click="batchToggleDomain(d.domain)">[[ formatDomainLabel(d.domain) ]]</button>
-                                        <button v-else class="btn btn-sm py-0 px-1" style="font-size: 0.7rem;" :class="batchHasAllOther(d.domains)?'btn-danger':'btn-outline-secondary'" @click="batchToggleOther(d.domains)">其他</button>
-                                    </template>
-                                    <button class="btn btn-sm btn-primary ms-2" @click="applyBatchRouting">应用</button>
-                                </div>
-                            </div>
-                            <div class="col-md-6" v-if="config.node_groups && config.node_groups.length > 0">
-                                <label class="form-label small mb-1"><i class="bi bi-folder"></i> 批量分配分组</label>
-                                <div class="d-flex align-items-center gap-2">
-                                    <select v-model="batchEdit.group" class="form-select form-select-sm" style="max-width: 200px;">
-                                        <option value="">未分组</option>
-                                        <option v-for="g in config.node_groups" :key="g" :value="g">[[ g ]]</option>
-                                    </select>
-                                    <button class="btn btn-sm btn-primary" @click="applyBatchGroup">应用</button>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="card-body bg-theme-light">
-                        <div v-if="filteredNodes.length === 0" class="text-center py-5 text-muted">
-                            <template v-if="nodeGroupFilter">当前分组暂无节点</template>
-                            <template v-else>暂无节点，请点击右上角添加</template>
-                        </div>
-                        <div class="row g-3">
-                            <div v-for="(n, i) in filteredNodes" :key="getNodeIndex(n)" class="col-md-6 col-xl-4"
-                                 @dragover.prevent="onDragOver($event, getNodeIndex(n))"
-                                 @drop="onDrop($event, getNodeIndex(n))"
-                                 :class="{'drag-over': dragOverIndex === getNodeIndex(n) && draggingIndex !== getNodeIndex(n)}">
-                                <div class="card h-100 shadow-sm" :style="draggingIndex === getNodeIndex(n) ? 'opacity: 0.5' : ''">
-                                    <div class="card-header py-2 bg-transparent">
-                                        <!-- Node name row -->
-                                        <div class="d-flex justify-content-between align-items-center mb-1" style="cursor:pointer;" @click="n.expanded = !n.expanded">
-                                            <div class="d-flex align-items-center gap-2 flex-grow-1" style="min-width: 0;">
-                                                <input v-if="showBatchEdit" type="checkbox" v-model="n.batchSelected" class="form-check-input" style="width: 1.2em; height: 1.2em;" @click.stop title="选择此节点">
-                                                <i class="bi text-muted" :class="n.expanded ? 'bi-chevron-down' : 'bi-chevron-right'"></i>
-                                                <span class="fw-bold" style="word-break: break-all;">[[ n.name ]]</span>
-                                                <span v-if="n.group" class="badge bg-warning-subtle text-warning" style="font-size: 0.65rem;">[[ n.group ]]</span>
-                                            </div>
+                <!-- Table View -->
+                <div v-if="nodeViewMode === 'table'" class="card">
+                    <div class="table-responsive">
+                        <table class="table table-hover table-sm mb-0 align-middle">
+                            <thead class="table-light">
+                                <tr>
+                                    <th style="width: 40px;"><input type="checkbox" class="form-check-input" @change="toggleSelectAllNodes($event)" :checked="batchSelectedCount === searchedNodes.length && searchedNodes.length > 0"></th>
+                                    <th>节点名称</th>
+                                    <th>分组</th>
+                                    <th>Host</th>
+                                    <th style="width: 80px;">状态</th>
+                                    <th style="width: 100px;">速度</th>
+                                    <th style="width: 80px;">群发</th>
+                                    <th style="width: 100px;">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-if="searchedNodes.length === 0">
+                                    <td colspan="8" class="text-center text-muted py-4">暂无节点</td>
+                                </tr>
+                                <tr v-for="n in searchedNodes" :key="getNodeIndex(n)" :class="{'table-secondary': !n.enabled}">
+                                    <td><input type="checkbox" class="form-check-input" v-model="n.batchSelected"></td>
+                                    <td>
+                                        <span class="fw-bold">[[ n.name ]]</span>
+                                        <a href="#" class="ms-2 text-muted small" @click.prevent="n.expanded = true; nodeViewMode = 'card'" title="编辑"><i class="bi bi-pencil"></i></a>
+                                    </td>
+                                    <td>
+                                        <span v-if="n.group" class="badge" :style="'background-color:' + getGroupColor(config.node_groups.indexOf(n.group))">[[ n.group ]]</span>
+                                        <span v-else class="text-muted small">-</span>
+                                    </td>
+                                    <td class="small text-muted">[[ n.host ]]:[[ n.port ]]</td>
+                                    <td>
+                                        <div class="form-check form-switch mb-0">
+                                            <input class="form-check-input" type="checkbox" v-model="n.enabled">
                                         </div>
-                                        <!-- Switches and buttons row -->
-                                        <div class="d-flex align-items-center justify-content-between">
-                                            <div class="d-flex align-items-center gap-2">
-                                                <div class="form-check form-switch mb-0" @click.stop title="启用/禁用节点">
-                                                    <input class="form-check-input" type="checkbox" v-model="n.enabled" style="width: 2em; height: 1em;">
-                                                    <label class="form-check-label small text-muted">启用</label>
-                                                </div>
-                                                <div class="form-check form-switch mb-0" @click.stop title="允许群发 (Bulk)">
-                                                    <input class="form-check-input" :class="n.allow_bulk ? 'bg-warning border-warning' : ''" type="checkbox" v-model="n.allow_bulk" style="width: 2em; height: 1em;">
-                                                    <label class="form-check-label small text-muted">群发</label>
-                                                </div>
-                                            </div>
-                                            <div class="d-flex gap-1 flex-shrink-0">
-                                                <span class="btn btn-sm btn-outline-secondary py-0 px-2" 
-                                                      draggable="true"
-                                                      @dragstart="onDragStart($event, getNodeIndex(n))"
-                                                      @dragend="onDragEnd"
-                                                      style="cursor: grab;"
-                                                      title="按住拖拽移动"><i class="bi bi-grip-vertical"></i></span>
-                                                <button class="btn btn-sm btn-outline-success py-0 px-2" @click.stop="copyNode(getNodeIndex(n))" title="复制节点"><i class="bi bi-copy"></i></button>
-                                                <button class="btn btn-sm btn-outline-primary py-0 px-2" @click.stop="save" title="保存配置"><i class="bi bi-save"></i></button>
-                                                <button class="btn btn-sm btn-outline-danger py-0 px-2" @click.stop="delNode(getNodeIndex(n))" title="删除节点"><i class="bi bi-trash"></i></button>
+                                    </td>
+                                    <td class="small">[[ n.max_per_hour || '∞' ]]/h</td>
+                                    <td>
+                                        <div class="form-check form-switch mb-0">
+                                            <input class="form-check-input" :class="n.allow_bulk ? 'bg-warning border-warning' : ''" type="checkbox" v-model="n.allow_bulk">
+                                        </div>
+                                    </td>
+                                    <td>
+                                        <div class="btn-group btn-group-sm">
+                                            <button class="btn btn-outline-secondary py-0 px-1" @click="copyNode(getNodeIndex(n))" title="复制"><i class="bi bi-copy"></i></button>
+                                            <button class="btn btn-outline-danger py-0 px-1" @click="delNode(getNodeIndex(n))" title="删除"><i class="bi bi-trash"></i></button>
+                                        </div>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Card View -->
+                <div v-if="nodeViewMode === 'card'">
+                    <div v-if="searchedNodes.length === 0" class="text-center py-5 text-muted">
+                        <i class="bi bi-inbox" style="font-size: 3rem;"></i>
+                        <p class="mt-2" v-if="nodeSearch">未找到匹配"[[ nodeSearch ]]"的节点</p>
+                        <p class="mt-2" v-else-if="nodeGroupFilter">当前分组暂无节点</p>
+                        <p class="mt-2" v-else>暂无节点，点击上方"添加"按钮创建</p>
+                    </div>
+                    <div class="row g-2">
+                        <div v-for="(n, i) in searchedNodes" :key="getNodeIndex(n)" class="col-sm-6 col-lg-4 col-xl-3 col-xxl-2"
+                             @dragover.prevent="onDragOver($event, getNodeIndex(n))"
+                             @drop="onDrop($event, getNodeIndex(n))"
+                             :class="{'drag-over': dragOverIndex === getNodeIndex(n) && draggingIndex !== getNodeIndex(n)}">
+                            <!-- Card with colored left border for group -->
+                            <div class="card h-100 shadow-sm position-relative overflow-hidden" 
+                                 :style="(draggingIndex === getNodeIndex(n) ? 'opacity: 0.5;' : '') + (n.group ? 'border-left: 4px solid ' + getGroupColor(config.node_groups.indexOf(n.group)) : 'border-left: 4px solid #dee2e6')">
+                                <div class="card-header py-2 px-2 bg-transparent">
+                                    <!-- Node name row -->
+                                    <div class="d-flex justify-content-between align-items-center" style="cursor:pointer;" @click="n.expanded = !n.expanded">
+                                        <div class="d-flex align-items-center gap-1 flex-grow-1" style="min-width: 0;">
+                                            <input type="checkbox" v-model="n.batchSelected" class="form-check-input" style="width: 1em; height: 1em;" @click.stop title="选择此节点">
+                                            <i class="bi text-muted small" :class="n.expanded ? 'bi-chevron-down' : 'bi-chevron-right'"></i>
+                                            <span class="fw-bold small text-truncate" :title="n.name" :class="{'text-muted': !n.enabled}">[[ n.name ]]</span>
+                                        </div>
+                                        <div class="d-flex align-items-center gap-1" @click.stop>
+                                            <span class="badge" :class="n.enabled ? 'bg-success' : 'bg-secondary'" style="font-size: 0.65rem;">[[ n.enabled ? 'ON' : 'OFF' ]]</span>
+                                            <div class="dropdown">
+                                                <button class="btn btn-sm btn-link text-muted p-0" data-bs-toggle="dropdown"><i class="bi bi-three-dots-vertical"></i></button>
+                                                <ul class="dropdown-menu dropdown-menu-end">
+                                                    <li><a class="dropdown-item small" href="#" @click.prevent="n.enabled = !n.enabled"><i class="bi" :class="n.enabled ? 'bi-pause' : 'bi-play'"></i> [[ n.enabled ? '禁用' : '启用' ]]</a></li>
+                                                    <li><a class="dropdown-item small" href="#" @click.prevent="copyNode(getNodeIndex(n))"><i class="bi bi-copy"></i> 复制</a></li>
+                                                    <li><hr class="dropdown-divider"></li>
+                                                    <li><a class="dropdown-item small text-danger" href="#" @click.prevent="delNode(getNodeIndex(n))"><i class="bi bi-trash"></i> 删除</a></li>
+                                                </ul>
                                             </div>
                                         </div>
                                     </div>
+                                    <!-- Quick info row -->
+                                    <div class="d-flex align-items-center gap-2 mt-1 small text-muted">
+                                        <span title="发送速度"><i class="bi bi-speedometer2"></i> [[ n.max_per_hour || '∞' ]]/h</span>
+                                        <span v-if="n.allow_bulk" class="badge bg-warning-subtle text-warning" style="font-size: 0.6rem;">群发</span>
+                                        <span v-if="n.routing_rules" class="badge bg-danger-subtle text-danger" style="font-size: 0.6rem;" :title="'排除: ' + n.routing_rules">排除[[ n.routing_rules.split(',').length ]]</span>
+                                    </div>
+                                </div>
                                     <!-- Collapsed quick edit -->
                                     <div class="card-body py-2 px-3 border-top" v-show="!n.expanded" style="background: var(--hover-bg);">
                                         <div class="row g-2">
@@ -2649,6 +2671,43 @@ EOF
                                         </div>
                                     </div>
                                 </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Fixed Bottom Batch Edit Toolbar -->
+                <div v-if="batchSelectedCount > 0" class="position-fixed bottom-0 start-0 end-0 bg-dark text-white p-2 shadow-lg" style="z-index: 1050;">
+                    <div class="container-fluid">
+                        <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
+                            <div class="d-flex align-items-center gap-2">
+                                <span class="badge bg-primary">[[ batchSelectedCount ]] 个已选</span>
+                                <button class="btn btn-sm btn-outline-light" @click="batchSelectAll">全选</button>
+                                <button class="btn btn-sm btn-outline-light" @click="batchSelectNone">取消</button>
+                            </div>
+                            <div class="d-flex align-items-center gap-3 flex-wrap">
+                                <!-- 批量速度 -->
+                                <div class="d-flex align-items-center gap-1">
+                                    <span class="small"><i class="bi bi-speedometer2"></i></span>
+                                    <input v-model.number="batchEdit.max_per_hour" type="number" class="form-control form-control-sm bg-dark text-white border-secondary" style="width: 60px;" placeholder="/h">
+                                    <button class="btn btn-sm btn-outline-light" @click="applyBatchSpeed">应用速度</button>
+                                </div>
+                                <!-- 批量分组 -->
+                                <div class="d-flex align-items-center gap-1" v-if="config.node_groups && config.node_groups.length > 0">
+                                    <span class="small"><i class="bi bi-folder"></i></span>
+                                    <select v-model="batchEdit.group" class="form-select form-select-sm bg-dark text-white border-secondary" style="width: 100px;">
+                                        <option value="">未分组</option>
+                                        <option v-for="g in config.node_groups" :key="g" :value="g">[[ g ]]</option>
+                                    </select>
+                                    <button class="btn btn-sm btn-outline-light" @click="applyBatchGroup">应用</button>
+                                </div>
+                                <!-- 批量启用/禁用 -->
+                                <div class="btn-group btn-group-sm">
+                                    <button class="btn btn-outline-success" @click="batchSetEnabled(true)"><i class="bi bi-play"></i> 全部启用</button>
+                                    <button class="btn btn-outline-warning" @click="batchSetEnabled(false)"><i class="bi bi-pause"></i> 全部禁用</button>
+                                </div>
+                                <!-- 批量删除 -->
+                                <button class="btn btn-sm btn-danger" @click="batchDeleteNodes"><i class="bi bi-trash"></i> 删除</button>
                             </div>
                         </div>
                     </div>
@@ -2785,7 +2844,9 @@ EOF
                     nodeGroupFilter: '',
                     showGroupModal: false,
                     newGroupName: '',
-                    editingGroupIndex: null
+                    editingGroupIndex: null,
+                    nodeSearch: '',
+                    nodeViewMode: 'card'
                 }
             },
             computed: {
@@ -2861,6 +2922,18 @@ EOF
                 },
                 ungroupedNodeCount() {
                     return this.config.downstream_pool.filter(n => !n.group).length;
+                },
+                searchedNodes() {
+                    let nodes = this.filteredNodes;
+                    if (this.nodeSearch) {
+                        const s = this.nodeSearch.toLowerCase();
+                        nodes = this.config.downstream_pool.filter(n => 
+                            n.name.toLowerCase().includes(s) || 
+                            n.host.toLowerCase().includes(s) ||
+                            (n.group && n.group.toLowerCase().includes(s))
+                        );
+                    }
+                    return nodes;
                 }
             },
             mounted() {
@@ -2903,6 +2976,29 @@ EOF
                 }
             },
             methods: {
+                getGroupColor(index) {
+                    const colors = ['#6366f1', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16'];
+                    if (index < 0) return '#6c757d';
+                    return colors[index % colors.length];
+                },
+                toggleSelectAllNodes(e) {
+                    const checked = e.target.checked;
+                    this.searchedNodes.forEach(n => n.batchSelected = checked);
+                },
+                batchSetEnabled(enabled) {
+                    const selected = this.config.downstream_pool.filter(n => n.batchSelected);
+                    if (selected.length === 0) return;
+                    selected.forEach(n => n.enabled = enabled);
+                },
+                batchDeleteNodes() {
+                    const selected = this.config.downstream_pool.filter(n => n.batchSelected);
+                    if (selected.length === 0) return;
+                    if (!confirm(`确定删除选中的 ${selected.length} 个节点？`)) return;
+                    selected.forEach(n => {
+                        const idx = this.config.downstream_pool.indexOf(n);
+                        if (idx !== -1) this.config.downstream_pool.splice(idx, 1);
+                    });
+                },
                 getNodeIndex(node) {
                     return this.config.downstream_pool.indexOf(node);
                 },
