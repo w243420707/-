@@ -1319,6 +1319,22 @@ def api_contacts_remove():
         deleted = result.rowcount
     return jsonify({"status": "ok", "deleted": deleted})
 
+@app.route('/api/contacts/remove_domain', methods=['POST'])
+@login_required
+def api_contacts_remove_domain():
+    """Remove all emails with a specific domain from contacts"""
+    domain = request.json.get('domain', '').strip().lower()
+    if not domain:
+        return jsonify({"error": "No domain provided"}), 400
+    # Remove @ prefix if user included it
+    if domain.startswith('@'):
+        domain = domain[1:]
+    with get_db() as conn:
+        # Match emails ending with @domain (case-insensitive)
+        result = conn.execute("DELETE FROM contacts WHERE LOWER(email) LIKE ?", ('%@' + domain,))
+        deleted = result.rowcount
+    return jsonify({"status": "ok", "deleted": deleted, "domain": domain})
+
 @app.route('/api/draft', methods=['GET', 'POST'])
 @login_required
 def api_draft():
@@ -1938,9 +1954,14 @@ EOF
                                         [[ ds.domain ]] <span class="text-muted">([[ ds.count ]])</span> <i class="bi bi-x-circle text-danger ms-1"></i>
                                     </span>
                                 </div>
-                                <div class="input-group input-group-sm mb-3">
+                                <div class="input-group input-group-sm mb-2">
                                     <input type="text" v-model="removeEmail" class="form-control" placeholder="输入要清除的邮箱地址..." @keyup.enter="removeSpecificEmail">
                                     <button class="btn btn-outline-danger" @click="removeSpecificEmail" :disabled="!removeEmail"><i class="bi bi-trash"></i> 清除</button>
+                                </div>
+                                <div class="input-group input-group-sm mb-3">
+                                    <span class="input-group-text">@</span>
+                                    <input type="text" v-model="removeDomain" class="form-control" placeholder="输入要清除的域名 (如 qq.com)..." @keyup.enter="removeDomainFromContacts">
+                                    <button class="btn btn-outline-danger" @click="removeDomainFromContacts" :disabled="!removeDomain"><i class="bi bi-trash"></i> 按域名清除</button>
                                 </div>
                                 <button class="btn btn-primary w-100 py-3 fw-bold" @click="sendBulk" :disabled="sending || recipientCount === 0">
                                     <span v-if="sending" class="spinner-border spinner-border-sm me-2"></span>
@@ -2421,6 +2442,7 @@ EOF
                     batchEdit: { max_per_hour: null, min_interval: null, max_interval: null, routing_rules: '' },
                     shufflingContacts: false,
                     removeEmail: '',
+                    removeDomain: '',
                     smtpUsers: [],
                     showUserModal: false,
                     editingUser: null,
@@ -2897,6 +2919,33 @@ EOF
                         }
                     } catch(e) { alert('失败: ' + e); }
                 },
+                async removeDomainFromContacts() {
+                    if (!this.removeDomain || !this.removeDomain.trim()) return;
+                    let domain = this.removeDomain.trim().toLowerCase();
+                    if (domain.startsWith('@')) domain = domain.substring(1);
+                    if (!confirm(`确定从通讯录中删除所有 @${domain} 的邮箱吗？`)) return;
+                    try {
+                        const res = await fetch('/api/contacts/remove_domain', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ domain: domain })
+                        });
+                        const data = await res.json();
+                        if (data.deleted > 0) {
+                            alert(`已从通讯录中删除 ${data.deleted} 个 @${domain} 邮箱`);
+                            this.removeDomain = '';
+                            this.fetchContactCount();
+                            // Also remove from current input if present
+                            if (this.bulk.recipients) {
+                                let emails = this.bulk.recipients.split('\n').filter(r => r.trim());
+                                emails = emails.filter(e => !e.trim().toLowerCase().endsWith('@' + domain));
+                                this.bulk.recipients = emails.join('\n');
+                            }
+                        } else {
+                            alert(`通讯录中未找到 @${domain} 的邮箱`);
+                        }
+                    } catch(e) { alert('失败: ' + e); }
+                },
                 downloadRecipients() {
                     if (!this.bulk.recipients) { alert('没有收件人可下载'); return; }
                     const emails = this.bulk.recipients.split('\n').filter(r => r.trim());
@@ -3045,7 +3094,6 @@ EOF
                     this.saving = true;
                     try {
                         await fetch('/api/save', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(this.config) });
-                        alert('保存成功');
                         this.showPwd = false;
                     } catch(e) { alert('失败: ' + e); }
                     this.saving = false;
