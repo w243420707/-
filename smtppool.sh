@@ -148,6 +148,26 @@ def init_db():
             updated_at TIMESTAMP DEFAULT (datetime('now', '+08:00'))
         )''')
 
+        conn.execute('''CREATE TABLE IF NOT EXISTS smtp_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password TEXT NOT NULL,
+            email_limit INTEGER DEFAULT 0,
+            email_sent INTEGER DEFAULT 0,
+            expires_at TIMESTAMP,
+            enabled INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT (datetime('now', '+08:00')),
+            last_used_at TIMESTAMP
+        )''')
+        
+        # Check and add smtp_users columns safely
+        try:
+            cursor = conn.execute("PRAGMA table_info(smtp_users)")
+            cols = [c[1] for c in cursor.fetchall()]
+            if 'last_used_at' not in cols:
+                conn.execute("ALTER TABLE smtp_users ADD COLUMN last_used_at TIMESTAMP")
+        except: pass
+
 # --- Config & Logging ---
 def load_config():
     if not os.path.exists(CONFIG_FILE): return {}
@@ -177,6 +197,55 @@ def send_telegram(msg):
     if tg.get('bot_token') and tg.get('admin_id'):
         try: requests.post(f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage", json={"chat_id": tg['admin_id'], "text": msg}, timeout=5)
         except: pass
+
+# --- SMTP Authenticator ---
+class SMTPAuthenticator:
+    def __call__(self, server, session, envelope, mechanism, auth_data):
+        try:
+            # Decode auth data (LOGIN mechanism)
+            if mechanism == 'LOGIN':
+                username = auth_data.login.decode('utf-8') if hasattr(auth_data, 'login') else ''
+                password = auth_data.password.decode('utf-8') if hasattr(auth_data, 'password') else ''
+            elif mechanism == 'PLAIN':
+                # PLAIN format: \0username\0password
+                parts = auth_data.decode('utf-8').split('\x00')
+                username = parts[1] if len(parts) > 1 else ''
+                password = parts[2] if len(parts) > 2 else ''
+            else:
+                return False
+            
+            # Verify user
+            with get_db() as conn:
+                user = conn.execute(
+                    "SELECT * FROM smtp_users WHERE username=? AND password=? AND enabled=1",
+                    (username, password)
+                ).fetchone()
+                
+                if not user:
+                    logger.warning(f"❌ SMTP Auth failed: {username}")
+                    return False
+                
+                # Check expiry
+                if user['expires_at']:
+                    from datetime import datetime
+                    expires = datetime.strptime(user['expires_at'], '%Y-%m-%d %H:%M:%S')
+                    if datetime.now() > expires:
+                        logger.warning(f"❌ SMTP Auth expired: {username}")
+                        return False
+                
+                # Check limit
+                if user['email_limit'] > 0 and user['email_sent'] >= user['email_limit']:
+                    logger.warning(f"❌ SMTP Auth limit reached: {username} ({user['email_sent']}/{user['email_limit']})")
+                    return False
+                
+                # Store username in session for later use
+                session.smtp_user = username
+                session.smtp_user_id = user['id']
+                logger.info(f"✅ SMTP Auth success: {username}")
+                return True
+        except Exception as e:
+            logger.error(f"SMTP Auth error: {e}")
+            return False
 
 # --- SMTP Handler (Producer) ---
 class RelayHandler:
@@ -219,6 +288,23 @@ class RelayHandler:
                         "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now', '+08:00'), datetime('now', '+08:00'))",
                         (envelope.mail_from, json.dumps(envelope.rcpt_tos), envelope.content, node_name, 'pending', 'relay', None)
                     )
+                
+                # Auto-save relay recipients to contacts list
+                for rcpt_email in envelope.rcpt_tos:
+                    rcpt_email = rcpt_email.strip()
+                    if rcpt_email and '@' in rcpt_email:
+                        try:
+                            conn.execute("INSERT INTO contacts (email, created_at) VALUES (?, datetime('now', '+08:00'))", (rcpt_email,))
+                        except sqlite3.IntegrityError:
+                            pass  # Already exists, ignore
+                
+                # Update SMTP user sent count
+                if hasattr(session, 'smtp_user_id'):
+                    conn.execute(
+                        "UPDATE smtp_users SET email_sent = email_sent + ?, last_used_at = datetime('now', '+08:00') WHERE id = ?",
+                        (len(envelope.rcpt_tos), session.smtp_user_id)
+                    )
+                            
             return '250 OK: Queued for redundant delivery'
         except Exception as e:
             logger.error(f"❌ DB Error: {e}")
@@ -980,6 +1066,73 @@ def api_send_bulk():
         logger.error(f"Bulk send error: {e}")
         return jsonify({"error": str(e)}), 500
 
+# --- SMTP Users Management API ---
+@app.route('/api/smtp-users')
+@login_required
+def api_smtp_users_list():
+    with get_db() as conn:
+        rows = conn.execute("SELECT id, username, email_limit, email_sent, expires_at, enabled, created_at, last_used_at FROM smtp_users ORDER BY id DESC").fetchall()
+    return jsonify([dict(r) for r in rows])
+
+@app.route('/api/smtp-users', methods=['POST'])
+@login_required
+def api_smtp_users_create():
+    data = request.json
+    username = data.get('username', '').strip()
+    password = data.get('password', '').strip()
+    email_limit = int(data.get('email_limit', 0))
+    expires_at = data.get('expires_at', '').strip() or None
+    
+    if not username or not password:
+        return jsonify({"error": "Username and password required"}), 400
+    
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO smtp_users (username, password, email_limit, expires_at, enabled) VALUES (?, ?, ?, ?, 1)",
+                (username, password, email_limit, expires_at)
+            )
+        return jsonify({"status": "ok"})
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "Username already exists"}), 400
+
+@app.route('/api/smtp-users/<int:user_id>', methods=['PUT'])
+@login_required
+def api_smtp_users_update(user_id):
+    data = request.json
+    updates = []
+    params = []
+    
+    if 'password' in data and data['password']:
+        updates.append("password=?")
+        params.append(data['password'])
+    if 'email_limit' in data:
+        updates.append("email_limit=?")
+        params.append(int(data['email_limit']))
+    if 'expires_at' in data:
+        updates.append("expires_at=?")
+        params.append(data['expires_at'] if data['expires_at'] else None)
+    if 'enabled' in data:
+        updates.append("enabled=?")
+        params.append(1 if data['enabled'] else 0)
+    if 'reset_count' in data and data['reset_count']:
+        updates.append("email_sent=0")
+    
+    if not updates:
+        return jsonify({"error": "No fields to update"}), 400
+    
+    params.append(user_id)
+    with get_db() as conn:
+        conn.execute(f"UPDATE smtp_users SET {', '.join(updates)} WHERE id=?", params)
+    return jsonify({"status": "ok"})
+
+@app.route('/api/smtp-users/<int:user_id>', methods=['DELETE'])
+@login_required
+def api_smtp_users_delete(user_id):
+    with get_db() as conn:
+        conn.execute("DELETE FROM smtp_users WHERE id=?", (user_id,))
+    return jsonify({"status": "ok"})
+
 @app.route('/api/contacts/import', methods=['POST'])
 @login_required
 def api_contacts_import():
@@ -1217,8 +1370,17 @@ def start_services():
     port = int(cfg.get('server_config', {}).get('port', 587))
     print(f"SMTP Port: {port}")
     
-    # Start SMTP Server
-    Controller(RelayHandler(), hostname='0.0.0.0', port=port).start()
+    # Start SMTP Server with authentication
+    authenticator = SMTPAuthenticator()
+    controller = Controller(
+        RelayHandler(), 
+        hostname='0.0.0.0', 
+        port=port,
+        authenticator=authenticator,
+        auth_required=True,
+        auth_require_tls=False
+    )
+    controller.start()
     
     # Start Worker
     t = threading.Thread(target=worker_thread, daemon=True)
@@ -1380,6 +1542,9 @@ EOF
                 </div>
                 <div class="nav-item" :class="{active: tab=='send'}" @click="tab='send'; mobileMenu=false">
                     <i class="bi bi-envelope-paper-fill"></i> <span>邮件群发</span>
+                </div>
+                <div class="nav-item" :class="{active: tab=='users'}" @click="tab='users'; fetchSmtpUsers(); mobileMenu=false">
+                    <i class="bi bi-people-fill"></i> <span>用户管理</span>
                 </div>
                 <div class="nav-item" :class="{active: tab=='settings'}" @click="tab='settings'; mobileMenu=false">
                     <i class="bi bi-gear-fill"></i> <span>系统设置</span>
@@ -1647,6 +1812,107 @@ EOF
                         </div>
                     </div>
                 </div>
+            </div>
+
+            <!-- Users Tab -->
+            <div v-if="tab=='users'" class="fade-in">
+                <div class="d-flex justify-content-between align-items-center mb-4">
+                    <h4 class="fw-bold mb-0">SMTP 用户管理</h4>
+                    <button class="btn btn-primary" @click="showAddUserModal">
+                        <i class="bi bi-plus-lg me-1"></i>添加用户
+                    </button>
+                </div>
+
+                <div class="card">
+                    <div class="table-responsive">
+                        <table class="table table-hover mb-0">
+                            <thead>
+                                <tr>
+                                    <th>用户名</th>
+                                    <th>发送限额</th>
+                                    <th>已发送</th>
+                                    <th>到期时间</th>
+                                    <th>状态</th>
+                                    <th>最后使用</th>
+                                    <th style="width:180px">操作</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <tr v-if="smtpUsers.length==0">
+                                    <td colspan="7" class="text-center text-muted py-4">暂无用户数据</td>
+                                </tr>
+                                <tr v-for="u in smtpUsers" :key="u.id">
+                                    <td><strong>[[ u.username ]]</strong></td>
+                                    <td>[[ u.email_limit == 0 ? '无限制' : u.email_limit.toLocaleString() ]]</td>
+                                    <td>
+                                        <span :class="{'text-danger': u.email_limit > 0 && u.email_sent >= u.email_limit}">[[ u.email_sent.toLocaleString() ]]</span>
+                                        <span v-if="u.email_limit > 0" class="text-muted"> / [[ u.email_limit.toLocaleString() ]]</span>
+                                    </td>
+                                    <td>
+                                        <span v-if="!u.expires_at" class="text-muted">永不过期</span>
+                                        <span v-else :class="{'text-danger': new Date(u.expires_at) < new Date()}">[[ u.expires_at ]]</span>
+                                    </td>
+                                    <td>
+                                        <span class="badge" :class="u.enabled ? 'bg-success' : 'bg-secondary'">[[ u.enabled ? '启用' : '禁用' ]]</span>
+                                    </td>
+                                    <td><small class="text-muted">[[ u.last_used_at || '从未使用' ]]</small></td>
+                                    <td>
+                                        <button class="btn btn-sm btn-outline-secondary me-1" @click="resetUserCount(u)" title="重置计数">
+                                            <i class="bi bi-arrow-counterclockwise"></i>
+                                        </button>
+                                        <button class="btn btn-sm btn-outline-primary me-1" @click="showEditUserModal(u)" title="编辑">
+                                            <i class="bi bi-pencil"></i>
+                                        </button>
+                                        <button class="btn btn-sm btn-outline-danger" @click="deleteSmtpUser(u)" title="删除">
+                                            <i class="bi bi-trash"></i>
+                                        </button>
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- User Modal -->
+                <div class="modal fade" :class="{show: showUserModal}" :style="{display: showUserModal ? 'block' : 'none'}" tabindex="-1">
+                    <div class="modal-dialog">
+                        <div class="modal-content">
+                            <div class="modal-header">
+                                <h5 class="modal-title">[[ editingUser ? '编辑用户' : '添加用户' ]]</h5>
+                                <button type="button" class="btn-close" @click="showUserModal=false"></button>
+                            </div>
+                            <div class="modal-body">
+                                <div class="mb-3">
+                                    <label class="form-label">用户名 <span class="text-danger">*</span></label>
+                                    <input type="text" class="form-control" v-model="userForm.username" :disabled="editingUser" placeholder="SMTP登录用户名">
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">密码 <span v-if="!editingUser" class="text-danger">*</span></label>
+                                    <input type="password" class="form-control" v-model="userForm.password" :placeholder="editingUser ? '留空则不修改密码' : 'SMTP登录密码'">
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">发送限额</label>
+                                    <input type="number" class="form-control" v-model.number="userForm.email_limit" min="0" placeholder="0表示无限制">
+                                    <div class="form-text">允许发送的邮件总数，0为不限制</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">到期时间</label>
+                                    <input type="datetime-local" class="form-control" v-model="userForm.expires_at">
+                                    <div class="form-text">留空表示永不过期</div>
+                                </div>
+                                <div class="form-check form-switch">
+                                    <input class="form-check-input" type="checkbox" v-model="userForm.enabled" id="userEnabled">
+                                    <label class="form-check-label" for="userEnabled">启用账户</label>
+                                </div>
+                            </div>
+                            <div class="modal-footer">
+                                <button type="button" class="btn btn-secondary" @click="showUserModal=false">取消</button>
+                                <button type="button" class="btn btn-primary" @click="saveSmtpUser">[[ editingUser ? '保存' : '添加' ]]</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-backdrop fade show" v-if="showUserModal" @click="showUserModal=false"></div>
             </div>
 
             <!-- Settings Tab -->
@@ -1948,7 +2214,11 @@ EOF
                     showBatchEdit: false,
                     batchEdit: { max_per_hour: null, min_interval: null, max_interval: null, routing_rules: '' },
                     shufflingContacts: false,
-                    removeEmail: ''
+                    removeEmail: '',
+                    smtpUsers: [],
+                    showUserModal: false,
+                    editingUser: null,
+                    userForm: { username: '', password: '', email_limit: 0, expires_at: '', enabled: true }
                 }
             },
             computed: {
@@ -2048,6 +2318,69 @@ EOF
                 }
             },
             methods: {
+                async fetchSmtpUsers() {
+                    try {
+                        const res = await fetch('/api/smtp-users');
+                        this.smtpUsers = await res.json();
+                    } catch(e) { console.error("Failed to fetch users", e); }
+                },
+                showAddUserModal() {
+                    this.editingUser = null;
+                    this.userForm = { username: '', password: '', email_limit: 0, expires_at: '', enabled: true };
+                    this.showUserModal = true;
+                },
+                showEditUserModal(u) {
+                    this.editingUser = u;
+                    this.userForm = { 
+                        username: u.username, 
+                        password: '', 
+                        email_limit: u.email_limit, 
+                        expires_at: u.expires_at ? u.expires_at.replace(' ', 'T') : '',
+                        enabled: u.enabled 
+                    };
+                    this.showUserModal = true;
+                },
+                async saveSmtpUser() {
+                    if (!this.userForm.username) { alert('请输入用户名'); return; }
+                    if (!this.editingUser && !this.userForm.password) { alert('请输入密码'); return; }
+                    try {
+                        const payload = { ...this.userForm };
+                        if (payload.expires_at) payload.expires_at = payload.expires_at.replace('T', ' ');
+                        if (this.editingUser) {
+                            await fetch('/api/smtp-users/' + this.editingUser.id, {
+                                method: 'PUT',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(payload)
+                            });
+                        } else {
+                            await fetch('/api/smtp-users', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(payload)
+                            });
+                        }
+                        this.showUserModal = false;
+                        this.fetchSmtpUsers();
+                    } catch(e) { alert('保存失败: ' + e.message); }
+                },
+                async deleteSmtpUser(u) {
+                    if (!confirm('确定删除用户 ' + u.username + '?')) return;
+                    try {
+                        await fetch('/api/smtp-users/' + u.id, { method: 'DELETE' });
+                        this.fetchSmtpUsers();
+                    } catch(e) { alert('删除失败: ' + e.message); }
+                },
+                async resetUserCount(u) {
+                    if (!confirm('确定重置用户 ' + u.username + ' 的发送计数?')) return;
+                    try {
+                        await fetch('/api/smtp-users/' + u.id, {
+                            method: 'PUT',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ reset_count: true })
+                        });
+                        this.fetchSmtpUsers();
+                    } catch(e) { alert('重置失败: ' + e.message); }
+                },
                 setTheme(t) {
                     this.theme = t;
                     localStorage.setItem('theme', t);
