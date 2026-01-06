@@ -157,8 +157,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
-            email_limit INTEGER DEFAULT 0,
-            email_sent INTEGER DEFAULT 0,
+            hourly_limit INTEGER DEFAULT 0,
+            hourly_sent INTEGER DEFAULT 0,
+            hourly_reset_at TIMESTAMP DEFAULT (datetime('now', '+08:00')),
             expires_at TIMESTAMP,
             enabled INTEGER DEFAULT 1,
             created_at TIMESTAMP DEFAULT (datetime('now', '+08:00')),
@@ -174,6 +175,15 @@ def init_db():
                 conn.execute("ALTER TABLE smtp_users ADD COLUMN last_used_at TIMESTAMP")
             if 'user_type' not in cols:
                 conn.execute("ALTER TABLE smtp_users ADD COLUMN user_type TEXT DEFAULT 'free'")
+            if 'hourly_limit' not in cols:
+                conn.execute("ALTER TABLE smtp_users ADD COLUMN hourly_limit INTEGER DEFAULT 0")
+            if 'hourly_sent' not in cols:
+                conn.execute("ALTER TABLE smtp_users ADD COLUMN hourly_sent INTEGER DEFAULT 0")
+            if 'hourly_reset_at' not in cols:
+                conn.execute("ALTER TABLE smtp_users ADD COLUMN hourly_reset_at TIMESTAMP DEFAULT (datetime('now', '+08:00'))")
+            # Migrate existing email_limit to hourly_limit
+            if 'email_limit' in cols and 'hourly_limit' in cols:
+                conn.execute("UPDATE smtp_users SET hourly_limit = email_limit WHERE hourly_limit = 0")
         except: pass
 
 # --- Config & Logging ---
@@ -247,9 +257,25 @@ class SMTPAuthenticator:
                         logger.warning(f"❌ SMTP Auth expired: {username}")
                         return fail_result
                 
-                # Check limit
-                if user['email_limit'] > 0 and user['email_sent'] >= user['email_limit']:
-                    logger.warning(f"❌ SMTP Auth limit reached: {username} ({user['email_sent']}/{user['email_limit']})")
+                # Check and reset hourly limit
+                now = datetime.now()
+                if user['hourly_reset_at']:
+                    reset_time = datetime.strptime(user['hourly_reset_at'], '%Y-%m-%d %H:%M:%S')
+                    # Reset if it's a new hour
+                    if now.hour != reset_time.hour or now.date() != reset_time.date():
+                        conn.execute(
+                            "UPDATE smtp_users SET hourly_sent = 0, hourly_reset_at = datetime('now', '+08:00') WHERE id = ?",
+                            (user['id'],)
+                        )
+                        # Refresh user data
+                        user = conn.execute(
+                            "SELECT * FROM smtp_users WHERE username=? AND password=? AND enabled=1",
+                            (username, password)
+                        ).fetchone()
+                
+                # Check hourly limit
+                if user['hourly_limit'] > 0 and user['hourly_sent'] >= user['hourly_limit']:
+                    logger.warning(f"❌ SMTP Auth hourly limit reached: {username} ({user['hourly_sent']}/{user['hourly_limit']} this hour)")
                     return fail_result
                 
                 # Store username in session for later use
@@ -322,10 +348,10 @@ class RelayHandler:
                         except sqlite3.IntegrityError:
                             pass  # Already exists, ignore
                 
-                # Update SMTP user sent count
+                # Update SMTP user hourly count
                 if hasattr(session, 'smtp_user_id'):
                     conn.execute(
-                        "UPDATE smtp_users SET email_sent = email_sent + ?, last_used_at = datetime('now', '+08:00') WHERE id = ?",
+                        "UPDATE smtp_users SET hourly_sent = hourly_sent + ?, last_used_at = datetime('now', '+08:00') WHERE id = ?",
                         (len(envelope.rcpt_tos), session.smtp_user_id)
                     )
                             
@@ -1095,7 +1121,7 @@ def api_send_bulk():
 @login_required
 def api_smtp_users_list():
     with get_db() as conn:
-        rows = conn.execute("SELECT id, username, email_limit, email_sent, expires_at, enabled, created_at, last_used_at, user_type FROM smtp_users ORDER BY id DESC").fetchall()
+        rows = conn.execute("SELECT id, username, hourly_limit, hourly_sent, hourly_reset_at, expires_at, enabled, created_at, last_used_at, user_type FROM smtp_users ORDER BY id DESC").fetchall()
     return jsonify([dict(r) for r in rows])
 
 @app.route('/api/smtp-users', methods=['POST'])
@@ -1104,7 +1130,7 @@ def api_smtp_users_create():
     data = request.json
     username = data.get('username', '').strip()
     password = data.get('password', '').strip()
-    email_limit = int(data.get('email_limit', 0))
+    hourly_limit = int(data.get('hourly_limit', 0))
     expires_at = data.get('expires_at', '').strip() or None
     
     if not username or not password:
@@ -1113,8 +1139,8 @@ def api_smtp_users_create():
     try:
         with get_db() as conn:
             conn.execute(
-                "INSERT INTO smtp_users (username, password, email_limit, expires_at, enabled) VALUES (?, ?, ?, ?, 1)",
-                (username, password, email_limit, expires_at)
+                "INSERT INTO smtp_users (username, password, hourly_limit, expires_at, enabled) VALUES (?, ?, ?, ?, 1)",
+                (username, password, hourly_limit, expires_at)
             )
         return jsonify({"status": "ok"})
     except sqlite3.IntegrityError:
@@ -1130,17 +1156,18 @@ def api_smtp_users_update(user_id):
     if 'password' in data and data['password']:
         updates.append("password=?")
         params.append(data['password'])
-    if 'email_limit' in data:
-        updates.append("email_limit=?")
-        params.append(int(data['email_limit']))
+    if 'hourly_limit' in data:
+        updates.append("hourly_limit=?")
+        params.append(int(data['hourly_limit']))
     if 'expires_at' in data:
         updates.append("expires_at=?")
         params.append(data['expires_at'] if data['expires_at'] else None)
     if 'enabled' in data:
         updates.append("enabled=?")
         params.append(1 if data['enabled'] else 0)
-    if 'reset_count' in data and data['reset_count']:
-        updates.append("email_sent=0")
+    if 'reset_hourly_count' in data and data['reset_hourly_count']:
+        updates.append("hourly_sent=0")
+        updates.append("hourly_reset_at=datetime('now', '+08:00')")
     
     if not updates:
         return jsonify({"error": "No fields to update"}), 400
@@ -1180,8 +1207,8 @@ def api_smtp_users_batch():
     elif user_type == 'yearly':
         expires_at = (datetime.now() + timedelta(days=365)).strftime('%Y-%m-%d %H:%M:%S')
     
-    # Get email limit from config
-    email_limit = user_limits.get(user_type, {}).get('email_limit', 0)
+    # Get hourly limit from config
+    hourly_limit = user_limits.get(user_type, {}).get('hourly_limit', 0)
     
     generated_users = []
     with get_db() as conn:
@@ -1192,13 +1219,13 @@ def api_smtp_users_batch():
             
             try:
                 conn.execute(
-                    "INSERT INTO smtp_users (username, password, email_limit, expires_at, enabled, user_type) VALUES (?, ?, ?, ?, 1, ?)",
-                    (username, password, email_limit, expires_at, user_type)
+                    "INSERT INTO smtp_users (username, password, hourly_limit, expires_at, enabled, user_type) VALUES (?, ?, ?, ?, 1, ?)",
+                    (username, password, hourly_limit, expires_at, user_type)
                 )
                 generated_users.append({
                     'username': username,
                     'password': password,
-                    'email_limit': email_limit,
+                    'hourly_limit': hourly_limit,
                     'expires_at': expires_at or 'Never',
                     'user_type': user_type
                 })
@@ -1936,8 +1963,8 @@ EOF
                                 <tr>
                                     <th>用户名</th>
                                     <th>类型</th>
-                                    <th>发送限额</th>
-                                    <th>已发送</th>
+                                    <th>每小时限额</th>
+                                    <th>本小时已发</th>
                                     <th>到期时间</th>
                                     <th>状态</th>
                                     <th>最后使用</th>
@@ -1951,10 +1978,11 @@ EOF
                                 <tr v-for="u in smtpUsers" :key="u.id">
                                     <td><strong>[[ u.username ]]</strong></td>
                                     <td><span class="badge" :class="getUserTypeBadge(u.user_type)">[[ getUserTypeLabel(u.user_type) ]]</span></td>
-                                    <td>[[ u.email_limit == 0 ? '无限制' : u.email_limit.toLocaleString() ]]</td>
+                                    <td>[[ u.hourly_limit == 0 ? '无限制' : u.hourly_limit.toLocaleString() + '/小时' ]]</td>
                                     <td>
-                                        <span :class="{'text-danger': u.email_limit > 0 && u.email_sent >= u.email_limit}">[[ u.email_sent.toLocaleString() ]]</span>
-                                        <span v-if="u.email_limit > 0" class="text-muted"> / [[ u.email_limit.toLocaleString() ]]</span>
+                                        <span :class="{'text-danger': u.hourly_limit > 0 && u.hourly_sent >= u.hourly_limit}">[[ u.hourly_sent.toLocaleString() ]]</span>
+                                        <span v-if="u.hourly_limit > 0" class="text-muted"> / [[ u.hourly_limit.toLocaleString() ]]</span>
+                                        <div class="small text-muted">重置: [[ formatHourlyReset(u.hourly_reset_at) ]]</div>
                                     </td>
                                     <td>
                                         <span v-if="!u.expires_at" class="text-muted">永不过期</span>
@@ -1965,7 +1993,7 @@ EOF
                                     </td>
                                     <td><small class="text-muted">[[ u.last_used_at || '从未使用' ]]</small></td>
                                     <td>
-                                        <button class="btn btn-sm btn-outline-secondary me-1" @click="resetUserCount(u)" title="重置计数">
+                                        <button class="btn btn-sm btn-outline-secondary me-1" @click="resetUserCount(u)" title="重置每小时计数">
                                             <i class="bi bi-arrow-counterclockwise"></i>
                                         </button>
                                         <button class="btn btn-sm btn-outline-primary me-1" @click="showEditUserModal(u)" title="编辑">
@@ -2038,9 +2066,9 @@ EOF
                                     <input type="password" class="form-control" v-model="userForm.password" :placeholder="editingUser ? '留空则不修改密码' : 'SMTP登录密码'">
                                 </div>
                                 <div class="mb-3">
-                                    <label class="form-label">发送限额</label>
-                                    <input type="number" class="form-control" v-model.number="userForm.email_limit" min="0" placeholder="0表示无限制">
-                                    <div class="form-text">允许发送的邮件总数，0为不限制</div>
+                                    <label class="form-label">每小时发送限额</label>
+                                    <input type="number" class="form-control" v-model.number="userForm.hourly_limit" min="0" placeholder="0表示无限制">
+                                    <div class="form-text">每小时允许发送的邮件数量，0为不限制</div>
                                 </div>
                                 <div class="mb-3">
                                     <label class="form-label">到期时间</label>
@@ -2121,27 +2149,27 @@ EOF
 
                     <div class="col-12">
                         <div class="card">
-                            <div class="card-header">用户限额配置 (批量生成时使用)</div>
+                            <div class="card-header">用户每小时限额配置 (批量生成时使用)</div>
                             <div class="card-body">
                                 <div class="row g-3">
                                     <div class="col-md-3">
-                                        <label class="form-label"><span class="badge bg-secondary me-1">免费</span>发送限额</label>
-                                        <input type="number" v-model.number="config.user_limits.free.email_limit" class="form-control" placeholder="0=无限制">
+                                        <label class="form-label"><span class="badge bg-secondary me-1">免费</span>每小时限额</label>
+                                        <input type="number" v-model.number="config.user_limits.free.hourly_limit" class="form-control" placeholder="0=无限制">
                                     </div>
                                     <div class="col-md-3">
-                                        <label class="form-label"><span class="badge bg-info me-1">月度</span>发送限额</label>
-                                        <input type="number" v-model.number="config.user_limits.monthly.email_limit" class="form-control" placeholder="0=无限制">
+                                        <label class="form-label"><span class="badge bg-info me-1">月度</span>每小时限额</label>
+                                        <input type="number" v-model.number="config.user_limits.monthly.hourly_limit" class="form-control" placeholder="0=无限制">
                                     </div>
                                     <div class="col-md-3">
-                                        <label class="form-label"><span class="badge bg-primary me-1">季度</span>发送限额</label>
-                                        <input type="number" v-model.number="config.user_limits.quarterly.email_limit" class="form-control" placeholder="0=无限制">
+                                        <label class="form-label"><span class="badge bg-primary me-1">季度</span>每小时限额</label>
+                                        <input type="number" v-model.number="config.user_limits.quarterly.hourly_limit" class="form-control" placeholder="0=无限制">
                                     </div>
                                     <div class="col-md-3">
-                                        <label class="form-label"><span class="badge bg-warning text-dark me-1">年度</span>发送限额</label>
-                                        <input type="number" v-model.number="config.user_limits.yearly.email_limit" class="form-control" placeholder="0=无限制">
+                                        <label class="form-label"><span class="badge bg-warning text-dark me-1">年度</span>每小时限额</label>
+                                        <input type="number" v-model.number="config.user_limits.yearly.hourly_limit" class="form-control" placeholder="0=无限制">
                                     </div>
                                 </div>
-                                <div class="form-text mt-2">批量生成用户时，系统会根据用户类型自动设置发送限额。0 表示不限制。</div>
+                                <div class="form-text mt-2">批量生成用户时，系统会根据用户类型自动设置每小时发送限额。0 表示不限制，每小时会自动重置计数。</div>
                             </div>
                         </div>
                     </div>
@@ -2382,7 +2410,7 @@ EOF
                     smtpUsers: [],
                     showUserModal: false,
                     editingUser: null,
-                    userForm: { username: '', password: '', email_limit: 0, expires_at: '', enabled: true },
+                    userForm: { username: '', password: '', hourly_limit: 0, expires_at: '', enabled: true },
                     showBatchUserModal: false,
                     batchUserType: 'free',
                     batchUserCount: 10,
@@ -2454,10 +2482,10 @@ EOF
                 if(!this.config.limit_config) this.config.limit_config = { max_per_hour: 0, min_interval: 1, max_interval: 5 };
                 if(!this.config.log_config) this.config.log_config = { max_mb: 50, backups: 3, retention_days: 7 };
                 if(!this.config.user_limits) this.config.user_limits = { 
-                    free: { email_limit: 100 }, 
-                    monthly: { email_limit: 1000 }, 
-                    quarterly: { email_limit: 5000 }, 
-                    yearly: { email_limit: 20000 } 
+                    free: { hourly_limit: 10 }, 
+                    monthly: { hourly_limit: 50 }, 
+                    quarterly: { hourly_limit: 100 }, 
+                    yearly: { hourly_limit: 200 } 
                 };
                 this.config.downstream_pool.forEach(n => { 
                     if(n.enabled === undefined) n.enabled = true; 
@@ -2500,7 +2528,7 @@ EOF
                 },
                 showAddUserModal() {
                     this.editingUser = null;
-                    this.userForm = { username: '', password: '', email_limit: 0, expires_at: '', enabled: true };
+                    this.userForm = { username: '', password: '', hourly_limit: 0, expires_at: '', enabled: true };
                     this.showUserModal = true;
                 },
                 showEditUserModal(u) {
@@ -2508,7 +2536,7 @@ EOF
                     this.userForm = { 
                         username: u.username, 
                         password: '', 
-                        email_limit: u.email_limit, 
+                        hourly_limit: u.hourly_limit, 
                         expires_at: u.expires_at ? u.expires_at.replace(' ', 'T') : '',
                         enabled: u.enabled 
                     };
@@ -2545,12 +2573,12 @@ EOF
                     } catch(e) { alert('删除失败: ' + e.message); }
                 },
                 async resetUserCount(u) {
-                    if (!confirm('确定重置用户 ' + u.username + ' 的发送计数?')) return;
+                    if (!confirm('确定重置用户 ' + u.username + ' 的每小时发送计数?')) return;
                     try {
                         await fetch('/api/smtp-users/' + u.id, {
                             method: 'PUT',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ reset_count: true })
+                            body: JSON.stringify({ reset_hourly_count: true })
                         });
                         this.fetchSmtpUsers();
                     } catch(e) { alert('重置失败: ' + e.message); }
@@ -2578,9 +2606,9 @@ EOF
                         const data = await res.json();
                         if (data.users && data.users.length > 0) {
                             // Generate CSV content
-                            let csv = 'Username,Password,Email Limit,Expires At,User Type\n';
+                            let csv = 'Username,Password,Hourly Limit,Expires At,User Type\n';
                             data.users.forEach(u => {
-                                csv += `${u.username},${u.password},${u.email_limit},${u.expires_at},${u.user_type}\n`;
+                                csv += `${u.username},${u.password},${u.hourly_limit},${u.expires_at},${u.user_type}\n`;
                             });
                             // Download CSV
                             const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
@@ -2599,6 +2627,16 @@ EOF
                         }
                     } catch(e) { alert('生成失败: ' + e.message); }
                     this.batchGenerating = false;
+                },
+                formatHourlyReset(resetTime) {
+                    if (!resetTime) return '未知';
+                    const reset = new Date(resetTime);
+                    const now = new Date();
+                    const nextHour = new Date(reset);
+                    nextHour.setHours(nextHour.getHours() + 1, 0, 0, 0);
+                    if (now >= nextHour) return '即将重置';
+                    const minutes = Math.floor((nextHour - now) / 60000);
+                    return `${minutes}分钟后`;
                 },
                 setTheme(t) {
                     this.theme = t;
