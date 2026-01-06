@@ -1270,6 +1270,26 @@ def api_contacts_count():
         c = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
     return jsonify({"count": c})
 
+@app.route('/api/contacts/domain_stats')
+@login_required
+def api_contacts_domain_stats():
+    """Get domain statistics for all contacts"""
+    with get_db() as conn:
+        rows = conn.execute("SELECT email FROM contacts").fetchall()
+    
+    domain_count = {}
+    for row in rows:
+        email = row['email']
+        if '@' in email:
+            domain = email.split('@')[-1].lower().strip()
+            if domain:
+                domain_count[domain] = domain_count.get(domain, 0) + 1
+    
+    # Sort by count descending
+    sorted_domains = sorted(domain_count.items(), key=lambda x: x[1], reverse=True)
+    result = [{'domain': d, 'count': c} for d, c in sorted_domains]
+    return jsonify(result)
+
 @app.route('/api/contacts/clear', methods=['POST'])
 @login_required
 def api_contacts_clear():
@@ -1936,6 +1956,21 @@ EOF
                                 <button v-else class="btn btn-outline-primary w-100 mb-2" @click="loadContacts(0)">
                                     <i class="bi bi-cloud-download"></i> 加载全部 ([[ contactCount ]])
                                 </button>
+                                
+                                <!-- 通讯录域名统计 -->
+                                <div v-if="contactDomainStats.length > 0" class="mb-2">
+                                    <div class="d-flex justify-content-between align-items-center mb-1">
+                                        <small class="text-muted">通讯录域名统计:</small>
+                                        <button class="btn btn-link btn-sm p-0 text-muted" @click="fetchContactDomainStats" title="刷新统计">
+                                            <i class="bi bi-arrow-clockwise"></i>
+                                        </button>
+                                    </div>
+                                    <div class="d-flex flex-wrap gap-1" style="max-height: 100px; overflow-y: auto;">
+                                        <span class="badge bg-secondary-subtle text-dark border" v-for="ds in contactDomainStats" :key="ds.domain" style="cursor: pointer;" @click="removeDomainFromContacts(ds.domain)" :title="'点击清除通讯录中所有 @' + ds.domain + ' 邮箱'">
+                                            @[[ ds.domain ]] <span class="text-muted">([[ ds.count ]])</span> <i class="bi bi-x-circle text-danger ms-1"></i>
+                                        </span>
+                                    </div>
+                                </div>
 
                                 <textarea v-model="bulk.recipients" class="form-control flex-grow-1 mb-3" placeholder="每行一个邮箱地址..." style="min-height: 200px;"></textarea>
                                 <div class="d-flex justify-content-between align-items-center mb-2">
@@ -2443,6 +2478,7 @@ EOF
                     shufflingContacts: false,
                     removeEmail: '',
                     removeDomain: '',
+                    contactDomainStats: [],
                     smtpUsers: [],
                     showUserModal: false,
                     editingUser: null,
@@ -2536,6 +2572,7 @@ EOF
 
                 this.fetchQueue();
                 this.fetchContactCount();
+                this.fetchContactDomainStats();
                 this.fetchBulkStatus();
                 this.fetchTopDomains();
                 setInterval(() => {
@@ -2754,6 +2791,12 @@ EOF
                         this.contactCount = data.count;
                     } catch(e) {}
                 },
+                async fetchContactDomainStats() {
+                    try {
+                        const res = await fetch('/api/contacts/domain_stats');
+                        this.contactDomainStats = await res.json();
+                    } catch(e) { this.contactDomainStats = []; }
+                },
                 async fetchTopDomains() {
                     try {
                         const res = await fetch('/api/domain/stats');
@@ -2919,9 +2962,10 @@ EOF
                         }
                     } catch(e) { alert('失败: ' + e); }
                 },
-                async removeDomainFromContacts() {
-                    if (!this.removeDomain || !this.removeDomain.trim()) return;
-                    let domain = this.removeDomain.trim().toLowerCase();
+                async removeDomainFromContacts(domainParam) {
+                    let domain = domainParam || this.removeDomain;
+                    if (!domain || !domain.trim()) return;
+                    domain = domain.trim().toLowerCase();
                     if (domain.startsWith('@')) domain = domain.substring(1);
                     if (!confirm(`确定从通讯录中删除所有 @${domain} 的邮箱吗？`)) return;
                     try {
@@ -2932,9 +2976,9 @@ EOF
                         });
                         const data = await res.json();
                         if (data.deleted > 0) {
-                            alert(`已从通讯录中删除 ${data.deleted} 个 @${domain} 邮箱`);
                             this.removeDomain = '';
                             this.fetchContactCount();
+                            this.fetchContactDomainStats();
                             // Also remove from current input if present
                             if (this.bulk.recipients) {
                                 let emails = this.bulk.recipients.split('\n').filter(r => r.trim());
