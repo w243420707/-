@@ -1303,6 +1303,35 @@ def api_smtp_users_batch():
     
     return jsonify({"status": "ok", "users": generated_users, "count": len(generated_users)})
 
+@app.route('/api/smtp-users/batch-action', methods=['POST'])
+@login_required
+def api_smtp_users_batch_action():
+    """Batch action on SMTP users (delete, enable, disable)"""
+    data = request.json
+    action = data.get('action')
+    user_ids = data.get('user_ids', [])
+    
+    if not user_ids:
+        return jsonify({"success": False, "error": "No users selected"})
+    
+    if action not in ['delete', 'enable', 'disable']:
+        return jsonify({"success": False, "error": "Invalid action"})
+    
+    count = 0
+    with get_db() as conn:
+        placeholders = ','.join('?' * len(user_ids))
+        if action == 'delete':
+            cursor = conn.execute(f"DELETE FROM smtp_users WHERE id IN ({placeholders})", user_ids)
+            count = cursor.rowcount
+        elif action == 'enable':
+            cursor = conn.execute(f"UPDATE smtp_users SET enabled = 1 WHERE id IN ({placeholders})", user_ids)
+            count = cursor.rowcount
+        elif action == 'disable':
+            cursor = conn.execute(f"UPDATE smtp_users SET enabled = 0 WHERE id IN ({placeholders})", user_ids)
+            count = cursor.rowcount
+    
+    return jsonify({"success": True, "count": count, "action": action})
+
 @app.route('/api/contacts/import', methods=['POST'])
 @login_required
 def api_contacts_import():
@@ -2025,11 +2054,44 @@ EOF
                     </div>
                 </div>
 
+                <!-- Filter and Batch Actions Bar -->
+                <div class="card mb-3">
+                    <div class="card-body py-2">
+                        <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                            <div class="d-flex align-items-center gap-2">
+                                <span class="text-muted small">筛选:</span>
+                                <div class="btn-group btn-group-sm" role="group">
+                                    <button type="button" class="btn" :class="userFilter=='all' ? 'btn-primary' : 'btn-outline-secondary'" @click="userFilter='all'">全部 ([[ smtpUsers.length ]])</button>
+                                    <button type="button" class="btn" :class="userFilter=='free' ? 'btn-secondary' : 'btn-outline-secondary'" @click="userFilter='free'">免费 ([[ userCountByType('free') ]])</button>
+                                    <button type="button" class="btn" :class="userFilter=='monthly' ? 'btn-info' : 'btn-outline-secondary'" @click="userFilter='monthly'">月度 ([[ userCountByType('monthly') ]])</button>
+                                    <button type="button" class="btn" :class="userFilter=='quarterly' ? 'btn-primary' : 'btn-outline-secondary'" @click="userFilter='quarterly'">季度 ([[ userCountByType('quarterly') ]])</button>
+                                    <button type="button" class="btn" :class="userFilter=='yearly' ? 'btn-warning' : 'btn-outline-secondary'" @click="userFilter='yearly'">年度 ([[ userCountByType('yearly') ]])</button>
+                                </div>
+                                <div class="btn-group btn-group-sm ms-2" role="group">
+                                    <button type="button" class="btn" :class="userStatusFilter=='all' ? 'btn-primary' : 'btn-outline-secondary'" @click="userStatusFilter='all'">全部</button>
+                                    <button type="button" class="btn" :class="userStatusFilter=='enabled' ? 'btn-success' : 'btn-outline-secondary'" @click="userStatusFilter='enabled'">启用</button>
+                                    <button type="button" class="btn" :class="userStatusFilter=='disabled' ? 'btn-secondary' : 'btn-outline-secondary'" @click="userStatusFilter='disabled'">禁用</button>
+                                    <button type="button" class="btn" :class="userStatusFilter=='expired' ? 'btn-danger' : 'btn-outline-secondary'" @click="userStatusFilter='expired'">已过期</button>
+                                </div>
+                            </div>
+                            <div class="d-flex align-items-center gap-2" v-if="selectedUserIds.length > 0">
+                                <span class="badge bg-primary">[[ selectedUserIds.length ]] 已选</span>
+                                <button class="btn btn-sm btn-outline-success" @click="batchEnableUsers(true)"><i class="bi bi-check-circle me-1"></i>批量启用</button>
+                                <button class="btn btn-sm btn-outline-secondary" @click="batchEnableUsers(false)"><i class="bi bi-x-circle me-1"></i>批量禁用</button>
+                                <button class="btn btn-sm btn-outline-danger" @click="batchDeleteUsers"><i class="bi bi-trash me-1"></i>批量删除</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="card">
                     <div class="table-responsive" style="max-height: 600px; overflow-y: auto;">
                         <table class="table table-hover mb-0">
                             <thead style="position: sticky; top: 0; background: var(--card-bg); z-index: 1;">
                                 <tr>
+                                    <th style="width: 40px;">
+                                        <input type="checkbox" class="form-check-input" :checked="isAllFilteredSelected" @change="toggleSelectAllFiltered">
+                                    </th>
                                     <th>用户名</th>
                                     <th>类型</th>
                                     <th>每小时限额</th>
@@ -2041,10 +2103,13 @@ EOF
                                 </tr>
                             </thead>
                             <tbody>
-                                <tr v-if="smtpUsers.length==0">
-                                    <td colspan="8" class="text-center text-muted py-4">暂无用户数据</td>
+                                <tr v-if="filteredUsers.length==0">
+                                    <td colspan="9" class="text-center text-muted py-4">暂无用户数据</td>
                                 </tr>
-                                <tr v-for="u in smtpUsers" :key="u.id">
+                                <tr v-for="u in filteredUsers" :key="u.id" :class="{'table-active': selectedUserIds.includes(u.id)}">
+                                    <td>
+                                        <input type="checkbox" class="form-check-input" :checked="selectedUserIds.includes(u.id)" @change="toggleUserSelection(u.id)">
+                                    </td>
                                     <td><strong>[[ u.username ]]</strong></td>
                                     <td><span class="badge" :class="getUserTypeBadge(u.user_type)">[[ getUserTypeLabel(u.user_type) ]]</span></td>
                                     <td>[[ (u.hourly_limit || 0) == 0 ? '无限制' : (u.hourly_limit || 0).toLocaleString() + '/小时' ]]</td>
@@ -2483,7 +2548,10 @@ EOF
                     showBatchUserModal: false,
                     batchUserType: 'free',
                     batchUserCount: 10,
-                    batchGenerating: false
+                    batchGenerating: false,
+                    userFilter: 'all',
+                    userStatusFilter: 'all',
+                    selectedUserIds: []
                 }
             },
             computed: {
@@ -2545,6 +2613,27 @@ EOF
                     if(this.bulkStatus === 'paused') return 'bi-pause-circle-fill';
                     if(this.isFinished) return 'bi-check-circle-fill';
                     return 'bi-lightning-charge-fill';
+                },
+                filteredUsers() {
+                    let users = this.smtpUsers;
+                    // Filter by type
+                    if (this.userFilter !== 'all') {
+                        users = users.filter(u => u.user_type === this.userFilter);
+                    }
+                    // Filter by status
+                    if (this.userStatusFilter === 'enabled') {
+                        users = users.filter(u => u.enabled);
+                    } else if (this.userStatusFilter === 'disabled') {
+                        users = users.filter(u => !u.enabled);
+                    } else if (this.userStatusFilter === 'expired') {
+                        const now = new Date();
+                        users = users.filter(u => u.expires_at && new Date(u.expires_at) < now);
+                    }
+                    return users;
+                },
+                isAllFilteredSelected() {
+                    if (this.filteredUsers.length === 0) return false;
+                    return this.filteredUsers.every(u => this.selectedUserIds.includes(u.id));
                 }
             },
             mounted() {
@@ -2640,6 +2729,72 @@ EOF
                         await fetch('/api/smtp-users/' + u.id, { method: 'DELETE' });
                         this.fetchSmtpUsers();
                     } catch(e) { alert('删除失败: ' + e.message); }
+                },
+                userCountByType(type) {
+                    return this.smtpUsers.filter(u => u.user_type === type).length;
+                },
+                toggleUserSelection(userId) {
+                    const idx = this.selectedUserIds.indexOf(userId);
+                    if (idx >= 0) {
+                        this.selectedUserIds.splice(idx, 1);
+                    } else {
+                        this.selectedUserIds.push(userId);
+                    }
+                },
+                toggleSelectAllFiltered() {
+                    if (this.isAllFilteredSelected) {
+                        // Deselect all filtered users
+                        this.filteredUsers.forEach(u => {
+                            const idx = this.selectedUserIds.indexOf(u.id);
+                            if (idx >= 0) this.selectedUserIds.splice(idx, 1);
+                        });
+                    } else {
+                        // Select all filtered users
+                        this.filteredUsers.forEach(u => {
+                            if (!this.selectedUserIds.includes(u.id)) {
+                                this.selectedUserIds.push(u.id);
+                            }
+                        });
+                    }
+                },
+                async batchDeleteUsers() {
+                    if (this.selectedUserIds.length === 0) return;
+                    if (!confirm(`确定删除选中的 ${this.selectedUserIds.length} 个用户？此操作不可撤销！`)) return;
+                    try {
+                        const res = await fetch('/api/smtp-users/batch-action', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ action: 'delete', user_ids: this.selectedUserIds })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            alert(`成功删除 ${data.count} 个用户`);
+                            this.selectedUserIds = [];
+                            this.fetchSmtpUsers();
+                        } else {
+                            alert('操作失败: ' + (data.error || '未知错误'));
+                        }
+                    } catch(e) { alert('批量删除失败: ' + e.message); }
+                },
+                async batchEnableUsers(enabled) {
+                    if (this.selectedUserIds.length === 0) return;
+                    const action = enabled ? '启用' : '禁用';
+                    if (!confirm(`确定${action}选中的 ${this.selectedUserIds.length} 个用户？`)) return;
+                    try {
+                        const res = await fetch('/api/smtp-users/batch-action', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ action: enabled ? 'enable' : 'disable', user_ids: this.selectedUserIds })
+                        });
+                        const data = await res.json();
+                        if (data.success) {
+                            alert(`成功${action} ${data.count} 个用户`);
+                            this.selectedUserIds = [];
+                            this.fetchSmtpUsers();
+                        } else {
+                            alert('操作失败: ' + (data.error || '未知错误'));
+                        }
+                    } catch(e) { alert(`批量${action}失败: ` + e.message); }
                 },
                 async resetUserCount(u) {
                     if (!confirm('确定重置用户 ' + u.username + ' 的每小时发送计数?')) return;
