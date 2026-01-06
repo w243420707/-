@@ -1886,7 +1886,7 @@ EOF
     </style>
 </head>
 <body>
-    <div id="app">
+    <div id="app" v-cloak>
         <!-- Mobile Toggle -->
         <div class="d-md-none p-3 border-bottom d-flex justify-content-between align-items-center sticky-top" style="background: var(--sidebar-bg)">
             <div class="d-flex align-items-center gap-2">
