@@ -1121,7 +1121,45 @@ def api_send_bulk():
 @login_required
 def api_smtp_users_list():
     with get_db() as conn:
-        rows = conn.execute("SELECT id, username, COALESCE(hourly_limit, 0) as hourly_limit, COALESCE(hourly_sent, 0) as hourly_sent, hourly_reset_at, expires_at, enabled, created_at, last_used_at, COALESCE(user_type, 'free') as user_type FROM smtp_users ORDER BY id DESC").fetchall()
+        # Check which columns exist
+        cursor = conn.execute("PRAGMA table_info(smtp_users)")
+        cols = [c[1] for c in cursor.fetchall()]
+        
+        # Build SELECT dynamically based on available columns
+        select_cols = ['id', 'username', 'password', 'enabled', 'created_at']
+        
+        if 'hourly_limit' in cols:
+            select_cols.append("COALESCE(hourly_limit, 0) as hourly_limit")
+        else:
+            select_cols.append("COALESCE(email_limit, 0) as hourly_limit")
+            
+        if 'hourly_sent' in cols:
+            select_cols.append("COALESCE(hourly_sent, 0) as hourly_sent")
+        else:
+            select_cols.append("COALESCE(email_sent, 0) as hourly_sent")
+            
+        if 'hourly_reset_at' in cols:
+            select_cols.append("hourly_reset_at")
+        else:
+            select_cols.append("NULL as hourly_reset_at")
+            
+        if 'expires_at' in cols:
+            select_cols.append("expires_at")
+        else:
+            select_cols.append("NULL as expires_at")
+            
+        if 'last_used_at' in cols:
+            select_cols.append("last_used_at")
+        else:
+            select_cols.append("NULL as last_used_at")
+            
+        if 'user_type' in cols:
+            select_cols.append("COALESCE(user_type, 'free') as user_type")
+        else:
+            select_cols.append("'free' as user_type")
+        
+        query = f"SELECT {', '.join(select_cols)} FROM smtp_users ORDER BY id DESC"
+        rows = conn.execute(query).fetchall()
     return jsonify([dict(r) for r in rows])
 
 @app.route('/api/smtp-users', methods=['POST'])
@@ -1138,10 +1176,20 @@ def api_smtp_users_create():
     
     try:
         with get_db() as conn:
-            conn.execute(
-                "INSERT INTO smtp_users (username, password, hourly_limit, expires_at, enabled) VALUES (?, ?, ?, ?, 1)",
-                (username, password, hourly_limit, expires_at)
-            )
+            # Check which columns exist
+            cursor = conn.execute("PRAGMA table_info(smtp_users)")
+            cols = [c[1] for c in cursor.fetchall()]
+            
+            if 'hourly_limit' in cols:
+                conn.execute(
+                    "INSERT INTO smtp_users (username, password, hourly_limit, expires_at, enabled) VALUES (?, ?, ?, ?, 1)",
+                    (username, password, hourly_limit, expires_at)
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO smtp_users (username, password, email_limit, expires_at, enabled) VALUES (?, ?, ?, ?, 1)",
+                    (username, password, hourly_limit, expires_at)
+                )
         return jsonify({"status": "ok"})
     except sqlite3.IntegrityError:
         return jsonify({"error": "Username already exists"}), 400
@@ -1153,11 +1201,19 @@ def api_smtp_users_update(user_id):
     updates = []
     params = []
     
+    # Check which columns exist
+    with get_db() as conn:
+        cursor = conn.execute("PRAGMA table_info(smtp_users)")
+        cols = [c[1] for c in cursor.fetchall()]
+    
     if 'password' in data and data['password']:
         updates.append("password=?")
         params.append(data['password'])
     if 'hourly_limit' in data:
-        updates.append("hourly_limit=?")
+        if 'hourly_limit' in cols:
+            updates.append("hourly_limit=?")
+        else:
+            updates.append("email_limit=?")
         params.append(int(data['hourly_limit']))
     if 'expires_at' in data:
         updates.append("expires_at=?")
@@ -1166,8 +1222,11 @@ def api_smtp_users_update(user_id):
         updates.append("enabled=?")
         params.append(1 if data['enabled'] else 0)
     if 'reset_hourly_count' in data and data['reset_hourly_count']:
-        updates.append("hourly_sent=0")
-        updates.append("hourly_reset_at=datetime('now', '+08:00')")
+        if 'hourly_sent' in cols:
+            updates.append("hourly_sent=0")
+            updates.append("hourly_reset_at=datetime('now', '+08:00')")
+        else:
+            updates.append("email_sent=0")
     
     if not updates:
         return jsonify({"error": "No fields to update"}), 400
@@ -1212,16 +1271,26 @@ def api_smtp_users_batch():
     
     generated_users = []
     with get_db() as conn:
+        # Check which columns exist
+        cursor = conn.execute("PRAGMA table_info(smtp_users)")
+        cols = [c[1] for c in cursor.fetchall()]
+        
         for i in range(count):
             # Generate random username and password
             username = 'u_' + ''.join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(8))
             password = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(12))
             
             try:
-                conn.execute(
-                    "INSERT INTO smtp_users (username, password, hourly_limit, expires_at, enabled, user_type) VALUES (?, ?, ?, ?, 1, ?)",
-                    (username, password, hourly_limit, expires_at, user_type)
-                )
+                if 'hourly_limit' in cols:
+                    conn.execute(
+                        "INSERT INTO smtp_users (username, password, hourly_limit, expires_at, enabled, user_type) VALUES (?, ?, ?, ?, 1, ?)",
+                        (username, password, hourly_limit, expires_at, user_type)
+                    )
+                else:
+                    conn.execute(
+                        "INSERT INTO smtp_users (username, password, email_limit, expires_at, enabled) VALUES (?, ?, ?, ?, 1)",
+                        (username, password, hourly_limit, expires_at)
+                    )
                 generated_users.append({
                     'username': username,
                     'password': password,
