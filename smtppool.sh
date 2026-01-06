@@ -2363,6 +2363,12 @@ EOF
                     pool.splice(newIndex, 0, item);
                 },
                 onDragStart(e, i) {
+                    // Prevent drag when clicking on input, textarea, select, or button elements
+                    const tagName = e.target.tagName.toLowerCase();
+                    if (['input', 'textarea', 'select', 'button'].includes(tagName) || e.target.isContentEditable) {
+                        e.preventDefault();
+                        return;
+                    }
                     this.draggingIndex = i;
                     e.dataTransfer.effectAllowed = 'move';
                     e.dataTransfer.setData('text/plain', i);
