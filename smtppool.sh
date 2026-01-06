@@ -131,6 +131,8 @@ def init_db():
                 conn.execute("ALTER TABLE queue ADD COLUMN subject TEXT")
             if 'smtp_user' not in cols:
                 conn.execute("ALTER TABLE queue ADD COLUMN smtp_user TEXT")
+            if 'scheduled_at' not in cols:
+                conn.execute("ALTER TABLE queue ADD COLUMN scheduled_at TIMESTAMP")
         except Exception as e:
             print(f"DB Init Warning: {e}")
 
@@ -138,6 +140,7 @@ def init_db():
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON queue (status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_scheduled ON queue (scheduled_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_node_status ON queue (assigned_node, status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON queue (created_at)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_source ON queue (source)")
@@ -182,15 +185,58 @@ def init_db():
                 conn.execute("ALTER TABLE smtp_users ADD COLUMN hourly_reset_at TIMESTAMP")
         except: pass
 
-# --- Config & Logging ---
-def load_config():
+# --- Config Cache (TTL-based) ---
+_config_cache = {'data': None, 'time': 0, 'ttl': 3}  # 3 seconds TTL
+
+def load_config(use_cache=True):
+    """Load config with optional caching (default 3s TTL)"""
+    global _config_cache
+    now = time.time()
+    if use_cache and _config_cache['data'] is not None and (now - _config_cache['time']) < _config_cache['ttl']:
+        return _config_cache['data']
     if not os.path.exists(CONFIG_FILE): return {}
     try:
-        with open(CONFIG_FILE, 'r') as f: return json.load(f)
+        with open(CONFIG_FILE, 'r') as f:
+            data = json.load(f)
+            _config_cache['data'] = data
+            _config_cache['time'] = now
+            return data
     except: return {}
 
 def save_config(data):
+    global _config_cache
     with open(CONFIG_FILE, 'w') as f: json.dump(data, f, indent=4)
+    _config_cache['data'] = data  # Update cache immediately
+    _config_cache['time'] = time.time()
+
+def invalidate_config_cache():
+    """Force reload config on next access"""
+    global _config_cache
+    _config_cache['data'] = None
+    _config_cache['time'] = 0
+
+# --- Chat Corpus (Module-level constant for memory efficiency) ---
+CHAT_CORPUS = [
+    "晚安，愿你梦想成真。", "嘿，祝你每一天都精彩。", "想去打羽毛球，期待已久了。",
+    "下午好，愿你梦想成真。", "打算去公园散步，有点累但很开心。", "下午好，祝你工作顺利。",
+    "你好，祝你万事如意。", "嘿，愿你快乐。", "后天打算去露营，觉得很充实。",
+    "打算去逛街，觉得生活很美好。", "这时候要去学做饭，觉得很充实。", "约了朋友吃饭，觉得很充实。",
+    "下午好，祝你每一天都精彩。", "要去骑行，感觉很放松。", "打算去练瑜伽，觉得很充实。",
+    "今天准备去图书馆，希望能有好天气。", "想去看电影，有点累但很开心。", "晚上好，祝你心想事成。",
+    "要去博物馆，觉得很充实。", "要去骑行，有点累但很开心。", "最近要去健身房锻炼，期待已久了。",
+    "下周准备在家大扫除，希望能一切顺利。", "哈喽，祝你心想事成。", "晚安，祝你工作顺利。",
+    "嘿，愿你身体健康。", "明天想去看电影，希望能一切顺利。", "准备去图书馆，感觉很放松。",
+    "这时候想去听音乐会，心情特别好。", "哈喽，祝你万事如意。", "中午好，祝你开心。",
+    "后天准备在家大扫除，期待已久了。", "准备去图书馆，希望能一切顺利。", "晚安，祝你万事如意。",
+    "打算去看画展，有点累但很开心。", "这时候想去钓鱼，感觉充满了能量。", "明天想去看电影，心情特别好。",
+    "早安，愿你有个好梦。", "周末打算去露营，感觉很放松。", "最近想去看电影，感觉很放松。",
+    "准备去野餐，感觉充满了能量。", "今天打算去露营，希望能遇到有趣的人。", "后天约了朋友吃饭，觉得生活很美好。",
+    "要去骑行，希望能一切顺利。", "要去骑行，心情特别好。", "最近想去打羽毛球，心情特别好。",
+    "假期打算去逛街，觉得很充实。", "准备在家大扫除，希望能遇到有趣的人。", "周末准备去图书馆，希望能一切顺利。",
+    "下周想去钓鱼，感觉很放松。", "周末准备去野餐，感觉很放松。", "假期要去健身房锻炼，感觉充满了能量。",
+]
+
+# --- Config & Logging ---
 
 def setup_logging():
     cfg = load_config()
@@ -412,6 +458,20 @@ def worker_thread():
                 except Exception as e:
                     logger.error(f"Cleanup failed: {e}")
                 last_cleanup_time = now
+
+            # --- Activate Scheduled Emails (every loop) ---
+            # Change status from 'scheduled' to 'pending' when scheduled_at time has passed
+            try:
+                current_time = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
+                with get_db() as conn:
+                    activated = conn.execute(
+                        "UPDATE queue SET status='pending' WHERE status='scheduled' AND scheduled_at <= ?",
+                        (current_time,)
+                    ).rowcount
+                    if activated > 0:
+                        logger.info(f"⏰ Activated {activated} scheduled emails")
+            except Exception as e:
+                logger.error(f"Schedule activation failed: {e}")
 
             pool_cfg = {n['name']: n for n in cfg.get('downstream_pool', [])}
             
@@ -861,7 +921,7 @@ def select_node_for_recipient(pool, recipient, global_limit, source='relay'):
     
     return select_weighted_node(candidates, global_limit)
 
-def bulk_import_task(raw_recipients, subjects, bodies, pool):
+def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
     try:
         # Process recipients in background to avoid blocking
         recipients = [r.strip() for r in raw_recipients.split('\n') if r.strip()]
@@ -872,8 +932,19 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool):
         tracking_base = cfg.get('web_config', {}).get('public_domain', '').rstrip('/')
 
         charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-        # Chat corpus for anti-spam
-        chat_corpus = [
+        # Use module-level CHAT_CORPUS for memory efficiency
+        chat_corpus = CHAT_CORPUS
+        
+        # Calculate scheduled time (default: now)
+        schedule_time = None
+        if scheduled_at:
+            try:
+                schedule_time = datetime.strptime(scheduled_at, '%Y-%m-%dT%H:%M')
+            except:
+                schedule_time = None
+        
+        # Placeholder to remove old chat_corpus definition
+        _removed_chat_corpus = [
             "晚安，愿你梦想成真。", "嘿，祝你每一天都精彩。", "想去打羽毛球，期待已久了。",
             "下午好，愿你梦想成真。", "打算去公园散步，有点累但很开心。", "下午好，祝你工作顺利。",
             "你好，祝你万事如意。", "嘿，愿你快乐。", "后天打算去露营，觉得很充实。",
@@ -998,50 +1069,7 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool):
             "周末打算去露营，感觉很放松。", "最近想去看电影，感觉很放松。", "早上好，祝你工作顺利。",
             "这时候准备去图书馆，有点累但很开心。", "明天准备去跑步，希望能有好天气。", "周末想去打羽毛球，希望能有好天气。",
             "今天想去打羽毛球，觉得生活很美好。", "周末准备去跑步，希望能遇到有趣的人。", "最近要去健身房锻炼，感觉很放松。",
-            "今天要去健身房锻炼，感觉很放松。", "后天想去听音乐会，感觉很放松。", "这时候打算去看画展，有点累但很开心。",
-            "下周想去听音乐会，感觉很放松。", "要去超市买菜，希望能有好天气。", "想去听音乐会，觉得很充实。",
-            "要去健身房锻炼，感觉充满了能量。", "准备去游泳，感觉很放松。", "嘿，祝你万事如意。",
-            "假期打算去看画展，期待已久了。", "下周准备去游泳，希望能一切顺利。", "要去超市买菜，心情特别好。",
-            "准备去野餐，感觉充满了能量。", "今天打算去露营，希望能遇到有趣的人。", "后天约了朋友吃饭，觉得生活很美好。",
-            "要去骑行，希望能一切顺利。", "要去骑行，心情特别好。", "最近想去打羽毛球，心情特别好。",
-            "假期打算去逛街，觉得很充实。", "准备在家大扫除，希望能遇到有趣的人。", "周末准备去图书馆，希望能一切顺利。",
-            "下周想去钓鱼，感觉很放松。", "周末准备去野餐，感觉很放松。", "假期要去健身房锻炼，感觉充满了能量。",
-            "下周要去超市买菜，心情特别好。", "明天想去打羽毛球，心情特别好。", "最近打算去逛街，感觉充满了能量。",
-            "中午好，祝你万事如意。", "周末打算去看画展，希望能一切顺利。", "假期打算去爬山，心情特别好。",
-            "明天打算去爬山，有点累但很开心。", "打算去看画展，感觉很放松。", "打算去爬山，希望能一切顺利。",
-            "后天要去健身房锻炼，觉得很充实。", "打算去爬山，觉得很充实。", "今天打算去练瑜伽，心情特别好。",
-            "下周打算去露营，感觉很放松。", "假期准备去游泳，有点累但很开心。", "下午好，祝你万事如意。",
-            "约了朋友吃饭，有点累但很开心。", "假期要去咖啡店坐坐，觉得生活很美好。", "下周打算去练瑜伽，觉得生活很美好。",
-            "嘿，希望你天天好心情。", "今天要去超市买菜，有点累但很开心。", "周末要去超市买菜，觉得生活很美好。",
-            "准备去野餐，心情特别好。", "中午好，愿你梦想成真。", "周末准备在家大扫除，觉得生活很美好。",
-            "这时候想去看电影，希望能遇到有趣的人。", "约了朋友吃饭，希望能一切顺利。", "明天想去滑雪，心情特别好。",
-            "明天想去打羽毛球，有点累但很开心。", "假期要去健身房锻炼，希望能有好天气。", "后天准备去野餐，希望能一切顺利。",
-            "打算去逛街，心情特别好。", "明天打算去露营，心情特别好。", "周末打算去逛街，希望能一切顺利。",
-            "今天想去钓鱼，感觉充满了能量。", "想去海边走走，希望能有好天气。", "准备去跑步，觉得很充实。",
-            "打算去公园散步，觉得生活很美好。", "下周要去咖啡店坐坐，有点累但很开心。", "晚上好，祝你工作顺利。",
-            "下周要去健身房锻炼，希望能遇到有趣的人。", "打算去逛街，觉得很充实。", "后天约了朋友吃饭，心情特别好。",
-            "这时候想去滑雪，期待已久了。", "假期想去滑雪，感觉充满了能量。", "要去博物馆，希望能一切顺利。",
-            "这时候准备去野餐，感觉很放松。", "这时候想去滑雪，感觉充满了能量。", "最近要去健身房锻炼，觉得很充实。",
-            "今天想去听音乐会，觉得很充实。", "最近想去看电影，希望能一切顺利。", "明天想去滑雪，希望能有好天气。",
-            "下周要去超市买菜，希望能有好天气。", "打算去公园散步，心情特别好。", "打算去逛街，希望能遇到有趣的人。",
-            "哈喽，愿你快乐。", "想去看电影，觉得很充实。", "明天要去博物馆，心情特别好。",
-            "这时候打算去公园散步，希望能遇到有趣的人。", "今天准备在家看书，心情特别好。", "假期准备在家大扫除，期待已久了。",
-            "后天打算去公园散步，感觉很放松。", "下周打算去露营，感觉充满了能量。", "晚安，祝你每一天都精彩。",
-            "要去健身房锻炼，期待已久了。", "明天准备去图书馆，感觉充满了能量。", "准备在家大扫除，希望能有好天气。",
-            "准备去跑步，感觉充满了能量。", "假期准备在家大扫除，感觉很放松。", "假期想去看电影，有点累但很开心。",
-            "这时候打算去看画展，心情特别好。", "下周想去海边走走，心情特别好。", "周末打算去爬山，心情特别好。",
-            "早上好，祝你心想事成。", "下周想去看电影，觉得很充实。", "最近打算去看画展，觉得很充实。",
-            "周末要去学做饭，希望能遇到有趣的人。", "后天准备去跑步，感觉很放松。", "后天准备去野餐，觉得生活很美好。",
-            "想去钓鱼，有点累但很开心。", "周末想去钓鱼，希望能遇到有趣的人。", "最近准备去跑步，觉得生活很美好。",
-            "晚上好，愿你梦想成真。", "后天要去博物馆，感觉很放松。", "周末打算去练瑜伽，希望能遇到有趣的人。",
-            "明天打算去爬山，希望能有好天气。", "后天想去打羽毛球，期待已久了。", "这时候打算去练瑜伽，觉得生活很美好。",
-            "这时候想去听音乐会，期待已久了。", "打算去练瑜伽，希望能有好天气。", "要去博物馆，期待已久了。",
-            "想去滑雪，感觉很放松。", "假期想去打羽毛球，觉得很充实。", "想去看电影，希望能有好天气。",
-            "晚上好，祝你每一天都精彩。", "后天打算去露营，希望能有好天气。", "假期想去滑雪，希望能遇到有趣的人。",
-            "下周打算去露营，期待已久了。", "要去骑行，期待已久了。", "要去健身房锻炼，觉得生活很美好。",
-            "假期打算去看画展，心情特别好。", "周末约了朋友吃饭，有点累但很开心。", "今天打算去练瑜伽，有点累但很开心。",
-            "要去博物馆，希望能有好天气。", "最近打算去逛街，感觉很放松。",
-        ]
+]  # Empty placeholder, using CHAT_CORPUS module constant
         
         tasks = []
         count = 0
@@ -1157,13 +1185,18 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool):
                     continue
                 node_name = node.get('name', 'Unknown')
                 
-                tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, 'pending', 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8)))
+                # Determine status based on scheduling
+                initial_status = 'scheduled' if schedule_time and schedule_time > datetime.now() else 'pending'
+                scheduled_at_str = schedule_time.strftime('%Y-%m-%d %H:%M:%S') if schedule_time else None
+                
+                tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str))
                 count += 1
                 
+                # Batch insert every 500 records for better performance
                 if len(tasks) >= 500:
                     with get_db() as conn:
                         conn.executemany(
-                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             tasks
                         )
                     tasks = []
@@ -1171,10 +1204,11 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool):
                 logger.error(f"Error preparing email for {rcpt}: {e}")
                 continue
 
+        # Insert remaining tasks
         if tasks:
             with get_db() as conn:
                 conn.executemany(
-                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     tasks
                 )
         logger.info(f"Bulk import finished: {count} emails processed")
@@ -1213,9 +1247,14 @@ def api_send_bulk():
         pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
         if not pool: return jsonify({"error": "No enabled nodes available"}), 500
 
+        # Get scheduled_at if provided
+        scheduled_at = data.get('scheduled_at', '')
+
         # Start background task with raw string
-        threading.Thread(target=bulk_import_task, args=(raw_recipients, subjects, bodies, pool)).start()
-                
+        threading.Thread(target=bulk_import_task, args=(raw_recipients, subjects, bodies, pool, scheduled_at)).start()
+        
+        if scheduled_at:
+            return jsonify({"status": "ok", "count": "Processing in background", "scheduled": scheduled_at})
         return jsonify({"status": "ok", "count": "Processing in background"})
     except Exception as e:
         logger.error(f"Bulk send error: {e}")
@@ -2034,6 +2073,9 @@ EOF
                                 <button class="btn" :class="queueFilter===''?'btn-primary':'btn-outline-secondary'" @click="queueFilter=''">全部</button>
                                 <button class="btn" :class="queueFilter==='sent'?'btn-success':'btn-outline-secondary'" @click="queueFilter='sent'">已发送</button>
                                 <button class="btn" :class="queueFilter==='pending'?'btn-warning':'btn-outline-secondary'" @click="queueFilter='pending'">待发送</button>
+                                <button class="btn" :class="queueFilter==='scheduled'?'btn-info':'btn-outline-secondary'" @click="queueFilter='scheduled'">
+                                    <i class="bi bi-clock"></i> 定时
+                                </button>
                                 <button class="btn" :class="queueFilter==='failed'?'btn-danger':'btn-outline-secondary'" @click="queueFilter='failed'">失败</button>
                             </div>
                             <span class="text-muted small fw-normal" v-if="totalMails > 100">(最新 100 条 / 共 [[ totalMails ]] 条)</span>
@@ -2193,10 +2235,29 @@ EOF
                                     <input type="text" v-model="removeDomain" class="form-control" placeholder="输入要清除的域名 (如 qq.com)..." @keyup.enter="removeDomainFromContacts">
                                     <button class="btn btn-outline-danger" @click="removeDomainFromContacts" :disabled="!removeDomain"><i class="bi bi-trash"></i> 按域名清除</button>
                                 </div>
+                                
+                                <!-- 定时发送 -->
+                                <div class="mb-3">
+                                    <div class="form-check form-switch mb-2">
+                                        <input class="form-check-input" type="checkbox" v-model="bulk.enableSchedule" id="enableSchedule">
+                                        <label class="form-check-label" for="enableSchedule">
+                                            <i class="bi bi-clock me-1"></i>定时发送
+                                        </label>
+                                    </div>
+                                    <div v-if="bulk.enableSchedule" class="input-group input-group-sm">
+                                        <span class="input-group-text"><i class="bi bi-calendar-event"></i></span>
+                                        <input type="datetime-local" v-model="bulk.scheduledAt" class="form-control">
+                                        <span class="input-group-text text-muted small" v-if="bulk.scheduledAt">
+                                            [[ formatScheduleTime(bulk.scheduledAt) ]]
+                                        </span>
+                                    </div>
+                                    <div v-if="bulk.enableSchedule" class="form-text">设置后邮件将在指定时间开始发送</div>
+                                </div>
+                                
                                 <button class="btn btn-primary w-100 py-3 fw-bold" @click="sendBulk" :disabled="sending || recipientCount === 0">
                                     <span v-if="sending" class="spinner-border spinner-border-sm me-2"></span>
-                                    <i v-else class="bi bi-send-fill me-2"></i>
-                                    [[ sending ? '正在提交...' : '确认发送' ]]
+                                    <i v-else class="bi" :class="bulk.enableSchedule && bulk.scheduledAt ? 'bi-clock-fill' : 'bi-send-fill'" class="me-2"></i>
+                                    [[ sending ? '正在提交...' : (bulk.enableSchedule && bulk.scheduledAt ? '定时发送' : '确认发送') ]]
                                 </button>
                             </div>
                         </div>
@@ -2892,7 +2953,7 @@ EOF
                     qStats: { total: {}, nodes: {} },
                     qList: [],
                     queueFilter: '',
-                    bulk: { sender: '', subject: '', recipients: '', body: '', bodyList: [''] },
+                    bulk: { sender: '', subject: '', recipients: '', body: '', bodyList: [''], enableSchedule: false, scheduledAt: '' },
                     sending: false,
                     contactCount: 0,
                     bulkStatus: 'running',
@@ -2964,7 +3025,7 @@ EOF
                 },
                 totalMails() {
                     const t = this.qStats.total;
-                    return (t.pending||0) + (t.processing||0) + (t.sent||0) + (t.failed||0);
+                    return (t.pending||0) + (t.processing||0) + (t.sent||0) + (t.failed||0) + (t.scheduled||0);
                 },
                 progressPercent() {
                     if(this.totalMails === 0) return 0;
@@ -2972,7 +3033,7 @@ EOF
                 },
                 isFinished() {
                     const t = this.qStats.total;
-                    return this.totalMails > 0 && (t.pending||0) === 0 && (t.processing||0) === 0;
+                    return this.totalMails > 0 && (t.pending||0) === 0 && (t.processing||0) === 0 && (t.scheduled||0) === 0;
                 },
                 statusText() {
                     if(this.bulkStatus === 'paused') return '已暂停';
@@ -3325,9 +3386,25 @@ EOF
                         'pending': 'bg-warning-subtle text-warning',
                         'processing': 'bg-info-subtle text-info',
                         'sent': 'bg-success-subtle text-success',
-                        'failed': 'bg-danger-subtle text-danger'
+                        'failed': 'bg-danger-subtle text-danger',
+                        'scheduled': 'bg-primary-subtle text-primary'
                     };
                     return map[status] || 'bg-secondary-subtle text-secondary';
+                },
+                formatScheduleTime(dateStr) {
+                    if (!dateStr) return '';
+                    const d = new Date(dateStr);
+                    const now = new Date();
+                    const diff = d - now;
+                    if (diff < 0) return '已过期';
+                    const hours = Math.floor(diff / 3600000);
+                    const mins = Math.floor((diff % 3600000) / 60000);
+                    if (hours > 24) {
+                        const days = Math.floor(hours / 24);
+                        return `${days}天${hours % 24}小时后`;
+                    }
+                    if (hours > 0) return `${hours}小时${mins}分钟后`;
+                    return `${mins}分钟后`;
                 },
                 formatDomainLabel(domain) {
                     const map = {
@@ -3799,12 +3876,26 @@ EOF
                     // We will send 'bodies' array
                     const validBodies = this.bulk.bodyList.filter(b => b.trim());
                     if(!this.bulk.subject || validBodies.length === 0) return alert('请填写完整信息 (至少一个正文)');
-                    if(!confirm(`确认发送给 ${this.recipientCount} 人?`)) return;
+                    
+                    // Validate schedule time if enabled
+                    if (this.bulk.enableSchedule && this.bulk.scheduledAt) {
+                        const scheduleDate = new Date(this.bulk.scheduledAt);
+                        if (scheduleDate <= new Date()) {
+                            return alert('定时发送时间必须是未来时间');
+                        }
+                    }
+                    
+                    const confirmMsg = this.bulk.enableSchedule && this.bulk.scheduledAt 
+                        ? `确认定时发送给 ${this.recipientCount} 人?\n发送时间: ${this.bulk.scheduledAt.replace('T', ' ')}`
+                        : `确认发送给 ${this.recipientCount} 人?`;
+                    if(!confirm(confirmMsg)) return;
+                    
                     this.sending = true;
                     try {
                         const payload = {
                             ...this.bulk,
-                            bodies: validBodies
+                            bodies: validBodies,
+                            scheduled_at: this.bulk.enableSchedule ? this.bulk.scheduledAt : ''
                         };
                         const res = await fetch('/api/send/bulk', {
                             method: 'POST',
@@ -3813,8 +3904,13 @@ EOF
                         });
                         const data = await res.json();
                         if(res.ok) {
-                            alert(`已加入队列: ${data.count} 封`);
-                            this.bulk.recipients = ''; 
+                            const msg = data.scheduled 
+                                ? `已加入定时队列: ${data.count} 封\n发送时间: ${data.scheduled.replace('T', ' ')}`
+                                : `已加入队列: ${data.count} 封`;
+                            alert(msg);
+                            this.bulk.recipients = '';
+                            this.bulk.enableSchedule = false;
+                            this.bulk.scheduledAt = '';
                             this.tab = 'queue';
                             this.fetchQueue();
                         } else {
