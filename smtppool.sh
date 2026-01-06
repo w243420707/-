@@ -74,6 +74,7 @@ import base64
 import uuid
 from datetime import datetime, timedelta
 from email import message_from_bytes
+from email.header import decode_header
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid
 from logging.handlers import RotatingFileHandler
@@ -285,6 +286,11 @@ class RelayHandler:
         # Filter enabled nodes (default True)
         pool = [n for n in all_pool if n.get('enabled', True)]
         
+        # Debug logging
+        all_node_names = [n.get('name', '?') for n in all_pool]
+        enabled_node_names = [n.get('name', '?') for n in pool]
+        logger.info(f"📋 Config nodes: {all_node_names}, Enabled: {enabled_node_names}")
+        
         if not pool:
             logger.warning("❌ No enabled downstream nodes available")
             return '451 Temporary failure: No nodes'
@@ -314,7 +320,17 @@ class RelayHandler:
         smtp_user = getattr(session, 'smtp_user', None)
         try:
             msg = message_from_bytes(envelope.content)
-            subject = msg.get('Subject', '')[:100]  # Limit to 100 chars
+            raw_subject = msg.get('Subject', '')
+            # Decode MIME encoded subject
+            if raw_subject:
+                decoded_parts = decode_header(raw_subject)
+                subject_parts = []
+                for part, encoding in decoded_parts:
+                    if isinstance(part, bytes):
+                        subject_parts.append(part.decode(encoding or 'utf-8', errors='replace'))
+                    else:
+                        subject_parts.append(part)
+                subject = ''.join(subject_parts)[:100]  # Limit to 100 chars
         except:
             pass
         
@@ -517,6 +533,23 @@ def worker_thread():
                 # Mark processing
                 with get_db() as conn:
                     conn.execute("UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id=?", (row_id,))
+
+                # Double check node still exists (in case config changed during batch processing)
+                fresh_cfg = load_config()
+                fresh_pool = {n['name']: n for n in fresh_cfg.get('downstream_pool', [])}
+                node = fresh_pool.get(node_name)
+                if not node or not node.get('enabled', True):
+                    # Node was deleted/disabled, re-route
+                    active_nodes = [n for n in fresh_cfg.get('downstream_pool', []) if n.get('enabled', True)]
+                    new_node = select_node_for_recipient(active_nodes, rcpt_tos[0] if rcpt_tos else '', fresh_cfg.get('limit_config', {}), source=source) if active_nodes else None
+                    if new_node:
+                        logger.info(f"🔄 Last-minute re-route ID:{row_id} from deleted/disabled '{node_name}' to '{new_node['name']}'")
+                        with get_db() as conn:
+                            conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
+                    else:
+                        with get_db() as conn:
+                            conn.execute("UPDATE queue SET status='failed', last_error='Node deleted and no alternatives' WHERE id=?", (row_id,))
+                    continue
 
                 error_msg = ""
                 success = False
@@ -1941,7 +1974,12 @@ EOF
                                         <div class="fw-bold text-theme-main">[[ m.mail_from ]]</div>
                                         <div class="text-muted small text-truncate" style="max-width: 200px;">[[ m.rcpt_tos ]]</div>
                                     </td>
-                                    <td><span class="badge bg-theme-light text-theme-main border border-theme">[[ m.assigned_node ]]</span></td>
+                                    <td>
+                                        <span class="badge" :class="nodeExists(m.assigned_node) ? 'bg-theme-light text-theme-main border border-theme' : 'bg-danger-subtle text-danger border border-danger'" :title="nodeExists(m.assigned_node) ? '' : '节点已删除'">
+                                            [[ m.assigned_node ]]
+                                            <i v-if="!nodeExists(m.assigned_node)" class="bi bi-exclamation-triangle-fill ms-1"></i>
+                                        </span>
+                                    </td>
                                     <td>
                                         <span class="badge" :class="statusBadgeClass(m.status)">[[ m.status ]]</span>
                                         <div v-if="m.last_error" class="text-danger small mt-1" style="font-size: 0.7rem;">[[ m.last_error ]]</div>
@@ -2625,6 +2663,12 @@ EOF
                 statusClass() {
                     if(this.bulkStatus === 'paused') return 'bg-warning-subtle text-warning';
                     if(this.isFinished) return 'bg-success-subtle text-success';
+                },
+                // Check if a node exists in current config
+                nodeExists() {
+                    const nodeNames = new Set(this.config.downstream_pool.map(n => n.name));
+                    return name => nodeNames.has(name);
+                }
                     return 'bg-primary-subtle text-primary';
                 },
                 statusIcon() {
