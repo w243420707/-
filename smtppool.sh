@@ -1373,6 +1373,43 @@ def api_contacts_remove_domains():
                 total_deleted += result.rowcount
     return jsonify({"status": "ok", "deleted": total_deleted, "domains": domains})
 
+@app.route('/api/contacts/remove_small_domains', methods=['POST'])
+@login_required
+def api_contacts_remove_small_domains():
+    """Remove all emails from domains with count less than threshold"""
+    threshold = request.json.get('threshold', 10)
+    try:
+        threshold = int(threshold)
+    except:
+        return jsonify({"error": "Invalid threshold"}), 400
+    
+    # First get domain counts
+    with get_db() as conn:
+        rows = conn.execute("SELECT email FROM contacts").fetchall()
+    
+    domain_count = {}
+    for row in rows:
+        email = row['email']
+        if '@' in email:
+            domain = email.split('@')[-1].lower().strip()
+            if domain:
+                domain_count[domain] = domain_count.get(domain, 0) + 1
+    
+    # Find domains below threshold
+    small_domains = [d for d, c in domain_count.items() if c < threshold]
+    
+    if not small_domains:
+        return jsonify({"status": "ok", "deleted": 0, "domains": [], "threshold": threshold})
+    
+    # Delete emails from small domains
+    total_deleted = 0
+    with get_db() as conn:
+        for domain in small_domains:
+            result = conn.execute("DELETE FROM contacts WHERE LOWER(email) LIKE ?", ('%@' + domain,))
+            total_deleted += result.rowcount
+    
+    return jsonify({"status": "ok", "deleted": total_deleted, "domains": small_domains, "threshold": threshold})
+
 @app.route('/api/draft', methods=['GET', 'POST'])
 @login_required
 def api_draft():
@@ -1979,7 +2016,14 @@ EOF
                                 <div v-if="contactDomainStats.length > 0" class="mb-2">
                                     <div class="d-flex justify-content-between align-items-center mb-1">
                                         <small class="text-muted">通讯录域名统计:</small>
-                                        <div class="d-flex gap-1">
+                                        <div class="d-flex gap-1 align-items-center">
+                                            <div class="input-group input-group-sm" style="width: auto;">
+                                                <span class="input-group-text py-0 px-1" style="font-size: 0.75rem;">&lt;</span>
+                                                <input type="number" v-model.number="smallDomainThreshold" class="form-control py-0 px-1" style="width: 50px; font-size: 0.75rem;" min="1" placeholder="N">
+                                                <button class="btn btn-outline-danger btn-sm py-0 px-1" @click="removeSmallDomains" :title="'删除数量小于 ' + smallDomainThreshold + ' 的域名'" style="font-size: 0.75rem;">
+                                                    <i class="bi bi-trash"></i>
+                                                </button>
+                                            </div>
                                             <button v-if="domainSelectMode && selectedDomains.length > 0" class="btn btn-danger btn-sm py-0 px-2" @click="removeSelectedDomains" :title="'删除已选的 ' + selectedDomains.length + ' 个域名'">
                                                 <i class="bi bi-trash"></i> 删除([[ selectedDomains.length ]])
                                             </button>
@@ -2514,6 +2558,7 @@ EOF
                     contactDomainStats: [],
                     domainSelectMode: false,
                     selectedDomains: [],
+                    smallDomainThreshold: 10,
                     smtpUsers: [],
                     showUserModal: false,
                     editingUser: null,
@@ -3071,6 +3116,38 @@ EOF
                             }
                             this.selectedDomains = [];
                             this.domainSelectMode = false;
+                            this.fetchContactCount();
+                            this.fetchContactDomainStats();
+                        } else {
+                            alert('未删除任何邮箱');
+                        }
+                    } catch(e) { alert('失败: ' + e); }
+                },
+                async removeSmallDomains() {
+                    const threshold = this.smallDomainThreshold || 10;
+                    const smallDomains = this.contactDomainStats.filter(ds => ds.count < threshold);
+                    if (smallDomains.length === 0) {
+                        alert(`没有数量小于 ${threshold} 的域名`);
+                        return;
+                    }
+                    const totalEmails = smallDomains.reduce((sum, ds) => sum + ds.count, 0);
+                    if (!confirm(`确定删除数量小于 ${threshold} 的 ${smallDomains.length} 个域名（共 ${totalEmails} 个邮箱）吗？`)) return;
+                    try {
+                        const res = await fetch('/api/contacts/remove_small_domains', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ threshold: threshold })
+                        });
+                        const data = await res.json();
+                        if (data.deleted > 0) {
+                            // Also remove from current input if present
+                            if (this.bulk.recipients && data.domains) {
+                                let emails = this.bulk.recipients.split('\n').filter(r => r.trim());
+                                data.domains.forEach(domain => {
+                                    emails = emails.filter(e => !e.trim().toLowerCase().endsWith('@' + domain.toLowerCase()));
+                                });
+                                this.bulk.recipients = emails.join('\n');
+                            }
                             this.fetchContactCount();
                             this.fetchContactDomainStats();
                         } else {
