@@ -1770,8 +1770,8 @@ EOF
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <style>
-        /* Hide Vue templates until compiled */
-        [v-cloak] { display: none !important; }
+        /* Hide app until Vue is mounted (Vue 3 adds data-v-app when ready) */
+        #app:not([data-v-app]) { display: none !important; }
         
         :root { --sidebar-width: 240px; --primary-color: #4361ee; }
         
