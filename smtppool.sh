@@ -1355,6 +1355,24 @@ def api_contacts_remove_domain():
         deleted = result.rowcount
     return jsonify({"status": "ok", "deleted": deleted, "domain": domain})
 
+@app.route('/api/contacts/remove_domains', methods=['POST'])
+@login_required
+def api_contacts_remove_domains():
+    """Remove all emails with multiple domains from contacts"""
+    domains = request.json.get('domains', [])
+    if not domains:
+        return jsonify({"error": "No domains provided"}), 400
+    total_deleted = 0
+    with get_db() as conn:
+        for domain in domains:
+            domain = domain.strip().lower()
+            if domain.startswith('@'):
+                domain = domain[1:]
+            if domain:
+                result = conn.execute("DELETE FROM contacts WHERE LOWER(email) LIKE ?", ('%@' + domain,))
+                total_deleted += result.rowcount
+    return jsonify({"status": "ok", "deleted": total_deleted, "domains": domains})
+
 @app.route('/api/draft', methods=['GET', 'POST'])
 @login_required
 def api_draft():
@@ -1961,13 +1979,28 @@ EOF
                                 <div v-if="contactDomainStats.length > 0" class="mb-2">
                                     <div class="d-flex justify-content-between align-items-center mb-1">
                                         <small class="text-muted">通讯录域名统计:</small>
-                                        <button class="btn btn-link btn-sm p-0 text-muted" @click="fetchContactDomainStats" title="刷新统计">
-                                            <i class="bi bi-arrow-clockwise"></i>
-                                        </button>
+                                        <div class="d-flex gap-1">
+                                            <button v-if="domainSelectMode && selectedDomains.length > 0" class="btn btn-danger btn-sm py-0 px-2" @click="removeSelectedDomains" :title="'删除已选的 ' + selectedDomains.length + ' 个域名'">
+                                                <i class="bi bi-trash"></i> 删除([[ selectedDomains.length ]])
+                                            </button>
+                                            <button v-if="domainSelectMode" class="btn btn-secondary btn-sm py-0 px-2" @click="selectAllDomains" title="全选/取消">
+                                                <i class="bi" :class="selectedDomains.length === contactDomainStats.length ? 'bi-check-square' : 'bi-square'"></i>
+                                            </button>
+                                            <button class="btn btn-sm py-0 px-2" :class="domainSelectMode ? 'btn-primary' : 'btn-outline-secondary'" @click="toggleDomainSelectMode" :title="domainSelectMode ? '退出选择' : '批量选择'">
+                                                <i class="bi" :class="domainSelectMode ? 'bi-x-lg' : 'bi-check2-square'"></i>
+                                            </button>
+                                            <button class="btn btn-link btn-sm p-0 text-muted" @click="fetchContactDomainStats" title="刷新统计">
+                                                <i class="bi bi-arrow-clockwise"></i>
+                                            </button>
+                                        </div>
                                     </div>
                                     <div class="d-flex flex-wrap gap-1" style="max-height: 100px; overflow-y: auto;">
-                                        <span class="badge bg-secondary-subtle text-dark border" v-for="ds in contactDomainStats" :key="ds.domain" style="cursor: pointer;" @click="removeDomainFromContacts(ds.domain)" :title="'点击清除通讯录中所有 @' + ds.domain + ' 邮箱'">
+                                        <span v-if="!domainSelectMode" class="badge bg-secondary-subtle text-dark border" v-for="ds in contactDomainStats" :key="ds.domain" style="cursor: pointer;" @click="removeDomainFromContacts(ds.domain)" :title="'点击清除通讯录中所有 @' + ds.domain + ' 邮箱'">
                                             @[[ ds.domain ]] <span class="text-muted">([[ ds.count ]])</span> <i class="bi bi-x-circle text-danger ms-1"></i>
+                                        </span>
+                                        <span v-else class="badge border" v-for="ds in contactDomainStats" :key="ds.domain" :class="selectedDomains.includes(ds.domain) ? 'bg-danger text-white' : 'bg-light text-dark'" style="cursor: pointer;" @click="toggleSelectDomain(ds.domain)">
+                                            <i class="bi me-1" :class="selectedDomains.includes(ds.domain) ? 'bi-check-square' : 'bi-square'"></i>
+                                            @[[ ds.domain ]] <span :class="selectedDomains.includes(ds.domain) ? '' : 'text-muted'">([[ ds.count ]])</span>
                                         </span>
                                     </div>
                                 </div>
@@ -2479,6 +2512,8 @@ EOF
                     removeEmail: '',
                     removeDomain: '',
                     contactDomainStats: [],
+                    domainSelectMode: false,
+                    selectedDomains: [],
                     smtpUsers: [],
                     showUserModal: false,
                     editingUser: null,
@@ -2987,6 +3022,59 @@ EOF
                             }
                         } else {
                             alert(`通讯录中未找到 @${domain} 的邮箱`);
+                        }
+                    } catch(e) { alert('失败: ' + e); }
+                },
+                toggleDomainSelectMode() {
+                    this.domainSelectMode = !this.domainSelectMode;
+                    if (!this.domainSelectMode) {
+                        this.selectedDomains = [];
+                    }
+                },
+                toggleSelectDomain(domain) {
+                    const idx = this.selectedDomains.indexOf(domain);
+                    if (idx === -1) {
+                        this.selectedDomains.push(domain);
+                    } else {
+                        this.selectedDomains.splice(idx, 1);
+                    }
+                },
+                selectAllDomains() {
+                    if (this.selectedDomains.length === this.contactDomainStats.length) {
+                        this.selectedDomains = [];
+                    } else {
+                        this.selectedDomains = this.contactDomainStats.map(ds => ds.domain);
+                    }
+                },
+                async removeSelectedDomains() {
+                    if (this.selectedDomains.length === 0) return;
+                    const count = this.selectedDomains.length;
+                    const totalEmails = this.contactDomainStats
+                        .filter(ds => this.selectedDomains.includes(ds.domain))
+                        .reduce((sum, ds) => sum + ds.count, 0);
+                    if (!confirm(`确定删除 ${count} 个域名的 ${totalEmails} 个邮箱吗？\n\n域名: ${this.selectedDomains.join(', ')}`)) return;
+                    try {
+                        const res = await fetch('/api/contacts/remove_domains', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({ domains: this.selectedDomains })
+                        });
+                        const data = await res.json();
+                        if (data.deleted > 0) {
+                            // Also remove from current input if present
+                            if (this.bulk.recipients) {
+                                let emails = this.bulk.recipients.split('\n').filter(r => r.trim());
+                                this.selectedDomains.forEach(domain => {
+                                    emails = emails.filter(e => !e.trim().toLowerCase().endsWith('@' + domain.toLowerCase()));
+                                });
+                                this.bulk.recipients = emails.join('\n');
+                            }
+                            this.selectedDomains = [];
+                            this.domainSelectMode = false;
+                            this.fetchContactCount();
+                            this.fetchContactDomainStats();
+                        } else {
+                            alert('未删除任何邮箱');
                         }
                     } catch(e) { alert('失败: ' + e); }
                 },
