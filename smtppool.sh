@@ -359,49 +359,26 @@ class SMTPAuthenticator:
         except Exception as e:
             logger.error(f"SMTP认证错误: {e}")
             return fail_result
-
-# --- SMTP Handler (Producer) ---
+# --- SMTP Handler (中继邮件立即转发) ---
 class RelayHandler:
     async def handle_DATA(self, server, session, envelope):
         cfg = load_config()
         all_pool = cfg.get('downstream_pool', [])
-        # Filter enabled nodes (default True)
         pool = [n for n in all_pool if n.get('enabled', True)]
-        
-        # Debug logging
-        all_node_names = [n.get('name', '?') for n in all_pool]
-        enabled_node_names = [n.get('name', '?') for n in pool]
-        logger.info(f"📋 节点列表: {all_node_names}, 已启用: {enabled_node_names}")
         
         if not pool:
             logger.warning("❌ No enabled downstream nodes available")
             return '451 Temporary failure: No nodes'
         
-        # Load Balancing: Routing > Weighted
-        rcpt = envelope.rcpt_tos[0] if envelope.rcpt_tos else ''
+        # 随机选择一个节点立即转发
+        node = random.choice(pool)
+        node_name = node.get('name', 'Unknown')
         
-        # --- Redundant Send Logic (3 Nodes) ---
-        # 1. Select candidates (Ignore routing rules for relay, use all enabled nodes)
-        candidates = pool 
-        
-        # 2. Randomly select up to 3 unique nodes
-        selected_nodes = []
-        if len(candidates) <= 3:
-            selected_nodes = candidates
-        else:
-            selected_nodes = random.sample(candidates, 3)
-            
-        if not selected_nodes:
-             logger.warning("❌ 无可用节点")
-             return '451 Temporary failure: No suitable nodes'
-
-        # Extract subject from email content (before logging)
+        # 提取主题（用于日志）
         subject = ''
-        smtp_user = getattr(session, 'smtp_user', None)
         try:
             msg = message_from_bytes(envelope.content)
             raw_subject = msg.get('Subject', '')
-            # Decode MIME encoded subject
             if raw_subject:
                 decoded_parts = decode_header(raw_subject)
                 subject_parts = []
@@ -410,22 +387,84 @@ class RelayHandler:
                         subject_parts.append(part.decode(encoding or 'utf-8', errors='replace'))
                     else:
                         subject_parts.append(part)
-                subject = ''.join(subject_parts)[:100]  # Limit to 100 chars
+                subject = ''.join(subject_parts)[:50]
         except:
             pass
-
-        subject_short = subject[:30] if subject else '(无主题)'
-        logger.info(f"📥 收到邮件 | 发件人: {envelope.mail_from} | 收件人: {envelope.rcpt_tos[0] if envelope.rcpt_tos else '?'} | 主题: {subject_short} | 节点: {[n['name'] for n in selected_nodes]}")
         
-        # 3. Queue for all selected nodes (No Direct Send anymore to ensure async redundancy)
+        logger.info(f"📥 [RELAY] {envelope.mail_from} → {envelope.rcpt_tos[0]} | {subject} | via {node_name}")
+        
+        # 立即转发
         try:
-            with get_db() as conn:
-                for node in selected_nodes:
-                    node_name = node.get('name', 'Unknown')
+            # 构建发件人
+            sender = None
+            if node.get('sender_domain'):
+                domain = node['sender_domain']
+                if node.get('sender_random'):
+                    prefix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
+                else:
+                    prefix = node.get('sender_prefix', 'mail')
+                sender = f"{prefix}@{domain}"
+            elif node.get('sender_email'):
+                sender = node['sender_email']
+            else:
+                sender = envelope.mail_from or node.get('username')
+            
+            # 重写 From 头
+            msg = message_from_bytes(envelope.content)
+            if sender and (node.get('sender_domain') or node.get('sender_email')):
+                if 'From' in msg:
+                    del msg['From']
+                msg['From'] = sender
+            
+            msg_content = msg.as_bytes()
+            
+            # 发送
+            encryption = node.get('encryption', 'none')
+            host = node['host']
+            port = int(node['port'])
+            
+            if encryption == 'ssl':
+                with smtplib.SMTP_SSL(host, port, timeout=30) as s:
+                    if node.get('username') and node.get('password'):
+                        s.login(node['username'], node['password'])
+                    s.sendmail(sender, envelope.rcpt_tos, msg_content)
+            else:
+                with smtplib.SMTP(host, port, timeout=30) as s:
+                    if encryption == 'tls':
+                        s.starttls()
+                    if node.get('username') and node.get('password'):
+                        s.login(node['username'], node['password'])
+                    s.sendmail(sender, envelope.rcpt_tos, msg_content)
+            
+            logger.info(f"✅ [RELAY] 转发成功 | {envelope.rcpt_tos[0]} via {node_name}")
+            
+            # 自动保存收件人到通讯录
+            try:
+                with get_db() as conn:
+                    for rcpt_email in envelope.rcpt_tos:
+                        rcpt_email = rcpt_email.strip()
+                        if rcpt_email and '@' in rcpt_email:
+                            try:
+                                conn.execute("INSERT INTO contacts (email, created_at) VALUES (?, datetime('now', '+08:00'))", (rcpt_email,))
+                            except sqlite3.IntegrityError:
+                                pass
+            except:
+                pass
+            
+            return '250 OK: Delivered immediately'
+            
+        except Exception as e:
+            logger.error(f"❌ [RELAY] 转发失败: {e}")
+            # 转发失败，写入数据库作为失败记录
+            try:
+                with get_db() as conn:
                     conn.execute(
-                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, last_error, subject, smtp_user, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+08:00'), datetime('now', '+08:00'))",
-                        (envelope.mail_from, json.dumps(envelope.rcpt_tos), envelope.content, node_name, 'pending', 'relay', None, subject, smtp_user)
+                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, last_error, subject, created_at, updated_at) VALUES (?, ?, ?, ?, 'failed', 'relay', ?, ?, datetime('now', '+08:00'), datetime('now', '+08:00'))",
+                        (envelope.mail_from, json.dumps(envelope.rcpt_tos), envelope.content, node_name, str(e)[:200], subject)
                     )
+            except:
+                pass
+            return '451 Temporary failure: Delivery failed'
                 
                 # Auto-save relay recipients to contacts list
                 for rcpt_email in envelope.rcpt_tos:
