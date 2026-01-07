@@ -757,48 +757,41 @@ def dispatcher_thread():
                 if node_name in node_queues and node_queues[node_name].qsize() < 50:
                     nodes_need_tasks.append(node_name)
             
-            if not nodes_need_tasks:
-                time.sleep(0.5)
-                continue
-            
             # 批量从数据库获取群发任务并分发
-            with get_db() as conn:
-                for node_name in nodes_need_tasks:
-                    if bulk_ctrl == 'paused':
-                        rows = conn.execute(
-                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
-                            (node_name,)
-                        ).fetchall()
-                    else:
-                        # 只取群发邮件，中继已经在上面处理了
-                        rows = conn.execute(
-                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source='bulk' ORDER BY id ASC LIMIT 20",
-                            (node_name,)
-                        ).fetchall()
-                        rows = conn.execute(
-                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 20",
-                            (node_name,)
-                        ).fetchall()
-                    
-                    if rows:
-                        # 标记为处理中
-                        ids = [r['id'] for r in rows]
-                        placeholders = ','.join(['?'] * len(ids))
-                        conn.execute(f"UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id IN ({placeholders})", ids)
+            if nodes_need_tasks:
+                with get_db() as conn:
+                    for node_name in nodes_need_tasks:
+                        if bulk_ctrl == 'paused':
+                            rows = conn.execute(
+                                "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
+                                (node_name,)
+                            ).fetchall()
+                        else:
+                            # 只取群发邮件，中继已经在上面处理了
+                            rows = conn.execute(
+                                "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source='bulk' ORDER BY id ASC LIMIT 20",
+                                (node_name,)
+                            ).fetchall()
                         
-                        # 放入节点队列
-                        for row in rows:
-                            try:
-                                task = {
-                                    'id': row['id'],
-                                    'mail_from': row['mail_from'],
-                                    'rcpt_tos': json.loads(row['rcpt_tos']),
-                                    'content': row['content'],
-                                    'source': row['source']
-                                }
-                                node_queues[node_name].put(task, timeout=1)
-                            except:
-                                pass
+                        if rows:
+                            # 标记为处理中
+                            ids = [r['id'] for r in rows]
+                            placeholders = ','.join(['?'] * len(ids))
+                            conn.execute(f"UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id IN ({placeholders})", ids)
+                            
+                            # 放入节点队列
+                            for row in rows:
+                                try:
+                                    task = {
+                                        'id': row['id'],
+                                        'mail_from': row['mail_from'],
+                                        'rcpt_tos': json.loads(row['rcpt_tos']),
+                                        'content': row['content'],
+                                        'source': row['source']
+                                    }
+                                    node_queues[node_name].put(task, timeout=1)
+                                except:
+                                    pass
             
             time.sleep(0.1)  # 快速循环分发
             
