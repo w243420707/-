@@ -413,12 +413,11 @@ class RelayHandler:
         except:
             pass
         
-        # ✅ 修正：这两行需要与 try 块对齐（4个空格缩进）
         subject_short = subject[:30] if subject else '(无主题)'
         logger.info(
             f"📥 收到邮件 | 发件人: {envelope.mail_from} | 收件人: {envelope.rcpt_tos[0] if envelope.rcpt_tos else '?'} | 主题: {subject_short} | 节点: {[n['name'] for n in selected_nodes]}"
         )
-        
+                
         # 3. Queue for all selected nodes (No Direct Send anymore to ensure async redundancy)
         try:
             with get_db() as conn:
