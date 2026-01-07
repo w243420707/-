@@ -724,6 +724,33 @@ def dispatcher_thread():
                         node_workers[node_name] = t
                         logger.info(f"🆕 启动节点发送线程: {node_name}")
             
+            # 优先处理中继邮件（relay）- 不管队列是否满都立即处理
+            with get_db() as conn:
+                relay_rows = conn.execute(
+                    "SELECT id, mail_from, rcpt_tos, content, source, assigned_node FROM queue WHERE status='pending' AND source='relay' ORDER BY id ASC LIMIT 50"
+                ).fetchall()
+                
+                if relay_rows:
+                    ids = [r['id'] for r in relay_rows]
+                    placeholders = ','.join(['?'] * len(ids))
+                    conn.execute(f"UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id IN ({placeholders})", ids)
+                    
+                    for row in relay_rows:
+                        node_name = row['assigned_node']
+                        if node_name in node_queues:
+                            try:
+                                task = {
+                                    'id': row['id'],
+                                    'mail_from': row['mail_from'],
+                                    'rcpt_tos': json.loads(row['rcpt_tos']),
+                                    'content': row['content'],
+                                    'source': row['source']
+                                }
+                                node_queues[node_name].put(task, timeout=5)  # 中继邮件等待更长时间
+                            except:
+                                # 队列满了，重置状态
+                                conn.execute("UPDATE queue SET status='pending' WHERE id=?", (row['id'],))
+            
             # 找出需要补充任务的节点（队列少于50个任务）
             nodes_need_tasks = []
             for node_name in enabled_nodes:
@@ -734,7 +761,7 @@ def dispatcher_thread():
                 time.sleep(0.5)
                 continue
             
-            # 批量从数据库获取任务并分发
+            # 批量从数据库获取群发任务并分发
             with get_db() as conn:
                 for node_name in nodes_need_tasks:
                     if bulk_ctrl == 'paused':
@@ -743,6 +770,11 @@ def dispatcher_thread():
                             (node_name,)
                         ).fetchall()
                     else:
+                        # 只取群发邮件，中继已经在上面处理了
+                        rows = conn.execute(
+                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source='bulk' ORDER BY id ASC LIMIT 20",
+                            (node_name,)
+                        ).fetchall()
                         rows = conn.execute(
                             "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 20",
                             (node_name,)
