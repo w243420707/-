@@ -73,6 +73,7 @@ import sqlite3
 import time
 import base64
 import uuid
+import functools
 from datetime import datetime, timedelta
 from email import message_from_bytes
 from email.header import decode_header
@@ -91,8 +92,6 @@ DB_FILE = os.path.join(BASE_DIR, 'queue.db')
 LOG_FILE = '/var/log/smtp-relay/app.log'
 
 # --- Database ---
-import functools
-
 def db_retry(max_retries=3, delay=0.5):
     """Decorator for retrying database operations on lock"""
     def decorator(func):
