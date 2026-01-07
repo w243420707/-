@@ -2525,6 +2525,7 @@ EOF
                             <button class="btn" :class="nodeViewMode === 'table' ? 'btn-primary' : 'btn-outline-secondary'" @click="nodeViewMode = 'table'" title="表格视图"><i class="bi bi-table"></i></button>
                         </div>
                         <button class="btn btn-sm btn-outline-secondary" @click="showGroupModal = true" title="管理分组"><i class="bi bi-folder-plus"></i></button>
+                        <button class="btn btn-sm btn-outline-secondary" @click="autoRenameNodes" title="自动命名 (分组-域名)"><i class="bi bi-tag"></i> 自动命名</button>
                         <button class="btn btn-sm btn-outline-primary" @click="addNode"><i class="bi bi-plus-lg"></i> 添加</button>
                         <button class="btn btn-sm btn-primary" @click="save" :disabled="saving">
                             <span v-if="saving" class="spinner-border spinner-border-sm me-1"></span>
@@ -3814,9 +3815,25 @@ EOF
                 copyNode(i) {
                     const original = this.config.downstream_pool[i];
                     const copy = JSON.parse(JSON.stringify(original));
-                    copy.name = original.name + '-Copy';
+                    // 自动生成名称：分组-域名 格式
+                    copy.name = this.generateNodeName(copy);
                     copy.expanded = true;
                     this.config.downstream_pool.splice(i + 1, 0, copy);
+                },
+                generateNodeName(node) {
+                    const group = node.group || '未分组';
+                    const domain = node.sender_domain || node.host || 'unknown';
+                    return `${group}-${domain}`;
+                },
+                autoRenameNodes() {
+                    const selected = this.config.downstream_pool.filter(n => n.batchSelected);
+                    const targets = selected.length > 0 ? selected : this.config.downstream_pool;
+                    if (selected.length === 0 && !confirm(`确定为所有 ${targets.length} 个节点自动命名吗？\n格式: 分组名-发送域名`)) return;
+                    if (selected.length > 0 && !confirm(`确定为选中的 ${selected.length} 个节点自动命名吗？\n格式: 分组名-发送域名`)) return;
+                    targets.forEach(n => {
+                        n.name = this.generateNodeName(n);
+                    });
+                    alert(`已重命名 ${targets.length} 个节点`);
                 },
                 moveNode(i, direction) {
                     const newIndex = i + direction;
