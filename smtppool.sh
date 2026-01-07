@@ -91,9 +91,32 @@ DB_FILE = os.path.join(BASE_DIR, 'queue.db')
 LOG_FILE = '/var/log/smtp-relay/app.log'
 
 # --- Database ---
+import functools
+
+def db_retry(max_retries=3, delay=0.5):
+    """Decorator for retrying database operations on lock"""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except sqlite3.OperationalError as e:
+                    if 'locked' in str(e) and attempt < max_retries - 1:
+                        time.sleep(delay * (attempt + 1))
+                        continue
+                    raise
+            return func(*args, **kwargs)
+        return wrapper
+    return decorator
+
 def get_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=60)
     conn.row_factory = sqlite3.Row
+    # 启用WAL模式提高并发性能
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=60000')  # 60秒超时
+    conn.execute('PRAGMA synchronous=NORMAL')  # 平衡性能和安全
     return conn
 
 def init_db():
@@ -444,13 +467,21 @@ def worker_thread():
             
             # --- Reset stuck 'processing' items (every 2 minutes) ---
             if now - last_stuck_check_time > 120:
-                try:
-                    with get_db() as conn:
-                        stuck = conn.execute("UPDATE queue SET status='pending' WHERE status='processing' AND updated_at < datetime('now', '+08:00', '-5 minutes')").rowcount
-                        if stuck > 0:
-                            logger.info(f"🔄 已重置 {stuck} 个卡住的任务")
-                except Exception as e:
-                    logger.error(f"卡住任务检查失败: {e}")
+                for retry in range(3):
+                    try:
+                        with get_db() as conn:
+                            stuck = conn.execute("UPDATE queue SET status='pending' WHERE status='processing' AND updated_at < datetime('now', '+08:00', '-5 minutes')").rowcount
+                            if stuck > 0:
+                                logger.info(f"🔄 已重置 {stuck} 个卡住的任务")
+                        break
+                    except sqlite3.OperationalError as e:
+                        if 'locked' in str(e) and retry < 2:
+                            time.sleep(0.5 * (retry + 1))
+                            continue
+                        logger.error(f"卡住任务检查失败: {e}")
+                    except Exception as e:
+                        logger.error(f"卡住任务检查失败: {e}")
+                        break
                 last_stuck_check_time = now
             
             # --- Auto Cleanup (Once per hour) ---
@@ -469,17 +500,25 @@ def worker_thread():
 
             # --- Activate Scheduled Emails (every loop) ---
             # Change status from 'scheduled' to 'pending' when scheduled_at time has passed
-            try:
-                current_time = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
-                with get_db() as conn:
-                    activated = conn.execute(
-                        "UPDATE queue SET status='pending' WHERE status='scheduled' AND scheduled_at <= ?",
-                        (current_time,)
-                    ).rowcount
-                    if activated > 0:
-                        logger.info(f"⏰ 已激活 {activated} 封定时邮件")
-            except Exception as e:
-                logger.error(f"定时邮件激活失败: {e}")
+            for retry in range(3):
+                try:
+                    current_time = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
+                    with get_db() as conn:
+                        activated = conn.execute(
+                            "UPDATE queue SET status='pending' WHERE status='scheduled' AND scheduled_at <= ?",
+                            (current_time,)
+                        ).rowcount
+                        if activated > 0:
+                            logger.info(f"⏰ 已激活 {activated} 封定时邮件")
+                    break
+                except sqlite3.OperationalError as e:
+                    if 'locked' in str(e) and retry < 2:
+                        time.sleep(0.5 * (retry + 1))
+                        continue
+                    logger.error(f"定时邮件激活失败: {e}")
+                except Exception as e:
+                    logger.error(f"定时邮件激活失败: {e}")
+                    break
 
             pool_cfg = {n['name']: n for n in cfg.get('downstream_pool', [])}
             
