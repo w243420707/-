@@ -778,7 +778,9 @@ def api_save():
     # Auto rebalance after save (in background thread to avoid blocking)
     def async_rebalance():
         try:
-            rebalance_queue_internal()
+            count = rebalance_queue_internal()
+            if count > 0:
+                logger.info(f"✅ Auto-rebalanced {count} items after config save")
         except Exception as e:
             logger.error(f"Auto-rebalance failed: {e}")
     threading.Thread(target=async_rebalance, daemon=True).start()
@@ -1585,7 +1587,7 @@ def api_queue_clear():
     return jsonify({"status": "ok"})
 
 def rebalance_queue_internal():
-    cfg = load_config()
+    cfg = load_config(use_cache=False)  # Force fresh config
     pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
     if not pool: return 0
     
@@ -1597,8 +1599,16 @@ def rebalance_queue_internal():
     if not bulk_pool:
         bulk_pool = pool  # Fallback to all enabled nodes
     
-    count = 0
     limit_cfg = cfg.get('limit_config', {})
+    
+    # Pre-compute routing exclusion sets for each node (for faster lookup)
+    node_exclusions = {}
+    for n in pool:
+        rules = n.get('routing_rules', '')
+        if rules and rules.strip():
+            node_exclusions[n['name']] = set(d.strip().lower() for d in rules.split(',') if d.strip())
+        else:
+            node_exclusions[n['name']] = set()
     
     # Get list of valid node names for quick check
     valid_node_names = set(pool_by_name.keys())
@@ -1606,16 +1616,21 @@ def rebalance_queue_internal():
     
     with get_db() as conn:
         # Fetch ALL pending items to check routing rules
-        rows = conn.execute("SELECT id, rcpt_tos, source, assigned_node FROM queue WHERE status='pending'").fetchall()
+        rows = conn.execute("SELECT id, rcpt_tos, source, assigned_node FROM queue WHERE status IN ('pending', 'scheduled')").fetchall()
         
         if not rows: return 0
         
         updates = []
+        failures = []
+        
         for r in rows:
             try:
                 rcpts = json.loads(r['rcpt_tos'])
                 rcpt = rcpts[0] if rcpts else ''
-            except: rcpt = ''
+                domain = rcpt.split('@')[-1].lower().strip() if '@' in rcpt else ''
+            except:
+                rcpt = ''
+                domain = ''
             
             source = r['source']
             current_node_name = r['assigned_node']
@@ -1625,21 +1640,14 @@ def rebalance_queue_internal():
             needs_reassign = False
             
             # 1. Node doesn't exist or is disabled
-            if not current_node or not current_node.get('enabled', True):
+            if current_node_name not in valid_node_names:
                 needs_reassign = True
             # 2. Bulk mail on bulk-disabled node
-            elif source == 'bulk' and not current_node.get('allow_bulk', True):
+            elif source == 'bulk' and current_node_name in bulk_disabled_nodes:
                 needs_reassign = True
             # 3. Domain is excluded by current node's routing rules
-            else:
-                try:
-                    domain = rcpt.split('@')[-1].lower().strip()
-                except: domain = ''
-                rules = current_node.get('routing_rules', '')
-                if rules and rules.strip():
-                    excluded = [d.strip().lower() for d in rules.split(',') if d.strip()]
-                    if domain in excluded:
-                        needs_reassign = True
+            elif domain and domain in node_exclusions.get(current_node_name, set()):
+                needs_reassign = True
             
             if needs_reassign:
                 target_pool = bulk_pool if source == 'bulk' else pool
@@ -1648,12 +1656,17 @@ def rebalance_queue_internal():
                     updates.append((node['name'], r['id']))
                 elif not node:
                     # No valid node found, mark as failed
-                    conn.execute("UPDATE queue SET status='failed', last_error='No node available for this domain' WHERE id=?", (r['id'],))
+                    failures.append((r['id'],))
         
+        # Batch update for efficiency
         if updates:
             conn.executemany("UPDATE queue SET assigned_node=? WHERE id=?", updates)
-            count = len(updates)
-            logger.info(f"🔄 Rebalanced {count} items")
+        if failures:
+            conn.executemany("UPDATE queue SET status='failed', last_error='No node available for this domain' WHERE id=?", failures)
+        
+        count = len(updates)
+        if count > 0:
+            logger.info(f"🔄 Rebalanced {count} items, {len(failures)} failed")
     return count
 
 @app.route('/api/queue/rebalance', methods=['POST'])
