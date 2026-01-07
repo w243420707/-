@@ -658,6 +658,83 @@ node_queues = {}  # { 'node_name': Queue() }
 node_workers = {}  # 节点工作线程
 node_queue_lock = threading.Lock()
 
+# Background writer for bulk inserts: use a queue + batch executemany to improve throughput
+from queue import Queue as _LocalQueue, Empty as _LocalEmpty
+bulk_write_queue = _LocalQueue()
+_BULK_WRITE_BATCH = 2000
+
+# bulk write statistics
+bulk_stats_lock = threading.Lock()
+bulk_stats = {
+    'total_expected': 0,
+    'inserted': 0,
+    'start_time': None,
+    'last_update': 0.0,
+    'last_rate': 0.0
+}
+
+def bulk_writer_thread():
+    batch = []
+    insert_sql = "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    while True:
+        try:
+            item = bulk_write_queue.get(timeout=1)
+            batch.append(item)
+            # drain quickly up to batch size
+            while len(batch) < _BULK_WRITE_BATCH:
+                try:
+                    batch.append(bulk_write_queue.get_nowait())
+                except _LocalEmpty:
+                    break
+
+            if batch:
+                tries = 0
+                written = 0
+                while True:
+                    try:
+                        with get_db() as conn:
+                            conn.executemany(insert_sql, batch)
+                        written = len(batch)
+                        break
+                    except sqlite3.OperationalError as e:
+                        tries += 1
+                        logger.warning(f"Bulk writer DB locked, retry {tries}: {e}")
+                        time.sleep(min(1, 0.1 * tries))
+                        if tries >= 10:
+                            logger.error(f"Bulk writer giving up after {tries} retries: {e}")
+                            break
+                # update stats
+                if written:
+                    with bulk_stats_lock:
+                        bulk_stats['inserted'] += written
+                        now = time.time()
+                        bulk_stats['last_update'] = now
+                        if bulk_stats['start_time']:
+                            elapsed = max(1.0, now - bulk_stats['start_time'])
+                            bulk_stats['last_rate'] = bulk_stats['inserted'] / elapsed
+                batch = []
+        except _LocalEmpty:
+            # flush any remaining batch
+            if batch:
+                try:
+                    with get_db() as conn:
+                        conn.executemany(insert_sql, batch)
+                    written = len(batch)
+                    with bulk_stats_lock:
+                        bulk_stats['inserted'] += written
+                        now = time.time()
+                        bulk_stats['last_update'] = now
+                        if bulk_stats['start_time']:
+                            elapsed = max(1.0, now - bulk_stats['start_time'])
+                            bulk_stats['last_rate'] = bulk_stats['inserted'] / elapsed
+                except Exception as e:
+                    logger.error(f"Bulk writer final flush failed: {e}")
+                batch = []
+            time.sleep(0.1)
+
+# start writer thread daemon
+threading.Thread(target=bulk_writer_thread, daemon=True).start()
+
 def get_cached_config(max_age=2):
     """获取缓存的配置（直接使用 load_config 的缓存）"""
     return load_config(use_cache=True)
@@ -1709,28 +1786,36 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 initial_status = 'scheduled' if schedule_time and schedule_time > datetime.now() else 'pending'
                 scheduled_at_str = schedule_time.strftime('%Y-%m-%d %H:%M:%S') if schedule_time else None
                 
-                tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject))
+                record = ('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject)
                 count += 1
-                
-                # Batch insert every 500 records for better performance
-                if len(tasks) >= 500:
-                    with get_db() as conn:
-                        conn.executemany(
-                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            tasks
-                        )
-                    tasks = []
+                # increment expected total and set start_time if first
+                try:
+                    with bulk_stats_lock:
+                        bulk_stats['total_expected'] += 1
+                        if not bulk_stats['start_time']:
+                            bulk_stats['start_time'] = time.time()
+                except Exception:
+                    pass
+                # Push to bulk writer queue. If queue is full, fallback to direct DB write to avoid blocking forever.
+                try:
+                    bulk_write_queue.put(record, block=False)
+                except Exception:
+                    # fallback: write immediately in small transaction
+                    try:
+                        with get_db() as conn:
+                            conn.execute(
+                                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                record
+                            )
+                        with bulk_stats_lock:
+                            bulk_stats['inserted'] += 1
+                    except Exception as e:
+                        logger.error(f"Direct write fallback failed for {rcpt}: {e}")
             except Exception as e:
                 logger.error(f"准备邮件失败 {rcpt}: {e}")
                 continue
 
-        # Insert remaining tasks
-        if tasks:
-            with get_db() as conn:
-                conn.executemany(
-                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    tasks
-                )
+        # No local DB writes here; remaining records (if any) already pushed to bulk_write_queue.
         logger.info(f"群发导入完成: 共 {count} 封邮件")
     except Exception as e:
         logger.error(f"群发导入任务失败: {e}")
@@ -1779,6 +1864,22 @@ def api_send_bulk():
     except Exception as e:
         logger.error(f"群发错误: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/bulk/stats')
+@login_required
+def api_bulk_stats():
+    try:
+        with bulk_stats_lock:
+            stats = dict(bulk_stats)
+        # Add percentage if total_expected > 0
+        stats['percent'] = 0.0
+        if stats.get('total_expected'):
+            stats['percent'] = round((stats.get('inserted', 0) / max(1, stats.get('total_expected'))) * 100, 2)
+        return jsonify(stats)
+    except Exception as e:
+        logger.error(f"Failed to get bulk stats: {e}")
+        return jsonify({}), 500
 
 # --- SMTP Users Management API ---
 @app.route('/api/smtp-users')
@@ -2905,6 +3006,15 @@ EOF
                         <div class="card h-100">
                             <div class="card-header">收件人列表</div>
                             <div class="card-body d-flex flex-column">
+                                <!-- Bulk import progress -->
+                                <div v-if="bulkStats.total_expected > 0" class="mb-2">
+                                    <div class="d-flex justify-content-between small text-muted">
+                                        <div>导入进度</div>
+                                        <div>[[ bulkStats.inserted ]] / [[ bulkStats.total_expected ]] ([[ bulkStats.percent ]]%)</div>
+                                    </div>
+                                    <div class="progress mb-2" style="height:8px;"><div class="progress-bar bg-success" :style="{width: bulkStats.percent + '%'}"></div></div>
+                                    <div class="small text-muted">写入速率: [[ bulkStats.last_rate.toFixed(1) ]] 条/秒</div>
+                                </div>
                                 <div class="d-flex gap-2 mb-2">
                                     <button class="btn btn-outline-success flex-grow-1" @click="saveContacts"><i class="bi bi-cloud-upload"></i> 保存当前</button>
                                     <button class="btn btn-outline-danger" @click="clearContacts"><i class="bi bi-trash"></i> 清空</button>
@@ -3752,6 +3862,7 @@ EOF
                     nodeViewMode: 'card'
                         ,
                     system: { cpu_percent: 0, mem_total: 0, mem_used: 0, mem_percent: 0, swap_total: 0, swap_used: 0, swap_percent: 0, disk_percent: 0, net_sent: 0, net_recv: 0 },
+                    bulkStats: { total_expected: 0, inserted: 0, last_rate: 0.0, percent: 0.0 },
                     history: {
                         labels: [],
                         cpu: [],
@@ -3873,6 +3984,7 @@ EOF
                 this.fetchContactCount();
                 this.fetchContactDomainStats();
                 this.fetchBulkStatus();
+                this.fetchBulkStats();
                 this.fetchTopDomains();
                 this.fetchSystemStats();
                 // Initialize charts after first fetch
@@ -3881,9 +3993,12 @@ EOF
                 setInterval(() => {
                     this.fetchQueue();
                     this.fetchBulkStatus();
+                    this.fetchBulkStats();
                 }, 5000);
                 // Poll system stats every 5 seconds
                 setInterval(() => { this.fetchSystemStats(); }, 5000);
+                // Poll bulk stats more frequently
+                setInterval(() => { this.fetchBulkStats(); }, 2000);
                 // Refresh domain stats less frequently (every 30 seconds)
                 setInterval(() => {
                     this.fetchTopDomains();
@@ -4281,6 +4396,18 @@ EOF
                         const data = await res.json();
                         this.bulkStatus = data.status;
                     } catch(e) {}
+                },
+                async fetchBulkStats() {
+                    try {
+                        const res = await fetch('/api/bulk/stats');
+                        const d = await res.json();
+                        if (res.ok && d) {
+                            this.bulkStats.total_expected = d.total_expected || 0;
+                            this.bulkStats.inserted = d.inserted || 0;
+                            this.bulkStats.last_rate = d.last_rate || d.last_rate || 0.0;
+                            this.bulkStats.percent = d.percent || 0.0;
+                        }
+                    } catch(e) { /* ignore */ }
                 },
                 async controlBulk(action) {
                     if(action === 'stop' && !confirm('确定停止并清空所有待发送的群发邮件吗？')) return;
