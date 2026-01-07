@@ -867,7 +867,7 @@ def api_domain_stats():
     
     return jsonify(result)
 
-def select_weighted_node(nodes, global_limit):
+def select_weighted_node(nodes, global_limit, queue_counts=None):
     if not nodes: return None
     try:
         weights = []
@@ -884,21 +884,45 @@ def select_weighted_node(nodes, global_limit):
             max_ph = int(node.get('max_per_hour', 0))
             if max_ph > 0: speed = min(speed, max_ph)
             
-            weights.append(speed)
+            # Factor in current queue load (nodes with fewer pending items get higher weight)
+            if queue_counts:
+                pending = queue_counts.get(node['name'], 0)
+                # Use inverse of pending count as multiplier (more pending = lower weight)
+                # Add 1 to avoid division by zero, use sqrt to soften the effect
+                load_factor = 1 / (1 + (pending / 100) ** 0.5)
+                speed = speed * load_factor
+            
+            weights.append(max(speed, 0.1))  # Ensure minimum weight
             
         return random.choices(nodes, weights=weights, k=1)[0]
     except:
         return random.choice(nodes)
 
-def select_node_for_recipient(pool, recipient, global_limit, source='relay'):
+def get_queue_counts_by_node():
+    """Get pending queue count for each node"""
+    try:
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT assigned_node, COUNT(*) as cnt FROM queue WHERE status IN ('pending', 'scheduled') GROUP BY assigned_node"
+            ).fetchall()
+            return {r['assigned_node']: r['cnt'] for r in rows}
+    except:
+        return {}
+
+def select_node_for_recipient(pool, recipient, global_limit, source='relay', force_assign=False, queue_counts=None):
     # pool is list of node dicts
     if not pool: return None
     try:
         domain = recipient.split('@')[-1].lower().strip()
     except:
         domain = ""
+    
+    # Get queue counts if not provided (for load-aware selection)
+    if queue_counts is None:
+        queue_counts = get_queue_counts_by_node()
         
     candidates = []
+    excluded_candidates = []  # Nodes that have this domain excluded
     
     for node in pool:
         # Filter by source capability
@@ -916,12 +940,19 @@ def select_node_for_recipient(pool, recipient, global_limit, source='relay'):
             if domain not in excluded:
                 # Domain is NOT excluded, so this node can handle it
                 candidates.append(node)
+            else:
+                # Domain is excluded, but keep track for force_assign
+                excluded_candidates.append(node)
     
-    # If no candidates found, return None (don't force assign to excluded nodes)
-    if not candidates:
-        return None
+    # Normal mode: only use non-excluded candidates
+    if candidates:
+        return select_weighted_node(candidates, global_limit, queue_counts)
     
-    return select_weighted_node(candidates, global_limit)
+    # Force assign mode: if no normal candidates, use excluded nodes (ignoring their rules)
+    if force_assign and excluded_candidates:
+        return select_weighted_node(excluded_candidates, global_limit, queue_counts)
+    
+    return None
 
 def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
     try:
@@ -1679,6 +1710,106 @@ def api_queue_rebalance():
         logger.error(f"Rebalance error: {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route('/api/queue/force_rebalance', methods=['POST'])
+@login_required
+def api_queue_force_rebalance():
+    """Force rebalance: redistribute ALL pending items evenly based on weight, respecting routing rules"""
+    try:
+        cfg = load_config(use_cache=False)
+        pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
+        if not pool:
+            return jsonify({"error": "No enabled nodes available"}), 400
+        
+        bulk_pool = [n for n in pool if n.get('allow_bulk', True)]
+        if not bulk_pool:
+            bulk_pool = pool
+        
+        limit_cfg = cfg.get('limit_config', {})
+        
+        # Pre-compute routing exclusion sets for each node
+        node_exclusions = {}
+        for n in pool:
+            rules = n.get('routing_rules', '')
+            if rules and rules.strip():
+                node_exclusions[n['name']] = set(d.strip().lower() for d in rules.split(',') if d.strip())
+            else:
+                node_exclusions[n['name']] = set()
+        
+        with get_db() as conn:
+            rows = conn.execute(
+                "SELECT id, source, rcpt_tos FROM queue WHERE status IN ('pending', 'scheduled') ORDER BY id"
+            ).fetchall()
+            
+            if not rows:
+                return jsonify({"status": "ok", "count": 0, "message": "No items to rebalance"})
+            
+            # Calculate weights for each node based on speed
+            def calc_weight(node):
+                min_i = float(node.get('min_interval') or limit_cfg.get('min_interval', 1))
+                max_i = float(node.get('max_interval') or limit_cfg.get('max_interval', 5))
+                avg_i = (min_i + max_i) / 2
+                if avg_i <= 0.01: avg_i = 0.01
+                speed = 3600 / avg_i
+                max_ph = int(node.get('max_per_hour', 0))
+                if max_ph > 0: speed = min(speed, max_ph)
+                return speed
+            
+            pool_weights = {n['name']: calc_weight(n) for n in pool}
+            bulk_weights = {n['name']: calc_weight(n) for n in bulk_pool}
+            
+            # Distribute items proportionally based on weights, respecting routing rules
+            updates = []
+            failures = []
+            node_counts = {n['name']: 0 for n in pool}  # Track assignments per node
+            
+            for r in rows:
+                source = r['source']
+                
+                # Extract domain from recipient
+                try:
+                    rcpts = json.loads(r['rcpt_tos'])
+                    rcpt = rcpts[0] if rcpts else ''
+                    domain = rcpt.split('@')[-1].lower().strip() if '@' in rcpt else ''
+                except:
+                    domain = ''
+                
+                # Get candidate nodes that accept this domain
+                target_pool = bulk_pool if source == 'bulk' else pool
+                candidates = []
+                for n in target_pool:
+                    excluded = node_exclusions.get(n['name'], set())
+                    if not domain or domain not in excluded:
+                        candidates.append(n)
+                
+                if not candidates:
+                    # No node accepts this domain
+                    failures.append((r['id'],))
+                    continue
+                
+                # Calculate total weight of candidates
+                candidate_weights = {n['name']: (pool_weights if source != 'bulk' else bulk_weights).get(n['name'], 1) for n in candidates}
+                total_weight = sum(candidate_weights.values())
+                
+                # Find the candidate with lowest current load relative to its weight
+                best_node = min(candidates, key=lambda n: node_counts[n['name']] / (candidate_weights[n['name']] / total_weight))
+                node_counts[best_node['name']] += 1
+                updates.append((best_node['name'], r['id']))
+            
+            if updates:
+                conn.executemany("UPDATE queue SET assigned_node=? WHERE id=?", updates)
+            if failures:
+                conn.executemany("UPDATE queue SET status='failed', last_error='No node accepts this domain' WHERE id=?", failures)
+            
+            logger.info(f"⚡ Force rebalanced {len(updates)} items across nodes, {len(failures)} failed")
+            
+            # Return distribution stats
+            stats = {n['name']: node_counts.get(n['name'], 0) for n in pool}
+            
+            return jsonify({"status": "ok", "count": len(updates), "failed": len(failures), "distribution": stats})
+    except Exception as e:
+        logger.error(f"Force rebalance error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/bulk/control', methods=['POST'])
 @login_required
 def api_bulk_control():
@@ -2056,10 +2187,15 @@ EOF
                 <div class="card mb-4">
                     <div class="card-header d-flex justify-content-between align-items-center">
                         <span>节点健康状态</span>
-                        <button class="btn btn-sm btn-outline-primary" @click="rebalanceQueue" :disabled="rebalancing">
-                            <i class="bi" :class="rebalancing?'bi-hourglass-split':'bi-shuffle'"></i> 
-                            [[ rebalancing ? '分配中...' : '重分配待发任务' ]]
-                        </button>
+                        <div class="btn-group">
+                            <button class="btn btn-sm btn-outline-primary" @click="rebalanceQueue" :disabled="rebalancing" title="仅重分配无效节点上的任务">
+                                <i class="bi" :class="rebalancing?'bi-hourglass-split':'bi-shuffle'"></i> 
+                                [[ rebalancing ? '分配中...' : '智能重分配' ]]
+                            </button>
+                            <button class="btn btn-sm btn-outline-warning" @click="forceRebalanceQueue" :disabled="rebalancing" title="忽略排除规则，按权重平均分配所有任务">
+                                <i class="bi bi-lightning-charge"></i> 强制均分
+                            </button>
+                        </div>
                     </div>
                     <div class="table-responsive">
                         <table class="table table-custom table-hover mb-0">
@@ -3960,13 +4096,34 @@ EOF
                     this.fetchQueue();
                 },
                 async rebalanceQueue() {
-                    if(!confirm('确定要将所有【待发送】邮件重新随机分配给当前启用的节点吗？\n\n这通常用于：\n1. 新增节点后，让其立即参与当前任务\n2. 某个节点堆积过多，需要分流')) return;
+                    if(!confirm('智能重分配：仅处理分配到已禁用节点或不满足路由规则的任务\n\n继续吗？')) return;
                     this.rebalancing = true;
                     try {
                         const res = await fetch('/api/queue/rebalance', { method: 'POST' });
                         const data = await res.json();
                         if(res.ok) {
                             alert(`成功重分配 ${data.count} 个任务`);
+                            this.fetchQueue();
+                        } else {
+                            alert('错误: ' + data.error);
+                        }
+                    } catch(e) { alert('失败: ' + e); }
+                    this.rebalancing = false;
+                },
+                async forceRebalanceQueue() {
+                    if(!confirm('⚡ 强制均分：按各节点发送速率权重平均分配所有待发任务\n\n• 遵守分流规则（排除域名）\n• 负载轻的节点获得更多任务\n• 最终分配比例接近节点发送能力比\n\n确定继续吗？')) return;
+                    this.rebalancing = true;
+                    try {
+                        const res = await fetch('/api/queue/force_rebalance', { method: 'POST' });
+                        const data = await res.json();
+                        if(res.ok) {
+                            let msg = `✅ 强制均分完成！\n分配成功: ${data.count} 个\n分配失败: ${data.failed || 0} 个\n\n分配详情：\n`;
+                            if(data.distribution) {
+                                for(const [node, cnt] of Object.entries(data.distribution)) {
+                                    msg += `  ${node}: ${cnt} 个\n`;
+                                }
+                            }
+                            alert(msg);
                             this.fetchQueue();
                         } else {
                             alert('错误: ' + data.error);
