@@ -1760,7 +1760,9 @@ def api_queue_force_rebalance():
             # Distribute items proportionally based on weights, respecting routing rules
             updates = []
             failures = []
-            node_counts = {n['name']: 0 for n in pool}  # Track assignments per node
+            # Track assignments per node - include all nodes from both pools
+            all_node_names = set(n['name'] for n in pool) | set(n['name'] for n in bulk_pool)
+            node_counts = {name: 0 for name in all_node_names}
             
             for r in rows:
                 source = r['source']
@@ -1788,10 +1790,11 @@ def api_queue_force_rebalance():
                 
                 # Calculate total weight of candidates
                 candidate_weights = {n['name']: (pool_weights if source != 'bulk' else bulk_weights).get(n['name'], 1) for n in candidates}
-                total_weight = sum(candidate_weights.values())
+                total_weight = sum(candidate_weights.values()) or 1  # Avoid division by zero
                 
                 # Find the candidate with lowest current load relative to its weight
-                best_node = min(candidates, key=lambda n: node_counts[n['name']] / (candidate_weights[n['name']] / total_weight))
+                # Add small epsilon to avoid division by zero when node_counts is 0
+                best_node = min(candidates, key=lambda n: (node_counts[n['name']] + 0.001) / (candidate_weights[n['name']] / total_weight + 0.001))
                 node_counts[best_node['name']] += 1
                 updates.append((best_node['name'], r['id']))
             
@@ -2199,19 +2202,24 @@ EOF
                     </div>
                     <div class="table-responsive">
                         <table class="table table-custom table-hover mb-0">
-                            <thead><tr><th>节点名称</th><th class="text-center">堆积</th><th class="text-center">成功</th><th class="text-center">失败</th><th>预计时长</th><th>预计结束</th></tr></thead>
+                            <thead><tr><th>节点名称</th><th class="text-center">堆积</th><th class="text-center">变化</th><th class="text-center">成功</th><th class="text-center">失败</th><th>预计时长</th><th>预计结束</th></tr></thead>
                             <tbody>
                                 <template v-for="(s, name) in qStats.nodes" :key="name">
-                                <tr v-if="(s.pending || 0) > 0">
+                                <tr v-if="(s.pending || 0) > 0 || nodeChanges[name]">
                                     <td class="fw-medium">[[ name ]]</td>
                                     <td class="text-center"><span class="badge bg-warning text-dark">[[ s.pending || 0 ]]</span></td>
+                                    <td class="text-center">
+                                        <span v-if="nodeChanges[name] > 0" class="badge bg-success">+[[ nodeChanges[name] ]]</span>
+                                        <span v-else-if="nodeChanges[name] < 0" class="badge bg-danger">[[ nodeChanges[name] ]]</span>
+                                        <span v-else class="text-muted">-</span>
+                                    </td>
                                     <td class="text-center text-success">[[ s.sent || 0 ]]</td>
                                     <td class="text-center text-danger">[[ s.failed || 0 ]]</td>
                                     <td class="text-muted small">[[ getEstDuration(name, s.pending) ]]</td>
                                     <td class="text-muted small">[[ getEstFinishTime(name, s.pending) ]]</td>
                                 </tr>
                                 </template>
-                                <tr v-if="!hasPendingNodes"><td colspan="6" class="text-center text-muted py-4">暂无待发任务节点</td></tr>
+                                <tr v-if="!hasPendingNodes && Object.keys(nodeChanges).length === 0"><td colspan="7" class="text-center text-muted py-4">暂无待发任务节点</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -3113,6 +3121,7 @@ EOF
                     contactCount: 0,
                     bulkStatus: 'running',
                     rebalancing: false,
+                    nodeChanges: {},  // Track pending count changes per node
                     theme: 'auto',
                     draggingIndex: null,
                     dragOverIndex: null,
@@ -4097,13 +4106,43 @@ EOF
                 },
                 async rebalanceQueue() {
                     if(!confirm('智能重分配：仅处理分配到已禁用节点或不满足路由规则的任务\n\n继续吗？')) return;
+                    
+                    // Record current pending counts before rebalance
+                    const beforeCounts = {};
+                    for(const [name, stats] of Object.entries(this.qStats.nodes || {})) {
+                        beforeCounts[name] = stats.pending || 0;
+                    }
+                    
                     this.rebalancing = true;
+                    this.nodeChanges = {};
+                    
                     try {
                         const res = await fetch('/api/queue/rebalance', { method: 'POST' });
                         const data = await res.json();
                         if(res.ok) {
-                            alert(`成功重分配 ${data.count} 个任务`);
-                            this.fetchQueue();
+                            await this.fetchQueue();
+                            
+                            // Calculate changes
+                            const changes = {};
+                            const allNodes = new Set([...Object.keys(beforeCounts), ...Object.keys(this.qStats.nodes || {})]);
+                            for(const name of allNodes) {
+                                const before = beforeCounts[name] || 0;
+                                const after = (this.qStats.nodes[name]?.pending) || 0;
+                                const diff = after - before;
+                                if(diff !== 0) changes[name] = diff;
+                            }
+                            this.nodeChanges = changes;
+                            
+                            let msg = `成功重分配 ${data.count} 个任务`;
+                            if(Object.keys(changes).length > 0) {
+                                msg += '\n\n变化详情：\n';
+                                for(const [node, diff] of Object.entries(changes)) {
+                                    msg += `  ${node}: ${diff > 0 ? '+' : ''}${diff}\n`;
+                                }
+                            }
+                            alert(msg);
+                            
+                            setTimeout(() => { this.nodeChanges = {}; }, 30000);
                         } else {
                             alert('错误: ' + data.error);
                         }
@@ -4112,19 +4151,46 @@ EOF
                 },
                 async forceRebalanceQueue() {
                     if(!confirm('⚡ 强制均分：按各节点发送速率权重平均分配所有待发任务\n\n• 遵守分流规则（排除域名）\n• 负载轻的节点获得更多任务\n• 最终分配比例接近节点发送能力比\n\n确定继续吗？')) return;
+                    
+                    // Record current pending counts before rebalance
+                    const beforeCounts = {};
+                    for(const [name, stats] of Object.entries(this.qStats.nodes || {})) {
+                        beforeCounts[name] = stats.pending || 0;
+                    }
+                    
                     this.rebalancing = true;
+                    this.nodeChanges = {};  // Clear previous changes
+                    
                     try {
                         const res = await fetch('/api/queue/force_rebalance', { method: 'POST' });
                         const data = await res.json();
                         if(res.ok) {
-                            let msg = `✅ 强制均分完成！\n分配成功: ${data.count} 个\n分配失败: ${data.failed || 0} 个\n\n分配详情：\n`;
-                            if(data.distribution) {
-                                for(const [node, cnt] of Object.entries(data.distribution)) {
-                                    msg += `  ${node}: ${cnt} 个\n`;
+                            // Fetch updated queue data
+                            await this.fetchQueue();
+                            
+                            // Calculate changes for each node
+                            const changes = {};
+                            const allNodes = new Set([...Object.keys(beforeCounts), ...Object.keys(this.qStats.nodes || {})]);
+                            for(const name of allNodes) {
+                                const before = beforeCounts[name] || 0;
+                                const after = (this.qStats.nodes[name]?.pending) || 0;
+                                const diff = after - before;
+                                if(diff !== 0) {
+                                    changes[name] = diff;
                                 }
                             }
+                            this.nodeChanges = changes;
+                            
+                            // Build summary message
+                            let msg = `✅ 强制均分完成！\n分配成功: ${data.count} 个\n分配失败: ${data.failed || 0} 个\n\n变化详情：\n`;
+                            for(const [node, diff] of Object.entries(changes)) {
+                                const sign = diff > 0 ? '+' : '';
+                                msg += `  ${node}: ${sign}${diff}\n`;
+                            }
                             alert(msg);
-                            this.fetchQueue();
+                            
+                            // Clear changes display after 30 seconds
+                            setTimeout(() => { this.nodeChanges = {}; }, 30000);
                         } else {
                             alert('错误: ' + data.error);
                         }
