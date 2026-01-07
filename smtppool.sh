@@ -675,9 +675,9 @@ def node_sender(node_name, task_queue):
                 except: pass
             threading.Thread(target=update_db, daemon=True).start()
             
-            # 日志汇总
+            # 日志汇总（每10封或60秒输出一次）
             now = time.time()
-            if local_success >= 10 or local_fail >= 10 or (now - last_log_time) > 10:
+            if local_success >= 10 or local_fail >= 10 or (now - last_log_time) > 60:
                 if local_success > 0:
                     logger.info(f"✅ [{node_name}] 发送成功 {local_success} 封")
                 if local_fail > 0:
