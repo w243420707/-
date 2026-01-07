@@ -1865,9 +1865,6 @@ def force_rebalance_internal():
         stats = {n['name']: node_counts.get(n['name'], 0) for n in pool}
         
         return {"status": "ok", "count": len(updates), "failed": len(failures), "distribution": stats}
-    except Exception as e:
-        logger.error(f"Force rebalance error: {e}")
-        return jsonify({"error": str(e)}), 500
 
 @app.route('/api/bulk/control', methods=['POST'])
 @login_required
