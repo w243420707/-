@@ -446,11 +446,6 @@ class RelayHandler:
             pass
         
         return '250 OK: Queued for redundant delivery'
-        except:
-            pass
-        
-        # ✅ 与前面的 try 块同级缩进（8个空格，即2个缩进层级）
-        subject_short = subject[:30] if subject else '(无主题)'
         logger.info(
             f"📥 收到邮件 | 发件人: {envelope.mail_from} ..."
         )
