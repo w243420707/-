@@ -904,6 +904,14 @@ def worker_thread():
 
 # --- Web App ---
 app = Flask(__name__)
+
+# 确保Worker在首次请求前启动
+@app.before_first_request
+def init_background_workers():
+    """Flask启动后立即初始化后台Worker"""
+    start_services()
+    logger.info("✅ Flask初始化完成，后台Worker已启动")
+
 # Persistent Secret Key to prevent session logout on restart
 try:
     _cfg = load_config()
@@ -4632,14 +4640,9 @@ autorestart=true
 stderr_logfile=/var/log/smtp-relay/err.log
 stdout_logfile=/var/log/smtp-relay/out.log
 
-[program:smtp-worker]
-command=/usr/bin/python3 -c "import asyncio; from app import worker_loop; asyncio.run(worker_loop())"
-directory=/opt/smtp-relay
-autostart=true
-autorestart=true
-stderr_logfile=/var/log/smtp-relay/worker_err.log
-stdout_logfile=/var/log/smtp-relay/worker_out.log
-user=root
+# [program:smtp-worker] 已移除
+# Worker线程已通过manager_thread在主程序中启动，无需单独配置
+
 EOF
 
     ufw allow 8080/tcp >/dev/null 2>&1
