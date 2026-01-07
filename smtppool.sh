@@ -4350,7 +4350,7 @@ EOF
                     this.stopLogTimer();
                     this.fetchLogs();
                     this.logTimer = setInterval(() => {
-                        if(this.tab === 'monitor' && this.liveLogsEnabled) {
+                        if(this.liveLogsEnabled) {
                             this.fetchLogs();
                         }
                     }, 1000);  // 每1秒刷新
