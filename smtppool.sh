@@ -1283,14 +1283,14 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 initial_status = 'scheduled' if schedule_time and schedule_time > datetime.now() else 'pending'
                 scheduled_at_str = schedule_time.strftime('%Y-%m-%d %H:%M:%S') if schedule_time else None
                 
-                tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str))
+                tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject))
                 count += 1
                 
                 # Batch insert every 500 records for better performance
                 if len(tasks) >= 500:
                     with get_db() as conn:
                         conn.executemany(
-                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             tasks
                         )
                     tasks = []
@@ -1302,7 +1302,7 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
         if tasks:
             with get_db() as conn:
                 conn.executemany(
-                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     tasks
                 )
         logger.info(f"群发导入完成: 共 {count} 封邮件")
@@ -4353,7 +4353,7 @@ EOF
                         if(this.tab === 'monitor' && this.liveLogsEnabled) {
                             this.fetchLogs();
                         }
-                    }, 3000);  // 每3秒刷新
+                    }, 1000);  // 每1秒刷新
                 },
                 stopLogTimer() {
                     if(this.logTimer) {
