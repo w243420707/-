@@ -1765,12 +1765,13 @@ def force_rebalance_internal():
     
     # Pre-compute routing exclusion sets for each node
     node_exclusions = {}
-    for n in pool:
-        rules = n.get('routing_rules', '')
-        if rules and rules.strip():
-            node_exclusions[n['name']] = set(d.strip().lower() for d in rules.split(',') if d.strip())
-        else:
-            node_exclusions[n['name']] = set()
+    for n in pool + bulk_pool:
+        if n['name'] not in node_exclusions:
+            rules = n.get('routing_rules', '')
+            if rules and rules.strip():
+                node_exclusions[n['name']] = set(d.strip().lower() for d in rules.split(',') if d.strip())
+            else:
+                node_exclusions[n['name']] = set()
     
     with get_db() as conn:
         rows = conn.execute(
@@ -1804,10 +1805,11 @@ def force_rebalance_internal():
         # Calculate "flexibility" for each node (how many domains it can accept)
         # Nodes with fewer exclusions should get more tasks
         node_flexibility = {}
-        for n in pool:
-            excluded = node_exclusions.get(n['name'], set())
-            # Fewer exclusions = higher flexibility score
-            node_flexibility[n['name']] = 1.0 / (1 + len(excluded) * 0.5)  # More exclusions = lower score
+        for n in pool + bulk_pool:
+            if n['name'] not in node_flexibility:
+                excluded = node_exclusions.get(n['name'], set())
+                # Fewer exclusions = higher flexibility score
+                node_flexibility[n['name']] = 1.0 / (1 + len(excluded) * 0.5)  # More exclusions = lower score
         
         for r in rows:
             source = r['source']
