@@ -1593,21 +1593,8 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
         
         tasks = []
         count = 0
-        inserted_total = 0
-        # Use configurable batch size (fallback to 2000)
-        batch_size = cfg.get('web_config', {}).get('bulk_batch_size', 2000)
-
-        # Open a single DB connection for the entire import to avoid repeated connect/commit overhead
-        conn = get_db()
-        try:
-            # Temporary performance PRAGMAs for bulk write
-            try:
-                conn.execute("PRAGMA synchronous=OFF")
-                conn.execute("PRAGMA temp_store=MEMORY")
-            except Exception:
-                pass
-
-            for rcpt in recipients:
+        
+        for rcpt in recipients:
             try:
                 # === Anti-Spam Randomization ===
                 rand_sub = ''.join(random.choices(charset, k=random.randint(4, 8)))
@@ -1725,46 +1712,26 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject))
                 count += 1
                 
-                # Batch insert when tasks reach batch_size
-                if len(tasks) >= batch_size:
-                    try:
+                # Batch insert every 500 records for better performance
+                if len(tasks) >= 500:
+                    with get_db() as conn:
                         conn.executemany(
                             "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             tasks
                         )
-                        conn.commit()
-                        inserted_total += len(tasks)
-                        if inserted_total % (batch_size * 1) == 0:
-                            logger.info(f"群发导入进度: 已写入 {inserted_total} 条")
-                    except Exception as e:
-                        logger.error(f"批量插入失败: {e}")
                     tasks = []
             except Exception as e:
                 logger.error(f"准备邮件失败 {rcpt}: {e}")
                 continue
-            # Insert any remaining tasks
-            if tasks:
-                try:
-                    conn.executemany(
-                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        tasks
-                    )
-                    conn.commit()
-                    inserted_total += len(tasks)
-                except Exception as e:
-                    logger.error(f"批量插入剩余任务失败: {e}")
 
-            logger.info(f"群发导入完成: 共 {count} 封邮件, 已写入 {inserted_total} 条")
-        finally:
-            try:
-                # restore safe defaults
-                conn.execute("PRAGMA synchronous=NORMAL")
-            except Exception:
-                pass
-            try:
-                conn.close()
-            except Exception:
-                pass
+        # Insert remaining tasks
+        if tasks:
+            with get_db() as conn:
+                conn.executemany(
+                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    tasks
+                )
+        logger.info(f"群发导入完成: 共 {count} 封邮件")
     except Exception as e:
         logger.error(f"群发导入任务失败: {e}")
 
