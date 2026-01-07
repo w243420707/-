@@ -4623,18 +4623,22 @@ EOF
 </html>
 EOF
 
-    cat > /etc/supervisor/conf.d/smtp_web.conf << EOF
+    cat > /etc/supervisor/conf.d/smtp-relay.conf <<EOF
 [program:smtp-web]
-directory=$APP_DIR
-command=$VENV_DIR/bin/python3 app.py
+command=/usr/bin/python3 /opt/smtp-relay/app.py
+directory=/opt/smtp-relay
 autostart=true
 autorestart=true
-stderr_logfile=$LOG_DIR/err.log
-stdout_logfile=$LOG_DIR/out.log
-stdout_logfile_maxbytes=10MB
-stdout_logfile_backups=3
-stderr_logfile_maxbytes=10MB
-stderr_logfile_backups=3
+stderr_logfile=/var/log/smtp-relay/err.log
+stdout_logfile=/var/log/smtp-relay/out.log
+
+[program:smtp-worker]
+command=/usr/bin/python3 -c "import asyncio; from app import worker_loop; asyncio.run(worker_loop())"
+directory=/opt/smtp-relay
+autostart=true
+autorestart=true
+stderr_logfile=/var/log/smtp-relay/worker_err.log
+stdout_logfile=/var/log/smtp-relay/worker_out.log
 user=root
 EOF
 
