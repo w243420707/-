@@ -2128,21 +2128,27 @@ TRACKING_GIF = base64.b64decode(b'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAA
 
 @app.route('/track/<tid>')
 def track_email(tid):
-    try:
-        with get_db() as conn:
-            # 获取收件人信息
-            row = conn.execute("SELECT rcpt_tos FROM queue WHERE tracking_id=?", (tid,)).fetchone()
-            rcpt = '未知'
-            if row:
-                try:
-                    rcpt_list = json.loads(row['rcpt_tos'])
-                    rcpt = rcpt_list[0] if rcpt_list else '未知'
-                except:
-                    pass
-            conn.execute("UPDATE queue SET opened_at=datetime('now', '+08:00'), open_count=open_count+1 WHERE tracking_id=?", (tid,))
-            logger.info(f"📖 邮件被打开 | 收件人: {rcpt} | 追踪ID: {tid[:8]}...")
-    except Exception as e:
-        logger.error(f"跟踪错误: {e}")
+    for retry in range(3):
+        try:
+            with get_db() as conn:
+                # 获取收件人信息
+                row = conn.execute("SELECT rcpt_tos FROM queue WHERE tracking_id=?", (tid,)).fetchone()
+                rcpt = '未知'
+                if row:
+                    try:
+                        rcpt_list = json.loads(row['rcpt_tos'])
+                        rcpt = rcpt_list[0] if rcpt_list else '未知'
+                    except:
+                        pass
+                conn.execute("UPDATE queue SET opened_at=datetime('now', '+08:00'), open_count=open_count+1 WHERE tracking_id=?", (tid,))
+                logger.info(f"📖 邮件被打开 | 收件人: {rcpt} | 追踪ID: {tid[:8]}...")
+            break
+        except Exception as e:
+            if 'locked' in str(e) and retry < 2:
+                time.sleep(0.3 * (retry + 1))
+                continue
+            logger.error(f"跟踪错误: {e}")
+            break
     return TRACKING_GIF, 200, {'Content-Type': 'image/gif', 'Cache-Control': 'no-cache, no-store, must-revalidate'}
 
 # --- Custom SMTP class with authentication ---
