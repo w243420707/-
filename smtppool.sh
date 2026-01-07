@@ -793,7 +793,8 @@ def api_save():
             if added_nodes:
                 # New nodes added - do a force rebalance to distribute load
                 logger.info(f"🆕 New nodes detected: {added_nodes}, performing force rebalance...")
-                count = force_rebalance_internal()
+                result = force_rebalance_internal()
+                count = result.get('count', 0) if isinstance(result, dict) else 0
                 if count > 0:
                     logger.info(f"✅ Force rebalanced {count} items after adding new nodes")
             else:
