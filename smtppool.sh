@@ -734,19 +734,26 @@ def dispatcher_thread():
                 time.sleep(0.5)
                 continue
             
-            # 批量从数据库获取任务并分发
-            with get_db() as conn:
-                for node_name in nodes_need_tasks:
-                    if bulk_ctrl == 'paused':
-                        rows = conn.execute(
-                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
-                            (node_name,)
+        # 批量从数据库获取任务并分发（优先处理 relay 邮件）
+        with get_db() as conn:
+            for node_name in nodes_need_tasks:
+                # 优先分配 relay 邮件（不受群发暂停影响）
+                relay_rows = conn.execute(
+                    "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source='relay' ORDER BY id ASC LIMIT 10",
+                    (node_name,)
+                ).fetchall()
+                
+                # 再分配 bulk 邮件（如果群发没暂停）
+                bulk_rows = []
+                if bulk_ctrl != 'paused':
+                    remaining = 20 - len(relay_rows)
+                    if remaining > 0:
+                        bulk_rows = conn.execute(
+                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source='bulk' ORDER BY id ASC LIMIT ?",
+                            (node_name, remaining)
                         ).fetchall()
-                    else:
-                        rows = conn.execute(
-                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 20",
-                            (node_name,)
-                        ).fetchall()
+                
+                rows = list(relay_rows) + list(bulk_rows)
                     
                     if rows:
                         # 标记为处理中
