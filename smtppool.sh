@@ -2446,6 +2446,7 @@ EOF
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <style>
         /* Hide app until Vue is mounted (Vue 3 adds data-v-app when ready) */
@@ -2649,6 +2650,18 @@ EOF
                 </div>
 
                 <!-- Live Logs -->
+                <!-- System Charts (CPU, Memory, Swap, Network) -->
+                <div class="card mb-4">
+                    <div class="card-body">
+                        <div class="row g-3">
+                            <div class="col-md-3 col-6"><canvas id="chartCpu" height="80"></canvas></div>
+                            <div class="col-md-3 col-6"><canvas id="chartMem" height="80"></canvas></div>
+                            <div class="col-md-3 col-6"><canvas id="chartSwap" height="80"></canvas></div>
+                            <div class="col-md-3 col-6"><canvas id="chartNet" height="80"></canvas></div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="card mb-4">
                     <div class="card-header d-flex justify-content-between align-items-center">
                         <div class="d-flex align-items-center gap-2">
@@ -3759,7 +3772,16 @@ EOF
                     nodeSearch: '',
                     nodeViewMode: 'card'
                         ,
-                    system: { cpu_percent: 0, mem_total: 0, mem_used: 0, mem_percent: 0, swap_total: 0, swap_used: 0, swap_percent: 0, disk_percent: 0, net_sent: 0, net_recv: 0 }
+                    system: { cpu_percent: 0, mem_total: 0, mem_used: 0, mem_percent: 0, swap_total: 0, swap_used: 0, swap_percent: 0, disk_percent: 0, net_sent: 0, net_recv: 0 },
+                    history: {
+                        labels: [],
+                        cpu: [],
+                        mem: [],
+                        swap: [],
+                        net_rx: [],
+                        net_tx: []
+                    },
+                    charts: { cpu: null, mem: null, swap: null, net: null }
                     }
             },
             computed: {
@@ -3874,6 +3896,8 @@ EOF
                 this.fetchBulkStatus();
                 this.fetchTopDomains();
                 this.fetchSystemStats();
+                // Initialize charts after first fetch
+                setTimeout(() => { this.initCharts(); }, 500);
                 this.startLogTimer();  // 启动实时日志
                 setInterval(() => {
                     this.fetchQueue();
@@ -3917,8 +3941,50 @@ EOF
                             this.system.disk_percent = d.disk_percent || 0;
                             this.system.net_sent = d.net_sent || 0;
                             this.system.net_recv = d.net_recv || 0;
+                            // push history (keep last 60 samples)
+                            const ts = new Date().toLocaleTimeString();
+                            this.history.labels.push(ts);
+                            this.history.cpu.push(this.system.cpu_percent);
+                            this.history.mem.push(this.system.mem_percent);
+                            this.history.swap.push(this.system.swap_percent);
+                            // convert net cumulative to per-sample bytes
+                            if (this.history.net_rx.length === 0) {
+                                this.history.net_rx.push(this.system.net_recv);
+                                this.history.net_tx.push(this.system.net_sent);
+                            } else {
+                                const prev_rx = this.history.net_rx[this.history.net_rx.length - 1];
+                                const prev_tx = this.history.net_tx[this.history.net_tx.length - 1];
+                                this.history.net_rx.push(this.system.net_recv - prev_rx);
+                                this.history.net_tx.push(this.system.net_sent - prev_tx);
+                            }
+                            if (this.history.labels.length > 60) { this.history.labels.shift(); this.history.cpu.shift(); this.history.mem.shift(); this.history.swap.shift(); this.history.net_rx.shift(); this.history.net_tx.shift(); }
+                            if (!this.charts.cpu) this.initCharts();
+                            this.updateCharts();
                         }
                     } catch(e) { /* ignore */ }
+                },
+
+                initCharts() {
+                    try {
+                        const ctxCpu = document.getElementById('chartCpu').getContext('2d');
+                        const ctxMem = document.getElementById('chartMem').getContext('2d');
+                        const ctxSwap = document.getElementById('chartSwap').getContext('2d');
+                        const ctxNet = document.getElementById('chartNet').getContext('2d');
+                        const commonOpts = { responsive: true, maintainAspectRatio: false, interaction: { intersect: false } };
+                        this.charts.cpu = new Chart(ctxCpu, { type: 'line', data: { labels: this.history.labels, datasets: [{ label: 'CPU %', data: this.history.cpu, borderColor: '#ff6384', backgroundColor: 'rgba(255,99,132,0.1)', tension: 0.3 }] }, options: commonOpts });
+                        this.charts.mem = new Chart(ctxMem, { type: 'line', data: { labels: this.history.labels, datasets: [{ label: 'Mem %', data: this.history.mem, borderColor: '#36a2eb', backgroundColor: 'rgba(54,162,235,0.1)', tension: 0.3 }] }, options: commonOpts });
+                        this.charts.swap = new Chart(ctxSwap, { type: 'line', data: { labels: this.history.labels, datasets: [{ label: 'Swap %', data: this.history.swap, borderColor: '#888888', backgroundColor: 'rgba(128,128,128,0.1)', tension: 0.3 }] }, options: commonOpts });
+                        this.charts.net = new Chart(ctxNet, { type: 'line', data: { labels: this.history.labels, datasets: [{ label: 'RX bytes', data: this.history.net_rx, borderColor: '#4bc0c0', backgroundColor: 'rgba(75,192,192,0.1)', tension: 0.3 }, { label: 'TX bytes', data: this.history.net_tx, borderColor: '#ff9f40', backgroundColor: 'rgba(255,159,64,0.1)', tension: 0.3 }] }, options: commonOpts });
+                    } catch(e) { /* ignore chart init errors */ }
+                },
+
+                updateCharts() {
+                    try {
+                        if (this.charts.cpu) { this.charts.cpu.data.labels = this.history.labels; this.charts.cpu.data.datasets[0].data = this.history.cpu; this.charts.cpu.update(); }
+                        if (this.charts.mem) { this.charts.mem.data.labels = this.history.labels; this.charts.mem.data.datasets[0].data = this.history.mem; this.charts.mem.update(); }
+                        if (this.charts.swap) { this.charts.swap.data.labels = this.history.labels; this.charts.swap.data.datasets[0].data = this.history.swap; this.charts.swap.update(); }
+                        if (this.charts.net) { this.charts.net.data.labels = this.history.labels; this.charts.net.data.datasets[0].data = this.history.net_rx; this.charts.net.data.datasets[1].data = this.history.net_tx; this.charts.net.update(); }
+                    } catch(e) { /* ignore chart errors */ }
                 },
                 getGroupColor(index) {
                     const colors = ['#6366f1', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16'];
