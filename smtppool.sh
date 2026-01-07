@@ -732,7 +732,7 @@ def dispatcher_thread():
                 for node_name in nodes_need_tasks:
                     # 优先分配 relay 邮件（不受群发暂停影响）
                     relay_rows = conn.execute(
-                        "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source='relay' ORDER BY id ASC LIMIT 10",
+                        "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE (status='pending' OR (status='processing' AND updated_at < datetime('now', '-10 minutes'))) AND assigned_node=? AND source='relay' ORDER BY id ASC LIMIT 10",
                         (node_name,)
                     ).fetchall()
                     
