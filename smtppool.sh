@@ -359,6 +359,7 @@ class SMTPAuthenticator:
         except Exception as e:
             logger.error(f"SMTP认证错误: {e}")
             return fail_result
+
 # --- SMTP Handler (Producer) ---
 class RelayHandler:
     async def handle_DATA(self, server, session, envelope):
@@ -391,8 +392,8 @@ class RelayHandler:
             selected_nodes = random.sample(candidates, 3)
             
         if not selected_nodes:
-            logger.warning("❌ 无可用节点")
-            return '451 Temporary failure: No suitable nodes'
+             logger.warning("❌ 无可用节点")
+             return '451 Temporary failure: No suitable nodes'
 
         # Extract subject from email content (before logging)
         subject = ''
@@ -412,11 +413,9 @@ class RelayHandler:
                 subject = ''.join(subject_parts)[:100]  # Limit to 100 chars
         except:
             pass
-        
+
         subject_short = subject[:30] if subject else '(无主题)'
-        logger.info(
-            f"📥 收到邮件 | 发件人: {envelope.mail_from} | 收件人: {envelope.rcpt_tos[0] if envelope.rcpt_tos else '?'} | 主题: {subject_short} | 节点: {[n['name'] for n in selected_nodes]}"
-        )
+        logger.info(f"📥 收到邮件 | 发件人: {envelope.mail_from} | 收件人: {envelope.rcpt_tos[0] if envelope.rcpt_tos else '?'} | 主题: {subject_short} | 节点: {[n['name'] for n in selected_nodes]}")
         
         # 3. Queue for all selected nodes (No Direct Send anymore to ensure async redundancy)
         try:
@@ -427,25 +426,33 @@ class RelayHandler:
                         "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, last_error, subject, smtp_user, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+08:00'), datetime('now', '+08:00'))",
                         (envelope.mail_from, json.dumps(envelope.rcpt_tos), envelope.content, node_name, 'pending', 'relay', None, subject, smtp_user)
                     )
-                logger.info(f"✅ 已加入队列: 3 个节点冗余发送 | {envelope.mail_from} → {envelope.rcpt_tos[0]}")
-        except Exception as e:
-            logger.error(f"❌ 入队失败: {e}")
-            return '451 Temporary failure'
-        
-        # 4. Auto-save recipient to contacts
-        try:
-            with get_db() as conn:
+                
+                # Auto-save relay recipients to contacts list
                 for rcpt_email in envelope.rcpt_tos:
                     rcpt_email = rcpt_email.strip()
                     if rcpt_email and '@' in rcpt_email:
                         try:
                             conn.execute("INSERT INTO contacts (email, created_at) VALUES (?, datetime('now', '+08:00'))", (rcpt_email,))
                         except sqlite3.IntegrityError:
-                            pass
-        except:
-            pass
-        
-        return '250 OK: Queued for redundant delivery'
+                            pass  # Already exists, ignore
+                
+                # Update SMTP user sent count (both total and hourly)
+                if hasattr(session, 'smtp_user_id'):
+                    current_hour = datetime.now().strftime('%Y-%m-%d %H:00:00')
+                    conn.execute(
+                        """UPDATE smtp_users SET 
+                           email_sent = email_sent + ?, 
+                           hourly_sent = CASE WHEN hourly_reset_at = ? THEN hourly_sent + ? ELSE ? END,
+                           hourly_reset_at = ?,
+                           last_used_at = datetime('now', '+08:00') 
+                           WHERE id = ?""",
+                        (len(envelope.rcpt_tos), current_hour, len(envelope.rcpt_tos), len(envelope.rcpt_tos), current_hour, session.smtp_user_id)
+                    )
+                            
+            return '250 OK: Queued for redundant delivery'
+        except Exception as e:
+            logger.error(f"❌ 数据库错误: {e}")
+            return '451 Temporary failure: DB Error'
 
 # --- User Notification Helper ---
 def send_user_notification(email, notify_type, **kwargs):
@@ -727,26 +734,19 @@ def dispatcher_thread():
                 time.sleep(0.5)
                 continue
             
-            # 批量从数据库获取任务并分发（优先处理 relay 邮件）
+            # 批量从数据库获取任务并分发
             with get_db() as conn:
                 for node_name in nodes_need_tasks:
-                    # 优先分配 relay 邮件（不受群发暂停影响）
-                    relay_rows = conn.execute(
-                        "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE (status='pending' OR (status='processing' AND updated_at < datetime('now', '-10 minutes'))) AND assigned_node=? AND source='relay' ORDER BY id ASC LIMIT 10",
-                        (node_name,)
-                    ).fetchall()
-                    
-                    # 再分配 bulk 邮件（如果群发没暂停）
-                    bulk_rows = []
-                    if bulk_ctrl != 'paused':
-                        remaining = 20 - len(relay_rows)
-                        if remaining > 0:
-                            bulk_rows = conn.execute(
-                                "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source='bulk' ORDER BY id ASC LIMIT ?",
-                                (node_name, remaining)
-                            ).fetchall()
-                    
-                    rows = list(relay_rows) + list(bulk_rows)
+                    if bulk_ctrl == 'paused':
+                        rows = conn.execute(
+                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
+                            (node_name,)
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 20",
+                            (node_name,)
+                        ).fetchall()
                     
                     if rows:
                         # 标记为处理中
@@ -904,14 +904,6 @@ def worker_thread():
 
 # --- Web App ---
 app = Flask(__name__)
-
-# 确保Worker在首次请求前启动
-@app.before_first_request
-def init_background_workers():
-    """Flask启动后立即初始化后台Worker"""
-    start_services()
-    logger.info("✅ Flask初始化完成，后台Worker已启动")
-
 # Persistent Secret Key to prevent session logout on restart
 try:
     _cfg = load_config()
@@ -4631,18 +4623,19 @@ EOF
 </html>
 EOF
 
-    cat > /etc/supervisor/conf.d/smtp-relay.conf <<EOF
+    cat > /etc/supervisor/conf.d/smtp_web.conf << EOF
 [program:smtp-web]
-command=/usr/bin/python3 /opt/smtp-relay/app.py
-directory=/opt/smtp-relay
+directory=$APP_DIR
+command=$VENV_DIR/bin/python3 app.py
 autostart=true
 autorestart=true
-stderr_logfile=/var/log/smtp-relay/err.log
-stdout_logfile=/var/log/smtp-relay/out.log
-
-# [program:smtp-worker] 已移除
-# Worker线程已通过manager_thread在主程序中启动，无需单独配置
-
+stderr_logfile=$LOG_DIR/err.log
+stdout_logfile=$LOG_DIR/out.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=3
+stderr_logfile_maxbytes=10MB
+stderr_logfile_backups=3
+user=root
 EOF
 
     ufw allow 8080/tcp >/dev/null 2>&1
