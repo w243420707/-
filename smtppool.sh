@@ -543,9 +543,12 @@ def send_user_notification(email, notify_type, **kwargs):
         logger.error(f"发送通知邮件失败: {e}")
         return False
 
-# --- Queue Worker (Multi-threaded per Node) ---
-# 全局统计（线程安全）
+# --- Queue Worker (Multi-threaded per Node with Memory Queue) ---
+# 高性能架构：调度器读取数据库 -> 分发到节点内存队列 -> 节点线程从内存队列取任务
 import threading
+from queue import Queue, Empty
+from concurrent.futures import ThreadPoolExecutor
+
 worker_stats = {
     'success': 0,
     'fail': 0,
@@ -553,12 +556,29 @@ worker_stats = {
     'minute_count': 0,
     'lock': threading.Lock()
 }
-node_workers = {}  # 存储每个节点的工作线程
 worker_stop_event = threading.Event()
 
-def node_worker(node_name):
-    """每个节点独立的发送线程"""
-    logger.info(f"🚀 节点工作线程启动: {node_name}")
+# 每个节点的内存任务队列
+node_queues = {}  # { 'node_name': Queue() }
+node_workers = {}  # 节点工作线程
+node_queue_lock = threading.Lock()
+
+# 配置缓存（减少磁盘读取）
+_config_cache = {'data': None, 'time': 0}
+_config_lock = threading.Lock()
+
+def get_cached_config(max_age=2):
+    """获取缓存的配置（最多缓存2秒）"""
+    with _config_lock:
+        now = time.time()
+        if _config_cache['data'] is None or (now - _config_cache['time']) > max_age:
+            _config_cache['data'] = load_config()
+            _config_cache['time'] = now
+        return _config_cache['data']
+
+def node_sender(node_name, task_queue):
+    """节点发送线程：从内存队列获取任务并发送"""
+    logger.info(f"🚀 节点发送线程启动: {node_name}")
     
     node_hourly_count = {'hour': -1, 'count': 0}
     last_log_time = time.time()
@@ -567,88 +587,27 @@ def node_worker(node_name):
     
     while not worker_stop_event.is_set():
         try:
-            cfg = load_config()
+            # 从内存队列获取任务（阻塞等待最多1秒）
+            try:
+                task = task_queue.get(timeout=1)
+            except Empty:
+                continue
+            
+            cfg = get_cached_config()
             pool_cfg = {n['name']: n for n in cfg.get('downstream_pool', [])}
             node = pool_cfg.get(node_name)
             
-            # 节点被删除或禁用，退出线程
             if not node or not node.get('enabled', True):
-                logger.info(f"🛑 节点 {node_name} 已禁用/删除，线程退出")
-                break
-            
-            # 检查群发控制状态
-            bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
-            
-            # 获取该节点的待发送任务
-            with get_db() as conn:
-                if bulk_ctrl == 'paused':
-                    # 暂停时只处理非群发任务
-                    row = conn.execute(
-                        "SELECT * FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 1",
-                        (node_name,)
-                    ).fetchone()
-                else:
-                    row = conn.execute(
-                        "SELECT * FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 1",
-                        (node_name,)
-                    ).fetchone()
-            
-            if not row:
-                time.sleep(0.5)
+                # 节点已禁用，任务放回队列等待重分配
+                task_queue.put(task)
+                time.sleep(1)
                 continue
             
-            row_id = row['id']
-            source = row['source']
+            row_id = task['id']
+            rcpt_tos = task['rcpt_tos']
+            msg_content = task['content']
+            source = task['source']
             is_bulk = (source == 'bulk')
-            
-            # 获取收件人信息
-            try:
-                rcpt_tos = json.loads(row['rcpt_tos'])
-                rcpt_domain = rcpt_tos[0].split('@')[-1].lower().strip() if rcpt_tos else ''
-            except:
-                rcpt_tos = []
-                rcpt_domain = ''
-            
-            # 检查域名是否被排除
-            rules = node.get('routing_rules', '')
-            if rules and rules.strip():
-                excluded = [d.strip().lower() for d in rules.split(',') if d.strip()]
-                if rcpt_domain in excluded:
-                    # 重新分配到其他节点
-                    available_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True) and (not is_bulk or n.get('allow_bulk', True))]
-                    new_node = select_node_for_recipient(available_nodes, rcpt_tos[0] if rcpt_tos else '', cfg.get('limit_config', {}), source=source)
-                    if new_node:
-                        with get_db() as conn:
-                            conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
-                    else:
-                        with get_db() as conn:
-                            conn.execute("UPDATE queue SET status='failed', last_error=? WHERE id=?", (f'No node for domain: {rcpt_domain}', row_id))
-                    continue
-            
-            # 群发限速检查
-            if is_bulk:
-                # 小时限额检查
-                max_ph = int(node.get('max_per_hour', 0))
-                if max_ph > 0:
-                    current_hour = (datetime.utcnow() + timedelta(hours=8)).hour
-                    if node_hourly_count['hour'] != current_hour:
-                        with get_db() as conn:
-                            cnt = conn.execute(
-                                "SELECT COUNT(*) FROM queue WHERE assigned_node=? AND status='sent' AND updated_at > datetime('now', '+08:00', '-1 hour')", 
-                                (node_name,)
-                            ).fetchone()[0]
-                        node_hourly_count = {'hour': current_hour, 'count': cnt}
-                    
-                    if node_hourly_count['count'] >= max_ph:
-                        logger.warning(f"⚠️ 节点 {node_name} 已达小时限额 ({node_hourly_count['count']}/{max_ph})，等待60秒")
-                        time.sleep(60)
-                        continue
-            
-            # 标记为处理中
-            with get_db() as conn:
-                updated = conn.execute("UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id=? AND status='pending'", (row_id,)).rowcount
-            if updated == 0:
-                continue  # 已被其他线程处理
             
             error_msg = ""
             success = False
@@ -666,9 +625,7 @@ def node_worker(node_name):
                 elif node.get('sender_email'):
                     sender = node['sender_email']
                 else:
-                    sender = row['mail_from'] or node.get('username')
-                
-                msg_content = row['content']
+                    sender = task.get('mail_from') or node.get('username')
                 
                 # Header rewrite
                 if sender and (node.get('sender_domain') or node.get('sender_email')):
@@ -701,12 +658,9 @@ def node_worker(node_name):
                 local_success += 1
                 node_hourly_count['count'] += 1
                 
-                # 更新全局统计
                 with worker_stats['lock']:
                     worker_stats['success'] += 1
                     worker_stats['minute_count'] += 1
-                    
-                    # 每分钟输出一次速度统计
                     if time.time() - worker_stats['minute_start'] >= 60:
                         logger.info(f"📊 发送速度: {worker_stats['minute_count']} 封/分钟 | 总计: {worker_stats['success']} 封")
                         worker_stats['minute_start'] = time.time()
@@ -718,20 +672,25 @@ def node_worker(node_name):
                 with worker_stats['lock']:
                     worker_stats['fail'] += 1
             
-            # 更新数据库
-            with get_db() as conn:
-                if success:
-                    conn.execute("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", (row_id,))
-                else:
-                    conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", (error_msg, row_id))
+            # 批量更新数据库（使用单独线程，不阻塞发送）
+            # 使用默认参数捕获当前值，避免闭包问题
+            def update_db(rid=row_id, ok=success, err=error_msg):
+                try:
+                    with get_db() as conn:
+                        if ok:
+                            conn.execute("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", (rid,))
+                        else:
+                            conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", (err[:200], rid))
+                except: pass
+            threading.Thread(target=update_db, daemon=True).start()
             
-            # 日志汇总（每10封或10秒输出一次）
+            # 日志汇总
             now = time.time()
             if local_success >= 10 or local_fail >= 10 or (now - last_log_time) > 10:
                 if local_success > 0:
-                    logger.info(f"✅ [{node_name}] 发送成功 {local_success} 封 | 最近: {rcpt_tos[0] if rcpt_tos else '?'}")
+                    logger.info(f"✅ [{node_name}] 发送成功 {local_success} 封")
                 if local_fail > 0:
-                    logger.error(f"❌ [{node_name}] 发送失败 {local_fail} 封 | 最近错误: {error_msg[:50]}")
+                    logger.error(f"❌ [{node_name}] 发送失败 {local_fail} 封 | 错误: {error_msg[:50]}")
                 local_success = 0
                 local_fail = 0
                 last_log_time = now
@@ -744,15 +703,95 @@ def node_worker(node_name):
                 delay = random.uniform(min_int, max_int)
                 time.sleep(delay)
             
+            task_queue.task_done()
+            
         except Exception as e:
-            logger.error(f"[{node_name}] 工作线程错误: {e}")
-            time.sleep(5)
+            logger.error(f"[{node_name}] 发送线程错误: {e}")
+            time.sleep(1)
     
-    logger.info(f"🛑 节点工作线程退出: {node_name}")
+    logger.info(f"🛑 节点发送线程退出: {node_name}")
+
+def dispatcher_thread():
+    """调度器线程：从数据库读取任务，分发到节点内存队列"""
+    logger.info("📦 任务调度器启动")
+    
+    while not worker_stop_event.is_set():
+        try:
+            cfg = get_cached_config()
+            bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
+            
+            # 获取所有启用的节点
+            enabled_nodes = {n['name'] for n in cfg.get('downstream_pool', []) if n.get('enabled', True)}
+            
+            # 确保每个节点都有队列和工作线程
+            with node_queue_lock:
+                for node_name in enabled_nodes:
+                    if node_name not in node_queues:
+                        node_queues[node_name] = Queue(maxsize=100)  # 每个节点最多缓存100个任务
+                    if node_name not in node_workers or not node_workers[node_name].is_alive():
+                        q = node_queues[node_name]
+                        t = threading.Thread(target=node_sender, args=(node_name, q), daemon=True)
+                        t.start()
+                        node_workers[node_name] = t
+                        logger.info(f"🆕 启动节点发送线程: {node_name}")
+            
+            # 找出需要补充任务的节点（队列少于50个任务）
+            nodes_need_tasks = []
+            for node_name in enabled_nodes:
+                if node_name in node_queues and node_queues[node_name].qsize() < 50:
+                    nodes_need_tasks.append(node_name)
+            
+            if not nodes_need_tasks:
+                time.sleep(0.5)
+                continue
+            
+            # 批量从数据库获取任务并分发
+            with get_db() as conn:
+                for node_name in nodes_need_tasks:
+                    if bulk_ctrl == 'paused':
+                        rows = conn.execute(
+                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
+                            (node_name,)
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 20",
+                            (node_name,)
+                        ).fetchall()
+                    
+                    if rows:
+                        # 标记为处理中
+                        ids = [r['id'] for r in rows]
+                        placeholders = ','.join(['?'] * len(ids))
+                        conn.execute(f"UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id IN ({placeholders})", ids)
+                        
+                        # 放入节点队列
+                        for row in rows:
+                            try:
+                                task = {
+                                    'id': row['id'],
+                                    'mail_from': row['mail_from'],
+                                    'rcpt_tos': json.loads(row['rcpt_tos']),
+                                    'content': row['content'],
+                                    'source': row['source']
+                                }
+                                node_queues[node_name].put(task, timeout=1)
+                            except:
+                                pass
+            
+            time.sleep(0.1)  # 快速循环分发
+            
+        except Exception as e:
+            logger.error(f"调度器错误: {e}")
+            time.sleep(1)
 
 def manager_thread():
-    """管理线程：负责维护任务、启动/停止节点工作线程"""
-    logger.info("👷 队列管理器启动 (多线程模式)")
+    """管理线程：负责系统维护任务"""
+    logger.info("👷 队列管理器启动 (高性能模式)")
+    
+    # 启动调度器
+    dispatcher = threading.Thread(target=dispatcher_thread, daemon=True)
+    dispatcher.start()
     
     last_cleanup_time = 0
     last_stuck_check_time = 0
@@ -761,24 +800,14 @@ def manager_thread():
     
     while not worker_stop_event.is_set():
         try:
-            cfg = load_config()
+            cfg = get_cached_config()
             now = time.time()
             
-            # 获取所有启用的节点
-            enabled_nodes = {n['name'] for n in cfg.get('downstream_pool', []) if n.get('enabled', True)}
-            
-            # 启动新节点的工作线程
-            for node_name in enabled_nodes:
-                if node_name not in node_workers or not node_workers[node_name].is_alive():
-                    t = threading.Thread(target=node_worker, args=(node_name,), daemon=True)
-                    t.start()
-                    node_workers[node_name] = t
-                    logger.info(f"🆕 启动节点工作线程: {node_name}")
-            
-            # 清理已禁用节点的线程记录
-            dead_nodes = [n for n in node_workers if n not in enabled_nodes]
-            for n in dead_nodes:
-                del node_workers[n]
+            # 确保调度器运行
+            if not dispatcher.is_alive():
+                dispatcher = threading.Thread(target=dispatcher_thread, daemon=True)
+                dispatcher.start()
+                logger.warning("🔄 重启调度器线程")
             
             # --- Reset stuck 'processing' items (every 2 minutes) ---
             if now - last_stuck_check_time > 120:
