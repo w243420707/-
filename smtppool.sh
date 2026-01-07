@@ -714,44 +714,6 @@ def node_sender(node_name, task_queue):
                 else:
                     sender = task.get('mail_from') or node.get('username')
                 
-                # If content is stored as JSON (deferred), reconstruct message now
-                if not isinstance(msg_content, (bytes, bytearray)):
-                    try:
-                        parsed = None
-                        try:
-                            parsed = json.loads(msg_content)
-                        except Exception:
-                            parsed = None
-                        if isinstance(parsed, dict) and ('plain' in parsed or 'html' in parsed):
-                            m = MIMEMultipart('alternative')
-                            subj = task.get('subject') or parsed.get('subject') or ''
-                            if subj:
-                                m['Subject'] = subj
-                            m['To'] = ','.join(rcpt_tos) if isinstance(rcpt_tos, (list, tuple)) else str(rcpt_tos)
-                            # Add Date and Message-ID for better deliverability
-                            try:
-                                m['Date'] = formatdate(localtime=True)
-                            except:
-                                pass
-                            try:
-                                m['Message-ID'] = make_msgid()
-                            except:
-                                pass
-                            # From will be set/overwritten below
-                            plain_part = MIMEText(parsed.get('plain', ''), 'plain', 'utf-8')
-                            html_part = MIMEText(parsed.get('html', ''), 'html', 'utf-8')
-                            m.attach(plain_part)
-                            m.attach(html_part)
-                            msg_content = m.as_bytes()
-                        else:
-                            # fallback: try to convert string to bytes
-                            msg_content = msg_content.encode('utf-8') if isinstance(msg_content, str) else msg_content
-                    except Exception:
-                        try:
-                            msg_content = msg_content.encode('utf-8') if isinstance(msg_content, str) else msg_content
-                        except:
-                            pass
-
                 # Header rewrite
                 if sender and (node.get('sender_domain') or node.get('sender_email')):
                     try:
@@ -925,13 +887,12 @@ def dispatcher_thread():
                         for row in rows:
                             try:
                                 task = {
-                                            'id': row['id'],
-                                            'mail_from': row['mail_from'],
-                                            'rcpt_tos': json.loads(row['rcpt_tos']),
-                                            'content': row['content'],
-                                            'source': row['source'],
-                                            'subject': row.get('subject') if 'subject' in row.keys() else None
-                                        }
+                                    'id': row['id'],
+                                    'mail_from': row['mail_from'],
+                                    'rcpt_tos': json.loads(row['rcpt_tos']),
+                                    'content': row['content'],
+                                    'source': row['source']
+                                }
                                 node_queues[node_name].put(task, timeout=1)
                             except Exception as e:
                                 failed_ids.append(row['id'])
@@ -1634,7 +1595,7 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
         count = 0
         inserted_total = 0
         # Use configurable batch size (fallback to 2000)
-        batch_size = cfg.get('web_config', {}).get('bulk_batch_size', 5000)
+        batch_size = cfg.get('web_config', {}).get('bulk_batch_size', 2000)
 
         # Open a single DB connection for the entire import to avoid repeated connect/commit overhead
         conn = get_db()
@@ -1647,37 +1608,37 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 pass
 
             for rcpt in recipients:
-                try:
-                    # === Anti-Spam Randomization ===
-                    rand_sub = ''.join(random.choices(charset, k=random.randint(4, 8)))
-                    # Select random sentences to simulate normal chat
-                    rand_chat = ' '.join(random.choices(chat_corpus, k=random.randint(5, 12)))
-                    
-                    # Randomly select subject and body
-                    current_subject = random.choice(subjects) if subjects else "(No Subject)"
-                    current_body = random.choice(bodies) if bodies else ""
+            try:
+                # === Anti-Spam Randomization ===
+                rand_sub = ''.join(random.choices(charset, k=random.randint(4, 8)))
+                # Select random sentences to simulate normal chat
+                rand_chat = ' '.join(random.choices(chat_corpus, k=random.randint(5, 12)))
+                
+                # Randomly select subject and body
+                current_subject = random.choice(subjects) if subjects else "(No Subject)"
+                current_body = random.choice(bodies) if bodies else ""
 
-                    tracking_id = str(uuid.uuid4())
-                    tracking_html = ""
-                    if tracking_base:
-                        tracking_url = f"{tracking_base}/track/{tracking_id}"
-                        tracking_html = f"<img src='{tracking_url}' width='1' height='1' alt='' style='display:none;border:0;'>"
+                tracking_id = str(uuid.uuid4())
+                tracking_html = ""
+                if tracking_base:
+                    tracking_url = f"{tracking_base}/track/{tracking_id}"
+                    tracking_html = f"<img src='{tracking_url}' width='1' height='1' alt='' style='display:none;border:0;'>"
 
-                    # === Enhanced Subject Randomization ===
-                    # Randomly choose subject format
-                    subject_formats = [
-                        f"{current_subject} {rand_sub}",
-                        f"{current_subject} - {rand_sub}",
-                        f"Re: {current_subject}",
-                        f"Fwd: {current_subject}",
-                        f"{current_subject}",
-                        f"{current_subject} #{rand_sub[:4]}",
-                    ]
-                    final_subject = random.choice(subject_formats)
-                    
-                    # === Build More Natural Email ===
-                    # Extract recipient name from email for personalization
-                    rcpt_name = rcpt.split('@')[0].replace('.', ' ').replace('_', ' ').replace('-', ' ').title()[:20]
+                # === Enhanced Subject Randomization ===
+                # Randomly choose subject format
+                subject_formats = [
+                    f"{current_subject} {rand_sub}",
+                    f"{current_subject} - {rand_sub}",
+                    f"Re: {current_subject}",
+                    f"Fwd: {current_subject}",
+                    f"{current_subject}",
+                    f"{current_subject} #{rand_sub[:4]}",
+                ]
+                final_subject = random.choice(subject_formats)
+                
+                # === Build More Natural Email ===
+                # Extract recipient name from email for personalization
+                rcpt_name = rcpt.split('@')[0].replace('.', ' ').replace('_', ' ').replace('-', ' ').title()[:20]
                 
                 # Random greetings and closings
                 greetings = ['', f'Hi,', f'Hello,', f'Hey,', f'{rcpt_name},', f'Hi {rcpt_name},', f'Dear {rcpt_name},', '你好，', '您好，', '']
@@ -1761,9 +1722,7 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 initial_status = 'scheduled' if schedule_time and schedule_time > datetime.now() else 'pending'
                 scheduled_at_str = schedule_time.strftime('%Y-%m-%d %H:%M:%S') if schedule_time else None
                 
-                # Delay generating raw bytes; store plain and html instead to speed up import
-                content_obj = json.dumps({'plain': plain_text, 'html': final_body})
-                tasks.append(('', json.dumps([rcpt]), content_obj, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject))
+                tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject))
                 count += 1
                 
                 # Batch insert when tasks reach batch_size
@@ -1780,9 +1739,9 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                     except Exception as e:
                         logger.error(f"批量插入失败: {e}")
                     tasks = []
-                except Exception as e:
-                    logger.error(f"准备邮件失败 {rcpt}: {e}")
-                    continue
+            except Exception as e:
+                logger.error(f"准备邮件失败 {rcpt}: {e}")
+                continue
             # Insert any remaining tasks
             if tasks:
                 try:
@@ -3294,9 +3253,9 @@ EOF
                                     <div class="form-text">用于生成邮件打开追踪链接，请填写公网可访问地址。</div>
                                 </div>
                                 <div class="mb-3">
-                                    <label class="form-label">批量导入每批写入大小 (bulk_batch_size)</label>
+                                    <label class="form-label">批量导入批次大小 (bulk_batch_size)</label>
                                     <input type="number" v-model.number="config.web_config.bulk_batch_size" class="form-control" placeholder="5000">
-                                    <div class="form-text">每次批量写入数据库的条目数，较大值可提高导入速度，但会增加内存与 IO 压力。</div>
+                                    <div class="form-text">控制单次批量写入数据库的条数，较大值能提高导入速度，但会消耗更多内存。建议在 1000-20000 范围内测试。</div>
                                 </div>
                             </div>
                         </div>
