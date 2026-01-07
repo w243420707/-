@@ -666,7 +666,10 @@ def worker_thread():
                     success = True
                     # 详细日志：收件人、主题、节点、来源
                     rcpt_str = rcpt_tos[0] if rcpt_tos else '未知'
-                    subject_str = row.get('subject', '')[:30] if row.get('subject') else ''
+                    try:
+                        subject_str = (row['subject'] or '')[:30]
+                    except:
+                        subject_str = ''
                     logger.info(f"✅ 发送成功 | 收件人: {rcpt_str} | 主题: {subject_str} | 节点: {node_name} | 来源: {source}")
                     
                     # Update hourly count (All traffic counts towards limit)
@@ -676,7 +679,10 @@ def worker_thread():
                 except Exception as e:
                     error_msg = str(e)
                     rcpt_str = rcpt_tos[0] if rcpt_tos else '未知'
-                    subject_str = row.get('subject', '')[:30] if row.get('subject') else ''
+                    try:
+                        subject_str = (row['subject'] or '')[:30]
+                    except:
+                        subject_str = ''
                     logger.error(f"❌ 发送失败 | 收件人: {rcpt_str} | 主题: {subject_str} | 节点: {node_name} | 错误: {e}")
 
                 # Update DB
