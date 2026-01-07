@@ -1647,37 +1647,37 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 pass
 
             for rcpt in recipients:
-            try:
-                # === Anti-Spam Randomization ===
-                rand_sub = ''.join(random.choices(charset, k=random.randint(4, 8)))
-                # Select random sentences to simulate normal chat
-                rand_chat = ' '.join(random.choices(chat_corpus, k=random.randint(5, 12)))
-                
-                # Randomly select subject and body
-                current_subject = random.choice(subjects) if subjects else "(No Subject)"
-                current_body = random.choice(bodies) if bodies else ""
+                try:
+                    # === Anti-Spam Randomization ===
+                    rand_sub = ''.join(random.choices(charset, k=random.randint(4, 8)))
+                    # Select random sentences to simulate normal chat
+                    rand_chat = ' '.join(random.choices(chat_corpus, k=random.randint(5, 12)))
+                    
+                    # Randomly select subject and body
+                    current_subject = random.choice(subjects) if subjects else "(No Subject)"
+                    current_body = random.choice(bodies) if bodies else ""
 
-                tracking_id = str(uuid.uuid4())
-                tracking_html = ""
-                if tracking_base:
-                    tracking_url = f"{tracking_base}/track/{tracking_id}"
-                    tracking_html = f"<img src='{tracking_url}' width='1' height='1' alt='' style='display:none;border:0;'>"
+                    tracking_id = str(uuid.uuid4())
+                    tracking_html = ""
+                    if tracking_base:
+                        tracking_url = f"{tracking_base}/track/{tracking_id}"
+                        tracking_html = f"<img src='{tracking_url}' width='1' height='1' alt='' style='display:none;border:0;'>"
 
-                # === Enhanced Subject Randomization ===
-                # Randomly choose subject format
-                subject_formats = [
-                    f"{current_subject} {rand_sub}",
-                    f"{current_subject} - {rand_sub}",
-                    f"Re: {current_subject}",
-                    f"Fwd: {current_subject}",
-                    f"{current_subject}",
-                    f"{current_subject} #{rand_sub[:4]}",
-                ]
-                final_subject = random.choice(subject_formats)
-                
-                # === Build More Natural Email ===
-                # Extract recipient name from email for personalization
-                rcpt_name = rcpt.split('@')[0].replace('.', ' ').replace('_', ' ').replace('-', ' ').title()[:20]
+                    # === Enhanced Subject Randomization ===
+                    # Randomly choose subject format
+                    subject_formats = [
+                        f"{current_subject} {rand_sub}",
+                        f"{current_subject} - {rand_sub}",
+                        f"Re: {current_subject}",
+                        f"Fwd: {current_subject}",
+                        f"{current_subject}",
+                        f"{current_subject} #{rand_sub[:4]}",
+                    ]
+                    final_subject = random.choice(subject_formats)
+                    
+                    # === Build More Natural Email ===
+                    # Extract recipient name from email for personalization
+                    rcpt_name = rcpt.split('@')[0].replace('.', ' ').replace('_', ' ').replace('-', ' ').title()[:20]
                 
                 # Random greetings and closings
                 greetings = ['', f'Hi,', f'Hello,', f'Hey,', f'{rcpt_name},', f'Hi {rcpt_name},', f'Dear {rcpt_name},', '你好，', '您好，', '']
@@ -1780,9 +1780,9 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                     except Exception as e:
                         logger.error(f"批量插入失败: {e}")
                     tasks = []
-            except Exception as e:
-                logger.error(f"准备邮件失败 {rcpt}: {e}")
-                continue
+                except Exception as e:
+                    logger.error(f"准备邮件失败 {rcpt}: {e}")
+                    continue
             # Insert any remaining tasks
             if tasks:
                 try:
