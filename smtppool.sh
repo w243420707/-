@@ -358,12 +358,10 @@ class RelayHandler:
             selected_nodes = random.sample(candidates, 3)
             
         if not selected_nodes:
-             logger.warning("❌ No suitable nodes found for redundancy")
+             logger.warning("❌ 无可用节点")
              return '451 Temporary failure: No suitable nodes'
 
-        logger.info(f"📥 收到邮件 | 发件人: {envelope.mail_from} | 收件人: {envelope.rcpt_tos} | 分配节点: {[n['name'] for n in selected_nodes]}")
-        
-        # Extract subject from email content
+        # Extract subject from email content (before logging)
         subject = ''
         smtp_user = getattr(session, 'smtp_user', None)
         try:
@@ -381,6 +379,9 @@ class RelayHandler:
                 subject = ''.join(subject_parts)[:100]  # Limit to 100 chars
         except:
             pass
+
+        subject_short = subject[:30] if subject else '(无主题)'
+        logger.info(f"📥 收到邮件 | 发件人: {envelope.mail_from} | 收件人: {envelope.rcpt_tos[0] if envelope.rcpt_tos else '?'} | 主题: {subject_short} | 节点: {[n['name'] for n in selected_nodes]}")
         
         # 3. Queue for all selected nodes (No Direct Send anymore to ensure async redundancy)
         try:
@@ -663,7 +664,10 @@ def worker_thread():
                             s.sendmail(sender, rcpt_tos, msg_content)
                     
                     success = True
-                    logger.info(f"✅ 发送成功 ID:{row_id} 经由 {node_name} (来源: {source})")
+                    # 详细日志：收件人、主题、节点、来源
+                    rcpt_str = rcpt_tos[0] if rcpt_tos else '未知'
+                    subject_str = row.get('subject', '')[:30] if row.get('subject') else ''
+                    logger.info(f"✅ 发送成功 | 收件人: {rcpt_str} | 主题: {subject_str} | 节点: {node_name} | 来源: {source}")
                     
                     # Update hourly count (All traffic counts towards limit)
                     if node_name in node_hourly_counts:
@@ -671,7 +675,9 @@ def worker_thread():
 
                 except Exception as e:
                     error_msg = str(e)
-                    logger.error(f"⚠️ 发送失败 ID:{row_id} 经由 {node_name}: {e}")
+                    rcpt_str = rcpt_tos[0] if rcpt_tos else '未知'
+                    subject_str = row.get('subject', '')[:30] if row.get('subject') else ''
+                    logger.error(f"❌ 发送失败 | 收件人: {rcpt_str} | 主题: {subject_str} | 节点: {node_name} | 错误: {e}")
 
                 # Update DB
                 with get_db() as conn:
