@@ -888,9 +888,17 @@ def select_weighted_node(nodes, global_limit, queue_counts=None):
             if queue_counts:
                 pending = queue_counts.get(node['name'], 0)
                 # Use inverse of pending count as multiplier (more pending = lower weight)
-                # Add 1 to avoid division by zero, use sqrt to soften the effect
-                load_factor = 1 / (1 + (pending / 100) ** 0.5)
+                # Stronger penalty for high load
+                load_factor = 1 / (1 + (pending / 50) ** 0.7)
                 speed = speed * load_factor
+            
+            # Factor in flexibility (nodes with no exclusion rules should get more tasks)
+            rules = node.get('routing_rules', '')
+            if rules and rules.strip():
+                excluded_count = len([d for d in rules.split(',') if d.strip()])
+                # Reduce weight for nodes with many exclusions
+                flexibility_factor = 1 / (1 + excluded_count * 0.3)
+                speed = speed * flexibility_factor
             
             weights.append(max(speed, 0.1))  # Ensure minimum weight
             
@@ -1764,6 +1772,14 @@ def api_queue_force_rebalance():
             all_node_names = set(n['name'] for n in pool) | set(n['name'] for n in bulk_pool)
             node_counts = {name: 0 for name in all_node_names}
             
+            # Calculate "flexibility" for each node (how many domains it can accept)
+            # Nodes with fewer exclusions should get more tasks
+            node_flexibility = {}
+            for n in pool:
+                excluded = node_exclusions.get(n['name'], set())
+                # Fewer exclusions = higher flexibility score
+                node_flexibility[n['name']] = 1.0 / (1 + len(excluded) * 0.5)  # More exclusions = lower score
+            
             for r in rows:
                 source = r['source']
                 
@@ -1788,13 +1804,24 @@ def api_queue_force_rebalance():
                     failures.append((r['id'],))
                     continue
                 
-                # Calculate total weight of candidates
-                candidate_weights = {n['name']: (pool_weights if source != 'bulk' else bulk_weights).get(n['name'], 1) for n in candidates}
-                total_weight = sum(candidate_weights.values()) or 1  # Avoid division by zero
+                # NEW LOGIC: Prioritize nodes with no exclusions (they can handle any domain)
+                # and prefer nodes with lower current load
+                weights = (pool_weights if source != 'bulk' else bulk_weights)
                 
-                # Find the candidate with lowest current load relative to its weight
-                # Add small epsilon to avoid division by zero when node_counts is 0
-                best_node = min(candidates, key=lambda n: (node_counts[n['name']] + 0.001) / (candidate_weights[n['name']] / total_weight + 0.001))
+                # Sort candidates: 
+                # 1. First by flexibility (nodes with no exclusions first)
+                # 2. Then by current load / weight ratio (lower is better)
+                def node_score(n):
+                    name = n['name']
+                    current_load = node_counts[name]
+                    weight = weights.get(name, 1)
+                    flexibility = node_flexibility.get(name, 1)
+                    # Lower score = better choice
+                    # Nodes with high flexibility should have lower base score
+                    # Nodes with fewer current tasks should be preferred
+                    return (current_load + 1) / (weight * flexibility + 0.001)
+                
+                best_node = min(candidates, key=node_score)
                 node_counts[best_node['name']] += 1
                 updates.append((best_node['name'], r['id']))
             
