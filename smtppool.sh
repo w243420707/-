@@ -262,20 +262,20 @@ def send_telegram(msg):
 class SMTPAuthenticator:
     def __call__(self, server, session, envelope, mechanism, auth_data):
         fail_result = AuthResult(success=False, handled=True)
-        logger.info(f"🔐 SMTP Auth attempt: mechanism={mechanism}, auth_data type={type(auth_data)}")
+        logger.info(f"🔐 SMTP认证尝试: 方式={mechanism}, 数据类型={type(auth_data)}")
         try:
             # Decode auth data
             if isinstance(auth_data, LoginPassword):
                 username = auth_data.login.decode('utf-8') if isinstance(auth_data.login, bytes) else auth_data.login
                 password = auth_data.password.decode('utf-8') if isinstance(auth_data.password, bytes) else auth_data.password
-                logger.info(f"🔐 LoginPassword: username={username}")
+                logger.info(f"🔐 用户名: {username}")
             elif mechanism == 'PLAIN':
                 # PLAIN format: \0username\0password
                 data = auth_data.decode('utf-8') if isinstance(auth_data, bytes) else auth_data
                 parts = data.split('\x00')
                 username = parts[1] if len(parts) > 1 else ''
                 password = parts[2] if len(parts) > 2 else ''
-                logger.info(f"🔐 PLAIN: username={username}")
+                logger.info(f"🔐 PLAIN认证用户: {username}")
             else:
                 logger.warning(f"❌ SMTP Auth unsupported mechanism: {mechanism}")
                 return fail_result
@@ -320,10 +320,10 @@ class SMTPAuthenticator:
                 # Store username in session for later use
                 session.smtp_user = username
                 session.smtp_user_id = user['id']
-                logger.info(f"✅ SMTP Auth success: {username} (hourly: {hourly_sent}/{user['email_limit']})")
+                logger.info(f"✅ SMTP认证成功: {username} (小时已发: {hourly_sent}/{user['email_limit']})")
                 return AuthResult(success=True)
         except Exception as e:
-            logger.error(f"SMTP Auth error: {e}")
+            logger.error(f"SMTP认证错误: {e}")
             return fail_result
 
 # --- SMTP Handler (Producer) ---
@@ -337,7 +337,7 @@ class RelayHandler:
         # Debug logging
         all_node_names = [n.get('name', '?') for n in all_pool]
         enabled_node_names = [n.get('name', '?') for n in pool]
-        logger.info(f"📋 Config nodes: {all_node_names}, Enabled: {enabled_node_names}")
+        logger.info(f"📋 节点列表: {all_node_names}, 已启用: {enabled_node_names}")
         
         if not pool:
             logger.warning("❌ No enabled downstream nodes available")
@@ -361,7 +361,7 @@ class RelayHandler:
              logger.warning("❌ No suitable nodes found for redundancy")
              return '451 Temporary failure: No suitable nodes'
 
-        logger.info(f"📥 Received | From: {envelope.mail_from} | To: {envelope.rcpt_tos} | Redundant Nodes: {[n['name'] for n in selected_nodes]}")
+        logger.info(f"📥 收到邮件 | 发件人: {envelope.mail_from} | 收件人: {envelope.rcpt_tos} | 分配节点: {[n['name'] for n in selected_nodes]}")
         
         # Extract subject from email content
         subject = ''
@@ -416,7 +416,7 @@ class RelayHandler:
                             
             return '250 OK: Queued for redundant delivery'
         except Exception as e:
-            logger.error(f"❌ DB Error: {e}")
+            logger.error(f"❌ 数据库错误: {e}")
             return '451 Temporary failure: DB Error'
 
 # --- Queue Worker (Consumer) ---
@@ -440,9 +440,9 @@ def worker_thread():
                     with get_db() as conn:
                         stuck = conn.execute("UPDATE queue SET status='pending' WHERE status='processing' AND updated_at < datetime('now', '+08:00', '-5 minutes')").rowcount
                         if stuck > 0:
-                            logger.info(f"🔄 Reset {stuck} stuck 'processing' items to 'pending'")
+                            logger.info(f"🔄 已重置 {stuck} 个卡住的任务")
                 except Exception as e:
-                    logger.error(f"Stuck check failed: {e}")
+                    logger.error(f"卡住任务检查失败: {e}")
                 last_stuck_check_time = now
             
             # --- Auto Cleanup (Once per hour) ---
@@ -454,9 +454,9 @@ def worker_thread():
                         cutoff = (datetime.utcnow() + timedelta(hours=8) - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
                         with get_db() as conn:
                             conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed') AND updated_at < ?", (cutoff,))
-                        logger.info(f"🧹 Auto-cleaned records older than {days} days")
+                        logger.info(f"🧹 自动清理了 {days} 天前的旧记录")
                 except Exception as e:
-                    logger.error(f"Cleanup failed: {e}")
+                    logger.error(f"自动清理失败: {e}")
                 last_cleanup_time = now
 
             # --- Activate Scheduled Emails (every loop) ---
@@ -469,9 +469,9 @@ def worker_thread():
                         (current_time,)
                     ).rowcount
                     if activated > 0:
-                        logger.info(f"⏰ Activated {activated} scheduled emails")
+                        logger.info(f"⏰ 已激活 {activated} 封定时邮件")
             except Exception as e:
-                logger.error(f"Schedule activation failed: {e}")
+                logger.error(f"定时邮件激活失败: {e}")
 
             pool_cfg = {n['name']: n for n in cfg.get('downstream_pool', [])}
             
@@ -527,7 +527,7 @@ def worker_thread():
                     active_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
                     new_node = select_node_for_recipient(active_nodes, rcpt_tos[0] if rcpt_tos else '', cfg.get('limit_config', {}), source=source) if active_nodes else None
                     if new_node:
-                        logger.info(f"🔄 Re-routing ID:{row_id} from '{node_name}' to '{new_node['name']}'")
+                        logger.info(f"🔄 重新分配 ID:{row_id} 从 '{node_name}' 到 '{new_node['name']}'")
                         with get_db() as conn:
                             conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
                     else:
@@ -540,7 +540,7 @@ def worker_thread():
                     bulk_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True) and n.get('allow_bulk', True)]
                     new_node = select_node_for_recipient(bulk_nodes, rcpt_tos[0] if rcpt_tos else '', cfg.get('limit_config', {}), source=source) if bulk_nodes else None
                     if new_node:
-                        logger.info(f"🔄 Re-routing bulk ID:{row_id} from '{node_name}' (allow_bulk=False) to '{new_node['name']}'")
+                        logger.info(f"🔄 群发重新分配 ID:{row_id} 从 '{node_name}' (禁止群发) 到 '{new_node['name']}'")
                         with get_db() as conn:
                             conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
                     else:
@@ -557,7 +557,7 @@ def worker_thread():
                         available_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True) and (not is_bulk or n.get('allow_bulk', True))]
                         new_node = select_node_for_recipient(available_nodes, rcpt_tos[0] if rcpt_tos else '', cfg.get('limit_config', {}), source=source)
                         if new_node:
-                            logger.info(f"🔄 Re-routing ID:{row_id} from '{node_name}' (domain {rcpt_domain} excluded) to '{new_node['name']}'")
+                            logger.info(f"🔄 重新分配 ID:{row_id} 从 '{node_name}' (域名{rcpt_domain}被排除) 到 '{new_node['name']}'")
                             with get_db() as conn:
                                 conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
                         else:
@@ -605,7 +605,7 @@ def worker_thread():
                     active_nodes = [n for n in fresh_cfg.get('downstream_pool', []) if n.get('enabled', True)]
                     new_node = select_node_for_recipient(active_nodes, rcpt_tos[0] if rcpt_tos else '', fresh_cfg.get('limit_config', {}), source=source) if active_nodes else None
                     if new_node:
-                        logger.info(f"🔄 Last-minute re-route ID:{row_id} from deleted/disabled '{node_name}' to '{new_node['name']}'")
+                        logger.info(f"🔄 紧急重新分配 ID:{row_id} 从已删除/禁用节点 '{node_name}' 到 '{new_node['name']}'")
                         with get_db() as conn:
                             conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
                     else:
@@ -663,7 +663,7 @@ def worker_thread():
                             s.sendmail(sender, rcpt_tos, msg_content)
                     
                     success = True
-                    logger.info(f"✅ Sent ID:{row_id} via {node_name} (Source: {source})")
+                    logger.info(f"✅ 发送成功 ID:{row_id} 经由 {node_name} (来源: {source})")
                     
                     # Update hourly count (All traffic counts towards limit)
                     if node_name in node_hourly_counts:
@@ -671,7 +671,7 @@ def worker_thread():
 
                 except Exception as e:
                     error_msg = str(e)
-                    logger.error(f"⚠️ Failed ID:{row_id} via {node_name}: {e}")
+                    logger.error(f"⚠️ 发送失败 ID:{row_id} 经由 {node_name}: {e}")
 
                 # Update DB
                 with get_db() as conn:
@@ -694,7 +694,7 @@ def worker_thread():
                 time.sleep(0.5)
 
         except Exception as e:
-            logger.error(f"Worker Error: {e}")
+            logger.error(f"工作线程错误: {e}")
             time.sleep(5)
 
 # --- Web App ---
@@ -792,18 +792,18 @@ def api_save():
         try:
             if added_nodes:
                 # New nodes added - do a force rebalance to distribute load
-                logger.info(f"🆕 New nodes detected: {added_nodes}, performing force rebalance...")
+                logger.info(f"🆕 检测到新节点: {added_nodes}, 正在强制重分配...")
                 result = force_rebalance_internal()
                 count = result.get('count', 0) if isinstance(result, dict) else 0
                 if count > 0:
-                    logger.info(f"✅ Force rebalanced {count} items after adding new nodes")
+                    logger.info(f"✅ 添加新节点后强制重分配了 {count} 个任务")
             else:
                 # Normal rebalance (only fix invalid assignments)
                 count = rebalance_queue_internal()
                 if count > 0:
-                    logger.info(f"✅ Auto-rebalanced {count} items after config save")
+                    logger.info(f"✅ 保存配置后自动重分配了 {count} 个任务")
         except Exception as e:
-            logger.error(f"Auto-rebalance failed: {e}")
+            logger.error(f"自动重分配失败: {e}")
     threading.Thread(target=async_rebalance, daemon=True).start()
     return jsonify({"status": "ok"})
 
@@ -815,6 +815,26 @@ def api_restart():
         os._exit(0)
     threading.Thread(target=restart_server).start()
     return jsonify({"status": "restarting"})
+
+@app.route('/api/logs')
+@login_required
+def api_logs():
+    """获取最近的日志"""
+    lines = int(request.args.get('lines', 100))
+    try:
+        log_file = LOG_FILE
+        if not os.path.exists(log_file):
+            return jsonify({"logs": []})
+        
+        # 读取最后 N 行
+        with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
+            all_lines = f.readlines()
+            recent = all_lines[-lines:] if len(all_lines) > lines else all_lines
+            # 反转顺序，最新的在前
+            recent.reverse()
+            return jsonify({"logs": [l.strip() for l in recent if l.strip()]})
+    except Exception as e:
+        return jsonify({"logs": [], "error": str(e)})
 
 @app.route('/api/queue/stats')
 @login_required
@@ -1263,7 +1283,7 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                         )
                     tasks = []
             except Exception as e:
-                logger.error(f"Error preparing email for {rcpt}: {e}")
+                logger.error(f"准备邮件失败 {rcpt}: {e}")
                 continue
 
         # Insert remaining tasks
@@ -1273,9 +1293,9 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                     "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     tasks
                 )
-        logger.info(f"Bulk import finished: {count} emails processed")
+        logger.info(f"群发导入完成: 共 {count} 封邮件")
     except Exception as e:
-        logger.error(f"Bulk import task failed: {e}")
+        logger.error(f"群发导入任务失败: {e}")
 
 @app.route('/api/send/bulk', methods=['POST'])
 @login_required
@@ -1319,7 +1339,7 @@ def api_send_bulk():
             return jsonify({"status": "ok", "count": "Processing in background", "scheduled": scheduled_at})
         return jsonify({"status": "ok", "count": "Processing in background"})
     except Exception as e:
-        logger.error(f"Bulk send error: {e}")
+        logger.error(f"群发错误: {e}")
         return jsonify({"error": str(e)}), 500
 
 # --- SMTP Users Management API ---
@@ -1726,7 +1746,7 @@ def rebalance_queue_internal():
         
         count = len(updates)
         if count > 0:
-            logger.info(f"🔄 Rebalanced {count} items, {len(failures)} failed")
+            logger.info(f"🔄 重分配完成: {count} 个成功, {len(failures)} 个失败")
     return count
 
 @app.route('/api/queue/rebalance', methods=['POST'])
@@ -1736,7 +1756,7 @@ def api_queue_rebalance():
         count = rebalance_queue_internal()
         return jsonify({"status": "ok", "count": count})
     except Exception as e:
-        logger.error(f"Rebalance error: {e}")
+        logger.error(f"重分配错误: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/queue/force_rebalance', methods=['POST'])
@@ -1747,7 +1767,7 @@ def api_queue_force_rebalance():
         result = force_rebalance_internal()
         return jsonify(result)
     except Exception as e:
-        logger.error(f"Force rebalance error: {e}")
+        logger.error(f"强制均分错误: {e}")
         return jsonify({"error": str(e)}), 500
 
 def force_rebalance_internal():
@@ -1861,7 +1881,7 @@ def force_rebalance_internal():
         if failures:
             conn.executemany("UPDATE queue SET status='failed', last_error='No node accepts this domain' WHERE id=?", failures)
         
-        logger.info(f"⚡ Force rebalanced {len(updates)} items across nodes, {len(failures)} failed")
+        logger.info(f"⚡ 强制均分完成: {len(updates)} 个成功, {len(failures)} 个失败")
         
         # Return distribution stats
         stats = {n['name']: node_counts.get(n['name'], 0) for n in pool}
@@ -1904,7 +1924,7 @@ def track_email(tid):
         with get_db() as conn:
             conn.execute("UPDATE queue SET opened_at=datetime('now', '+08:00'), open_count=open_count+1 WHERE tracking_id=?", (tid,))
     except Exception as e:
-        logger.error(f"Tracking error: {e}")
+        logger.error(f"跟踪错误: {e}")
     return TRACKING_GIF, 200, {'Content-Type': 'image/gif', 'Cache-Control': 'no-cache, no-store, must-revalidate'}
 
 # --- Custom SMTP class with authentication ---
@@ -2086,6 +2106,11 @@ EOF
             .main-content { margin-left: 0; padding: 1rem; }
             .mobile-toggle { display: block !important; }
         }
+        .log-line { white-space: pre-wrap; word-break: break-all; line-height: 1.4; padding: 1px 0; }
+        .log-line.log-error { color: #f14c4c; }
+        .log-line.log-warning { color: #cca700; }
+        .log-line.log-success { color: #23d18b; }
+        .log-line.log-info { color: #3794ff; }
     </style>
 </head>
 <body>
@@ -2327,6 +2352,37 @@ EOF
                                 <tr v-if="filteredQList.length===0"><td colspan="6" class="text-center py-5 text-muted">暂无记录</td></tr>
                             </tbody>
                         </table>
+                    </div>
+                </div>
+                
+                <!-- Live Logs -->
+                <div class="card mt-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <div class="d-flex align-items-center gap-2">
+                            <span>实时日志</span>
+                            <span class="badge bg-success" v-if="liveLogsEnabled"><i class="bi bi-broadcast"></i> 实时</span>
+                            <span class="badge bg-secondary" v-else><i class="bi bi-pause-circle"></i> 已暂停</span>
+                        </div>
+                        <div class="d-flex gap-2">
+                            <button class="btn btn-sm" :class="liveLogsEnabled ? 'btn-warning' : 'btn-success'" @click="toggleLiveLogs">
+                                <i class="bi" :class="liveLogsEnabled ? 'bi-pause-fill' : 'bi-play-fill'"></i>
+                                [[ liveLogsEnabled ? '暂停' : '启用' ]]
+                            </button>
+                            <button class="btn btn-sm btn-outline-secondary" @click="clearLogs">
+                                <i class="bi bi-trash"></i> 清空
+                            </button>
+                            <button class="btn btn-sm btn-outline-primary" @click="refreshLogs">
+                                <i class="bi bi-arrow-clockwise"></i> 刷新
+                            </button>
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <div ref="logContainer" class="log-container font-monospace small" style="height: 300px; overflow-y: auto; background: #1e1e1e; color: #d4d4d4; padding: 10px;">
+                            <div v-for="(log, idx) in liveLogs" :key="idx" class="log-line" :class="getLogClass(log)">
+                                [[ log ]]
+                            </div>
+                            <div v-if="liveLogs.length === 0" class="text-muted text-center py-4">暂无日志</div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -3177,6 +3233,9 @@ EOF
                     bulkStatus: 'running',
                     rebalancing: false,
                     nodeChanges: {},  // Track pending count changes per node
+                    liveLogs: [],  // Real-time logs
+                    liveLogsEnabled: true,  // Auto-refresh logs
+                    logTimer: null,  // Log refresh timer
                     theme: 'auto',
                     draggingIndex: null,
                     dragOverIndex: null,
@@ -3316,6 +3375,7 @@ EOF
                 this.fetchContactDomainStats();
                 this.fetchBulkStatus();
                 this.fetchTopDomains();
+                this.startLogTimer();  // 启动实时日志
                 setInterval(() => {
                     this.fetchQueue();
                     this.fetchBulkStatus();
@@ -4251,6 +4311,58 @@ EOF
                         }
                     } catch(e) { alert('失败: ' + e); }
                     this.rebalancing = false;
+                },
+                // 实时日志相关方法
+                async fetchLogs() {
+                    try {
+                        const res = await fetch('/api/logs?lines=100');
+                        const data = await res.json();
+                        if(data.logs) {
+                            this.liveLogs = data.logs;
+                            this.$nextTick(() => {
+                                const container = this.$refs.logContainer;
+                                if(container) container.scrollTop = 0;  // 保持在顶部（最新日志）
+                            });
+                        }
+                    } catch(e) { console.error('获取日志失败:', e); }
+                },
+                toggleLiveLogs() {
+                    this.liveLogsEnabled = !this.liveLogsEnabled;
+                    if(this.liveLogsEnabled) {
+                        this.startLogTimer();
+                    } else {
+                        this.stopLogTimer();
+                    }
+                },
+                startLogTimer() {
+                    this.stopLogTimer();
+                    this.fetchLogs();
+                    this.logTimer = setInterval(() => {
+                        if(this.tab === 'monitor' && this.liveLogsEnabled) {
+                            this.fetchLogs();
+                        }
+                    }, 3000);  // 每3秒刷新
+                },
+                stopLogTimer() {
+                    if(this.logTimer) {
+                        clearInterval(this.logTimer);
+                        this.logTimer = null;
+                    }
+                },
+                clearLogs() {
+                    this.liveLogs = [];
+                },
+                refreshLogs() {
+                    this.fetchLogs();
+                },
+                getLogClass(log) {
+                    if(!log) return '';
+                    const lower = log.toLowerCase();
+                    if(lower.includes('error') || lower.includes('失败') || lower.includes('错误') || lower.includes('❌')) return 'log-error';
+                    if(lower.includes('warning') || lower.includes('警告') || lower.includes('⚠')) return 'log-warning';
+                    if(lower.includes('success') || lower.includes('成功') || lower.includes('✅') || lower.includes('sent to')) return 'log-success';
+                    if(lower.includes('info') || lower.includes('🆕') || lower.includes('🔄') || lower.includes('⚡')) return 'log-info';
+                    return '';
                 }
             }
         });
