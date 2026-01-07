@@ -554,19 +554,57 @@ def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=
         encryption = node.get('encryption', 'none')
         username = node.get('username')
         password = node.get('password')
+        # 构造下游节点发件人（覆盖中继发件人）
+        sender = None
+        if node.get('sender_domain'):
+            domain = node.get('sender_domain')
+            if node.get('sender_random'):
+                prefix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
+            else:
+                prefix = node.get('sender_prefix', 'mail')
+            sender = f"{prefix}@{domain}"
+        elif node.get('sender_email'):
+            sender = node.get('sender_email')
+        else:
+            sender = node.get('username') or mail_from
+
+        # 如果 content 是原始邮件 bytes，则替换邮件头中的 From
+        msg_bytes = content
+        try:
+            if isinstance(content, (bytes, bytearray)):
+                try:
+                    msg = message_from_bytes(content)
+                    if 'From' in msg:
+                        del msg['From']
+                    msg['From'] = sender
+                    msg_bytes = msg.as_bytes()
+                except Exception:
+                    msg_bytes = content
+            else:
+                # content 可能为 str
+                try:
+                    msg = message_from_bytes(content.encode('utf-8'))
+                    if 'From' in msg:
+                        del msg['From']
+                    msg['From'] = sender
+                    msg_bytes = msg.as_bytes()
+                except Exception:
+                    msg_bytes = content
+        except Exception:
+            msg_bytes = content
 
         if encryption == 'ssl':
             with smtplib.SMTP_SSL(host, port, timeout=30) as s:
                 if username and password:
                     s.login(username, password)
-                s.sendmail(mail_from, rcpt_tos, content)
+                s.sendmail(sender, rcpt_tos, msg_bytes)
         else:
             with smtplib.SMTP(host, port, timeout=30) as s:
                 if encryption == 'tls':
                     s.starttls()
                 if username and password:
                     s.login(username, password)
-                s.sendmail(mail_from, rcpt_tos, content)
+                s.sendmail(sender, rcpt_tos, msg_bytes)
 
         logger.info(f"🔁 直接转发成功 -> {node.get('name')} | 收件: {rcpt_tos[0] if rcpt_tos else '?'} | 主题: {subject or ''}")
         return True
