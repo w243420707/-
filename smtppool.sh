@@ -420,13 +420,14 @@ class RelayHandler:
         # 3. Queue for all selected nodes (No Direct Send anymore to ensure async redundancy)
         try:
             with get_db() as conn:
+                # 对于中继进入的邮件：不入队，直接异步转发到下游节点
                 for node in selected_nodes:
-                    node_name = node.get('name', 'Unknown')
-                    conn.execute(
-                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, last_error, subject, smtp_user, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+08:00'), datetime('now', '+08:00'))",
-                        (envelope.mail_from, json.dumps(envelope.rcpt_tos), envelope.content, node_name, 'pending', 'relay', None, subject, smtp_user)
-                    )
-                
+                    threading.Thread(
+                        target=forward_to_node,
+                        args=(node, envelope.mail_from, envelope.rcpt_tos, envelope.content, subject, smtp_user),
+                        daemon=True
+                    ).start()
+
                 # Auto-save relay recipients to contacts list
                 for rcpt_email in envelope.rcpt_tos:
                     rcpt_email = rcpt_email.strip()
@@ -435,7 +436,7 @@ class RelayHandler:
                             conn.execute("INSERT INTO contacts (email, created_at) VALUES (?, datetime('now', '+08:00'))", (rcpt_email,))
                         except sqlite3.IntegrityError:
                             pass  # Already exists, ignore
-                
+
                 # Update SMTP user sent count (both total and hourly)
                 if hasattr(session, 'smtp_user_id'):
                     current_hour = datetime.now().strftime('%Y-%m-%d %H:00:00')
@@ -541,6 +542,36 @@ def send_user_notification(email, notify_type, **kwargs):
         return True
     except Exception as e:
         logger.error(f"发送通知邮件失败: {e}")
+        return False
+
+
+def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=None):
+    """立即将中继邮件转发给指定下游节点（异步线程调用）。
+    不入库，只记录日志；发生错误不会阻塞主线程。"""
+    try:
+        host = node.get('host')
+        port = int(node.get('port', 25))
+        encryption = node.get('encryption', 'none')
+        username = node.get('username')
+        password = node.get('password')
+
+        if encryption == 'ssl':
+            with smtplib.SMTP_SSL(host, port, timeout=30) as s:
+                if username and password:
+                    s.login(username, password)
+                s.sendmail(mail_from, rcpt_tos, content)
+        else:
+            with smtplib.SMTP(host, port, timeout=30) as s:
+                if encryption == 'tls':
+                    s.starttls()
+                if username and password:
+                    s.login(username, password)
+                s.sendmail(mail_from, rcpt_tos, content)
+
+        logger.info(f"🔁 直接转发成功 -> {node.get('name')} | 收件: {rcpt_tos[0] if rcpt_tos else '?'} | 主题: {subject or ''}")
+        return True
+    except Exception as e:
+        logger.error(f"🔁 直接转发到节点 {node.get('name')} 失败: {e}")
         return False
 
 # --- Queue Worker (Multi-threaded per Node with Memory Queue) ---
@@ -666,13 +697,33 @@ def node_sender(node_name, task_queue):
             # 批量更新数据库（使用单独线程，不阻塞发送）
             # 使用默认参数捕获当前值，避免闭包问题
             def update_db(rid=row_id, ok=success, err=error_msg):
-                try:
-                    with get_db() as conn:
-                        if ok:
-                            conn.execute("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", (rid,))
-                        else:
-                            conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", (err[:200], rid))
-                except: pass
+                retries = 3
+                for attempt in range(retries):
+                    try:
+                        with get_db() as conn:
+                            if ok:
+                                conn.execute("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", (rid,))
+                            else:
+                                conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", (err[:200], rid))
+                        return
+                    except sqlite3.OperationalError as e:
+                        if 'locked' in str(e) and attempt < retries - 1:
+                            time.sleep(0.5 * (attempt + 1))
+                            continue
+                        # 最终失败：将任务重置为 pending，并增加重试计数，避免永久卡住
+                        try:
+                            with get_db() as conn2:
+                                conn2.execute(
+                                    "UPDATE queue SET status='pending', retry_count = COALESCE(retry_count,0)+1, last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?",
+                                    (str(e)[:200], rid)
+                                )
+                        except:
+                            pass
+                        logger.error(f"[{node_name}] 更新数据库失败，已重置为 pending: {e}")
+                        return
+                    except Exception as e:
+                        logger.error(f"[{node_name}] 更新数据库异常: {e}")
+                        return
             threading.Thread(target=update_db, daemon=True).start()
             
             # 日志汇总（每10封输出一次）
