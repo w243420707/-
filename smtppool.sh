@@ -429,6 +429,13 @@ def worker_thread():
     node_hourly_counts = {}   # { 'node_name': { 'hour': 10, 'count': 50 } }
     last_cleanup_time = 0
     last_stuck_check_time = 0
+    
+    # 日志汇总计数器
+    log_batch_counter = {'success': 0, 'fail': 0, 'last_log_time': time.time()}
+    LOG_BATCH_SIZE = 10  # 每10封输出一次汇总
+    
+    # 发送速度统计
+    speed_stats = {'minute_start': time.time(), 'minute_count': 0, 'total_sent': 0}
 
     while True:
         try:
@@ -587,8 +594,12 @@ def worker_thread():
                         
                         if node_hourly_counts[node_name]['count'] >= max_ph:
                             # Limit reached, block this node for a while (e.g. 1 min)
-                            node_next_send_time[node_name] = now + 60 
+                            node_next_send_time[node_name] = now + 60
+                            logger.warning(f"⚠️ 节点 {node_name} 已达小时限额 ({node_hourly_counts[node_name]['count']}/{max_ph})，暂停60秒")
                             continue
+                        elif node_hourly_counts[node_name]['count'] >= max_ph * 0.8:
+                            # 80% warning
+                            logger.warning(f"⚠️ 节点 {node_name} 已达 80% 小时限额 ({node_hourly_counts[node_name]['count']}/{max_ph})")
 
                 # --- Processing ---
                 did_work = True
@@ -664,13 +675,21 @@ def worker_thread():
                             s.sendmail(sender, rcpt_tos, msg_content)
                     
                     success = True
-                    # 详细日志：收件人、主题、节点、来源
-                    rcpt_str = rcpt_tos[0] if rcpt_tos else '未知'
-                    try:
-                        subject_str = (row['subject'] or '')[:30]
-                    except:
-                        subject_str = ''
-                    logger.info(f"✅ 发送成功 | 收件人: {rcpt_str} | 主题: {subject_str} | 节点: {node_name} | 来源: {source}")
+                    # 汇总日志：每10封输出一次
+                    log_batch_counter['success'] += 1
+                    speed_stats['minute_count'] += 1
+                    speed_stats['total_sent'] += 1
+                    
+                    # 每分钟输出一次速度统计
+                    if time.time() - speed_stats['minute_start'] >= 60:
+                        logger.info(f"📊 发送速度: {speed_stats['minute_count']} 封/分钟 | 本次总计: {speed_stats['total_sent']} 封")
+                        speed_stats['minute_start'] = time.time()
+                        speed_stats['minute_count'] = 0
+                    
+                    if log_batch_counter['success'] >= LOG_BATCH_SIZE or (time.time() - log_batch_counter['last_log_time']) > 10:
+                        logger.info(f"✅ 发送成功 {log_batch_counter['success']} 封 | 最近: {rcpt_tos[0] if rcpt_tos else '未知'} | 节点: {node_name} | 来源: {source}")
+                        log_batch_counter['success'] = 0
+                        log_batch_counter['last_log_time'] = time.time()
                     
                     # Update hourly count (All traffic counts towards limit)
                     if node_name in node_hourly_counts:
@@ -678,12 +697,12 @@ def worker_thread():
 
                 except Exception as e:
                     error_msg = str(e)
-                    rcpt_str = rcpt_tos[0] if rcpt_tos else '未知'
-                    try:
-                        subject_str = (row['subject'] or '')[:30]
-                    except:
-                        subject_str = ''
-                    logger.error(f"❌ 发送失败 | 收件人: {rcpt_str} | 主题: {subject_str} | 节点: {node_name} | 错误: {e}")
+                    # 失败日志汇总
+                    log_batch_counter['fail'] += 1
+                    if log_batch_counter['fail'] >= LOG_BATCH_SIZE or (time.time() - log_batch_counter['last_log_time']) > 10:
+                        logger.error(f"❌ 发送失败 {log_batch_counter['fail']} 封 | 最近: {rcpt_tos[0] if rcpt_tos else '未知'} | 节点: {node_name} | 错误: {e}")
+                        log_batch_counter['fail'] = 0
+                        log_batch_counter['last_log_time'] = time.time()
 
                 # Update DB
                 with get_db() as conn:
@@ -1910,15 +1929,16 @@ def api_bulk_control():
     if action == 'pause':
         cfg['bulk_control']['status'] = 'paused'
         save_config(cfg)
+        logger.info("⏸️ 群发已暂停")
     elif action == 'resume':
         cfg['bulk_control']['status'] = 'running'
         save_config(cfg)
+        logger.info("▶️ 群发已恢复")
     elif action == 'stop':
         # Stop means clear pending bulk
         with get_db() as conn:
-            conn.execute("DELETE FROM queue WHERE (status='pending' OR status='processing') AND source='bulk'")
-        # Also pause to be safe? No, just clear queue is enough for "Stop" usually.
-        # But user might want to stop and then resume later with new list.
+            deleted = conn.execute("DELETE FROM queue WHERE (status='pending' OR status='processing') AND source='bulk'").rowcount
+        logger.info(f"⏹️ 群发已停止，清理了 {deleted} 封待发邮件")
         
     return jsonify({"status": "ok", "current": cfg['bulk_control']['status']})
 
@@ -1934,7 +1954,17 @@ TRACKING_GIF = base64.b64decode(b'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAA
 def track_email(tid):
     try:
         with get_db() as conn:
+            # 获取收件人信息
+            row = conn.execute("SELECT rcpt_tos FROM queue WHERE tracking_id=?", (tid,)).fetchone()
+            rcpt = '未知'
+            if row:
+                try:
+                    rcpt_list = json.loads(row['rcpt_tos'])
+                    rcpt = rcpt_list[0] if rcpt_list else '未知'
+                except:
+                    pass
             conn.execute("UPDATE queue SET opened_at=datetime('now', '+08:00'), open_count=open_count+1 WHERE tracking_id=?", (tid,))
+            logger.info(f"📖 邮件被打开 | 收件人: {rcpt} | 追踪ID: {tid[:8]}...")
     except Exception as e:
         logger.error(f"跟踪错误: {e}")
     return TRACKING_GIF, 200, {'Content-Type': 'image/gif', 'Cache-Control': 'no-cache, no-store, must-revalidate'}
@@ -4330,10 +4360,11 @@ EOF
                     // 只有在顶部时才刷新
                     if(!this.logAtTop) return;
                     try {
-                        const res = await fetch('/api/logs?lines=100');
+                        const res = await fetch('/api/logs?lines=50');
                         const data = await res.json();
                         if(data.logs) {
-                            this.liveLogs = data.logs;
+                            // 限制最多显示100条防止卡顿
+                            this.liveLogs = data.logs.slice(0, 100);
                         }
                     } catch(e) { console.error('获取日志失败:', e); }
                 },
