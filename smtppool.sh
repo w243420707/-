@@ -49,7 +49,7 @@ install_smtp() {
         cat > "$CONFIG_FILE" << EOF
 {
     "server_config": { "host": "0.0.0.0", "port": 587, "username": "myapp", "password": "123" },
-    "web_config": { "admin_password": "admin", "public_domain": "" },
+    "web_config": { "admin_password": "admin", "public_domain": "", "bulk_batch_size": 5000 },
     "telegram_config": { "bot_token": "", "admin_id": "" },
     "log_config": { "max_mb": 50, "backups": 3, "retention_days": 7 },
     "limit_config": { "max_per_hour": 0, "min_interval": 1, "max_interval": 5 },
@@ -714,6 +714,44 @@ def node_sender(node_name, task_queue):
                 else:
                     sender = task.get('mail_from') or node.get('username')
                 
+                # If content is stored as JSON (deferred), reconstruct message now
+                if not isinstance(msg_content, (bytes, bytearray)):
+                    try:
+                        parsed = None
+                        try:
+                            parsed = json.loads(msg_content)
+                        except Exception:
+                            parsed = None
+                        if isinstance(parsed, dict) and ('plain' in parsed or 'html' in parsed):
+                            m = MIMEMultipart('alternative')
+                            subj = task.get('subject') or parsed.get('subject') or ''
+                            if subj:
+                                m['Subject'] = subj
+                            m['To'] = ','.join(rcpt_tos) if isinstance(rcpt_tos, (list, tuple)) else str(rcpt_tos)
+                            # Add Date and Message-ID for better deliverability
+                            try:
+                                m['Date'] = formatdate(localtime=True)
+                            except:
+                                pass
+                            try:
+                                m['Message-ID'] = make_msgid()
+                            except:
+                                pass
+                            # From will be set/overwritten below
+                            plain_part = MIMEText(parsed.get('plain', ''), 'plain', 'utf-8')
+                            html_part = MIMEText(parsed.get('html', ''), 'html', 'utf-8')
+                            m.attach(plain_part)
+                            m.attach(html_part)
+                            msg_content = m.as_bytes()
+                        else:
+                            # fallback: try to convert string to bytes
+                            msg_content = msg_content.encode('utf-8') if isinstance(msg_content, str) else msg_content
+                    except Exception:
+                        try:
+                            msg_content = msg_content.encode('utf-8') if isinstance(msg_content, str) else msg_content
+                        except:
+                            pass
+
                 # Header rewrite
                 if sender and (node.get('sender_domain') or node.get('sender_email')):
                     try:
@@ -887,12 +925,13 @@ def dispatcher_thread():
                         for row in rows:
                             try:
                                 task = {
-                                    'id': row['id'],
-                                    'mail_from': row['mail_from'],
-                                    'rcpt_tos': json.loads(row['rcpt_tos']),
-                                    'content': row['content'],
-                                    'source': row['source']
-                                }
+                                            'id': row['id'],
+                                            'mail_from': row['mail_from'],
+                                            'rcpt_tos': json.loads(row['rcpt_tos']),
+                                            'content': row['content'],
+                                            'source': row['source'],
+                                            'subject': row.get('subject') if 'subject' in row.keys() else None
+                                        }
                                 node_queues[node_name].put(task, timeout=1)
                             except Exception as e:
                                 failed_ids.append(row['id'])
@@ -1593,8 +1632,21 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
         
         tasks = []
         count = 0
-        
-        for rcpt in recipients:
+        inserted_total = 0
+        # Use configurable batch size (fallback to 2000)
+        batch_size = cfg.get('web_config', {}).get('bulk_batch_size', 5000)
+
+        # Open a single DB connection for the entire import to avoid repeated connect/commit overhead
+        conn = get_db()
+        try:
+            # Temporary performance PRAGMAs for bulk write
+            try:
+                conn.execute("PRAGMA synchronous=OFF")
+                conn.execute("PRAGMA temp_store=MEMORY")
+            except Exception:
+                pass
+
+            for rcpt in recipients:
             try:
                 # === Anti-Spam Randomization ===
                 rand_sub = ''.join(random.choices(charset, k=random.randint(4, 8)))
@@ -1709,29 +1761,51 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 initial_status = 'scheduled' if schedule_time and schedule_time > datetime.now() else 'pending'
                 scheduled_at_str = schedule_time.strftime('%Y-%m-%d %H:%M:%S') if schedule_time else None
                 
-                tasks.append(('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject))
+                # Delay generating raw bytes; store plain and html instead to speed up import
+                content_obj = json.dumps({'plain': plain_text, 'html': final_body})
+                tasks.append(('', json.dumps([rcpt]), content_obj, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject))
                 count += 1
                 
-                # Batch insert every 500 records for better performance
-                if len(tasks) >= 500:
-                    with get_db() as conn:
+                # Batch insert when tasks reach batch_size
+                if len(tasks) >= batch_size:
+                    try:
                         conn.executemany(
                             "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                             tasks
                         )
+                        conn.commit()
+                        inserted_total += len(tasks)
+                        if inserted_total % (batch_size * 1) == 0:
+                            logger.info(f"群发导入进度: 已写入 {inserted_total} 条")
+                    except Exception as e:
+                        logger.error(f"批量插入失败: {e}")
                     tasks = []
             except Exception as e:
                 logger.error(f"准备邮件失败 {rcpt}: {e}")
                 continue
+            # Insert any remaining tasks
+            if tasks:
+                try:
+                    conn.executemany(
+                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        tasks
+                    )
+                    conn.commit()
+                    inserted_total += len(tasks)
+                except Exception as e:
+                    logger.error(f"批量插入剩余任务失败: {e}")
 
-        # Insert remaining tasks
-        if tasks:
-            with get_db() as conn:
-                conn.executemany(
-                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    tasks
-                )
-        logger.info(f"群发导入完成: 共 {count} 封邮件")
+            logger.info(f"群发导入完成: 共 {count} 封邮件, 已写入 {inserted_total} 条")
+        finally:
+            try:
+                # restore safe defaults
+                conn.execute("PRAGMA synchronous=NORMAL")
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
     except Exception as e:
         logger.error(f"群发导入任务失败: {e}")
 
@@ -3218,6 +3292,11 @@ EOF
                                     <label class="form-label">追踪域名 (Tracking URL)</label>
                                     <input type="text" v-model="config.web_config.public_domain" class="form-control" placeholder="http://YOUR_IP:8080">
                                     <div class="form-text">用于生成邮件打开追踪链接，请填写公网可访问地址。</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">批量导入每批写入大小 (bulk_batch_size)</label>
+                                    <input type="number" v-model.number="config.web_config.bulk_batch_size" class="form-control" placeholder="5000">
+                                    <div class="form-text">每次批量写入数据库的条目数，较大值可提高导入速度，但会增加内存与 IO 压力。</div>
                                 </div>
                             </div>
                         </div>
