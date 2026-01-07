@@ -554,42 +554,68 @@ def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=
         encryption = node.get('encryption', 'none')
         username = node.get('username')
         password = node.get('password')
-        # 构造下游节点发件人（覆盖中继发件人）
+        # 构造下游节点发件人（覆盖中继发件人），但保留中继原始头部信息
+        # 将下游发件人的本地部分替换为传递过来的本地名（mail_from 的 local part）
         sender = None
+        # 提取并清洗传入的本地名
+        try:
+            orig_local = (mail_from or '').split('@', 1)[0]
+        except Exception:
+            orig_local = ''
+        try:
+            import re
+            safe_local = re.sub(r'[^A-Za-z0-9._%+-]', '', orig_local) or None
+        except Exception:
+            safe_local = orig_local or None
+
         if node.get('sender_domain'):
             domain = node.get('sender_domain')
-            if node.get('sender_random'):
-                prefix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
+            if safe_local:
+                sender = f"{safe_local}@{domain}"
             else:
-                prefix = node.get('sender_prefix', 'mail')
-            sender = f"{prefix}@{domain}"
+                if node.get('sender_random'):
+                    prefix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
+                else:
+                    prefix = node.get('sender_prefix', 'mail')
+                sender = f"{prefix}@{domain}"
         elif node.get('sender_email'):
-            sender = node.get('sender_email')
+            se = node.get('sender_email')
+            if se and '@' in se:
+                domain = se.split('@', 1)[1]
+                if safe_local:
+                    sender = f"{safe_local}@{domain}"
+                else:
+                    sender = se
+            else:
+                sender = se
         else:
             sender = node.get('username') or mail_from
 
-        # 如果 content 是原始邮件 bytes，则替换邮件头中的 From
+        # 解析并重写消息头：保留所有原始头部，仅覆盖 From 和 Sender，并添加 X-Original-* 供追踪
         msg_bytes = content
         try:
             if isinstance(content, (bytes, bytearray)):
-                try:
-                    msg = message_from_bytes(content)
-                    if 'From' in msg:
-                        del msg['From']
-                    msg['From'] = sender
-                    msg_bytes = msg.as_bytes()
-                except Exception:
-                    msg_bytes = content
+                msg = message_from_bytes(content)
             else:
-                # content 可能为 str
-                try:
-                    msg = message_from_bytes(content.encode('utf-8'))
-                    if 'From' in msg:
-                        del msg['From']
-                    msg['From'] = sender
-                    msg_bytes = msg.as_bytes()
-                except Exception:
-                    msg_bytes = content
+                msg = message_from_bytes(content.encode('utf-8'))
+
+            original_from = msg.get('From')
+            original_sender = msg.get('Sender')
+            if original_from:
+                # 添加原始 From 作为附加头，保留供追溯
+                msg['X-Original-From'] = original_from
+            if original_sender:
+                msg['X-Original-Sender'] = original_sender
+
+            # 覆盖 From/Sender
+            if 'From' in msg:
+                del msg['From']
+            msg['From'] = sender
+            if 'Sender' in msg:
+                del msg['Sender']
+            msg['Sender'] = sender
+
+            msg_bytes = msg.as_bytes()
         except Exception:
             msg_bytes = content
 
