@@ -730,26 +730,37 @@ def dispatcher_thread():
                     "SELECT id, mail_from, rcpt_tos, content, source, assigned_node FROM queue WHERE status='pending' AND source='relay' ORDER BY id ASC LIMIT 50"
                 ).fetchall()
                 
-                if relay_rows:
-                    ids = [r['id'] for r in relay_rows]
-                    placeholders = ','.join(['?'] * len(ids))
-                    conn.execute(f"UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id IN ({placeholders})", ids)
+                for row in relay_rows:
+                    node_name = row['assigned_node']
                     
-                    for row in relay_rows:
-                        node_name = row['assigned_node']
-                        if node_name in node_queues:
-                            try:
-                                task = {
-                                    'id': row['id'],
-                                    'mail_from': row['mail_from'],
-                                    'rcpt_tos': json.loads(row['rcpt_tos']),
-                                    'content': row['content'],
-                                    'source': row['source']
-                                }
-                                node_queues[node_name].put(task, timeout=5)  # 中继邮件等待更长时间
-                            except:
-                                # 队列满了，重置状态
-                                conn.execute("UPDATE queue SET status='pending' WHERE id=?", (row['id'],))
+                    # 确保节点有队列
+                    if node_name not in node_queues:
+                        with node_queue_lock:
+                            if node_name not in node_queues:
+                                node_queues[node_name] = Queue(maxsize=100)
+                            if node_name not in node_workers or not node_workers[node_name].is_alive():
+                                q = node_queues[node_name]
+                                t = threading.Thread(target=node_sender, args=(node_name, q), daemon=True)
+                                t.start()
+                                node_workers[node_name] = t
+                    
+                    if node_name in node_queues:
+                        try:
+                            # 先标记为 processing
+                            conn.execute("UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id=?", (row['id'],))
+                            
+                            task = {
+                                'id': row['id'],
+                                'mail_from': row['mail_from'],
+                                'rcpt_tos': json.loads(row['rcpt_tos']),
+                                'content': row['content'],
+                                'source': row['source']
+                            }
+                            node_queues[node_name].put(task, timeout=5)  # 中继邮件等待更长时间
+                        except Exception as e:
+                            # 队列满了或其他错误，重置状态
+                            conn.execute("UPDATE queue SET status='pending' WHERE id=?", (row['id'],))
+                            logger.warning(f"中继邮件入队失败: {e}")
             
             # 找出需要补充任务的节点（队列少于50个任务）
             nodes_need_tasks = []
