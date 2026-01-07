@@ -49,7 +49,7 @@ install_smtp() {
         cat > "$CONFIG_FILE" << EOF
 {
     "server_config": { "host": "0.0.0.0", "port": 587, "username": "myapp", "password": "123" },
-    "web_config": { "admin_password": "admin", "public_domain": "", "bulk_batch_size": 5000 },
+    "web_config": { "admin_password": "admin", "public_domain": "" },
     "telegram_config": { "bot_token": "", "admin_id": "" },
     "log_config": { "max_mb": 50, "backups": 3, "retention_days": 7 },
     "limit_config": { "max_per_hour": 0, "min_interval": 1, "max_interval": 5 },
@@ -3251,11 +3251,6 @@ EOF
                                     <label class="form-label">追踪域名 (Tracking URL)</label>
                                     <input type="text" v-model="config.web_config.public_domain" class="form-control" placeholder="http://YOUR_IP:8080">
                                     <div class="form-text">用于生成邮件打开追踪链接，请填写公网可访问地址。</div>
-                                </div>
-                                <div class="mb-3">
-                                    <label class="form-label">批量导入批次大小 (bulk_batch_size)</label>
-                                    <input type="number" v-model.number="config.web_config.bulk_batch_size" class="form-control" placeholder="5000">
-                                    <div class="form-text">控制单次批量写入数据库的条数，较大值能提高导入速度，但会消耗更多内存。建议在 1000-20000 范围内测试。</div>
                                 </div>
                             </div>
                         </div>
