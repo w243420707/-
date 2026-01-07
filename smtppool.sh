@@ -39,7 +39,7 @@ install_smtp() {
         python3 -m venv venv
     fi
     "$VENV_DIR/bin/pip" install --upgrade pip
-    "$VENV_DIR/bin/pip" install flask requests aiosmtpd
+    "$VENV_DIR/bin/pip" install flask requests aiosmtpd psutil
 
     if [ -f "/tmp/smtp_config_backup.json" ]; then
         mv "/tmp/smtp_config_backup.json" "$CONFIG_FILE"
@@ -1208,6 +1208,53 @@ def api_queue_stats():
             nodes[n][r['status']] = r['c']
             
     return jsonify({"total": total, "nodes": nodes})
+
+
+@app.route('/api/system/stats')
+@login_required
+def api_system_stats():
+    """Return basic system metrics: CPU, memory, disk, net counters."""
+    try:
+        try:
+            import psutil
+        except Exception:
+            psutil = None
+
+        if psutil:
+            cpu = psutil.cpu_percent(interval=None)
+            vm = psutil.virtual_memory()
+            mem_total = vm.total
+            mem_used = vm.used
+            mem_percent = vm.percent
+            swap = psutil.swap_memory()
+            swap_total = swap.total
+            swap_used = swap.used
+            swap_percent = swap.percent
+            disk = psutil.disk_usage('/')
+            disk_percent = disk.percent
+            net = psutil.net_io_counters()
+            net_sent = net.bytes_sent
+            net_recv = net.bytes_recv
+        else:
+            cpu = 0.0
+            mem_total = mem_used = mem_percent = 0
+            disk_percent = 0
+            net_sent = net_recv = 0
+
+        return jsonify({
+            'cpu_percent': float(cpu),
+            'mem_total': int(mem_total),
+            'mem_used': int(mem_used),
+            'mem_percent': float(mem_percent),
+            'swap_total': int(swap_total) if psutil else 0,
+            'swap_used': int(swap_used) if psutil else 0,
+            'swap_percent': float(swap_percent) if psutil else 0.0,
+            'disk_percent': float(disk_percent),
+            'net_sent': int(net_sent),
+            'net_recv': int(net_recv)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/queue/list')
 @login_required
@@ -2677,6 +2724,38 @@ EOF
                             </div>
                         </div>
                     </div>
+                    <div class="col-md-4 col-12">
+                        <div class="card stat-card h-100">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-start mb-2">
+                                    <div class="p-2 rounded bg-secondary-subtle text-secondary"><i class="bi bi-hdd-fill"></i></div>
+                                    <span class="badge rounded-pill border text-muted">System</span>
+                                </div>
+                                <div class="mb-2">
+                                    <div class="d-flex justify-content-between small text-muted">
+                                        <div>CPU</div><div>[[ system.cpu_percent.toFixed(1) ]]%</div>
+                                    </div>
+                                    <div class="progress mt-1" style="height:6px;"><div class="progress-bar bg-danger" :style="{width: system.cpu_percent + '%'}"></div></div>
+                                </div>
+                                <div class="mb-2">
+                                    <div class="d-flex justify-content-between small text-muted">
+                                        <div>Memory</div><div>[[ bytesToHuman(system.mem_used) ]] / [[ bytesToHuman(system.mem_total) ]] ([[ system.mem_percent.toFixed(1) ]]%)</div>
+                                    </div>
+                                    <div class="progress mt-1" style="height:6px;"><div class="progress-bar bg-info" :style="{width: system.mem_percent + '%'}"></div></div>
+                                </div>
+                                <div class="mb-2">
+                                    <div class="d-flex justify-content-between small text-muted">
+                                        <div>Swap</div><div>[[ bytesToHuman(system.swap_used) ]] / [[ bytesToHuman(system.swap_total) ]] ([[ system.swap_percent.toFixed(1) ]]%)</div>
+                                    </div>
+                                    <div class="progress mt-1" style="height:6px;"><div class="progress-bar bg-secondary" :style="{width: system.swap_percent + '%'}"></div></div>
+                                </div>
+                                <div class="d-flex justify-content-between small text-muted">
+                                    <div>Disk</div><div>[[ system.disk_percent.toFixed(1) ]]%</div>
+                                </div>
+                                <div class="small text-muted mt-2">Net TX: [[ bytesToHuman(system.net_sent) ]] · RX: [[ bytesToHuman(system.net_recv) ]]</div>
+                            </div>
+                        </div>
+                    </div>
                     <div class="col-md-2 col-6" v-for="(label, key) in {'pending': '待发送', 'processing': '发送中', 'sent': '已成功', 'failed': '已失败'}" :key="key">
                         <div class="card stat-card h-100">
                             <div class="card-body">
@@ -3633,7 +3712,7 @@ EOF
         const { createApp } = Vue;
         const app = createApp({
             delimiters: ['[[', ']]'],
-            data() {
+                    data() {
                 return {
                     tab: 'queue',
                     mobileMenu: false,
@@ -3679,7 +3758,9 @@ EOF
                     editingGroupIndex: null,
                     nodeSearch: '',
                     nodeViewMode: 'card'
-                }
+                        ,
+                    system: { cpu_percent: 0, mem_total: 0, mem_used: 0, mem_percent: 0, swap_total: 0, swap_used: 0, swap_percent: 0, disk_percent: 0, net_sent: 0, net_recv: 0 }
+                    }
             },
             computed: {
                 filteredQList() {
@@ -3792,11 +3873,14 @@ EOF
                 this.fetchContactDomainStats();
                 this.fetchBulkStatus();
                 this.fetchTopDomains();
+                this.fetchSystemStats();
                 this.startLogTimer();  // 启动实时日志
                 setInterval(() => {
                     this.fetchQueue();
                     this.fetchBulkStatus();
                 }, 5000);
+                // Poll system stats every 5 seconds
+                setInterval(() => { this.fetchSystemStats(); }, 5000);
                 // Refresh domain stats less frequently (every 30 seconds)
                 setInterval(() => {
                     this.fetchTopDomains();
@@ -3809,6 +3893,33 @@ EOF
                 }
             },
             methods: {
+                bytesToHuman(bytes) {
+                    if (!bytes && bytes !== 0) return '0 B';
+                    const thresh = 1024;
+                    const units = ['B','KB','MB','GB','TB'];
+                    let u = 0;
+                    let val = bytes;
+                    while (val >= thresh && u < units.length - 1) { val /= thresh; u++; }
+                    return val.toFixed(val >= 100 ? 0 : val >= 10 ? 1 : 2) + ' ' + units[u];
+                },
+                async fetchSystemStats() {
+                    try {
+                        const res = await fetch('/api/system/stats');
+                        const d = await res.json();
+                        if (res.ok && d) {
+                            this.system.cpu_percent = d.cpu_percent || 0;
+                            this.system.mem_total = d.mem_total || 0;
+                            this.system.mem_used = d.mem_used || 0;
+                            this.system.mem_percent = d.mem_percent || 0;
+                            this.system.swap_total = d.swap_total || 0;
+                            this.system.swap_used = d.swap_used || 0;
+                            this.system.swap_percent = d.swap_percent || 0;
+                            this.system.disk_percent = d.disk_percent || 0;
+                            this.system.net_sent = d.net_sent || 0;
+                            this.system.net_recv = d.net_recv || 0;
+                        }
+                    } catch(e) { /* ignore */ }
+                },
                 getGroupColor(index) {
                     const colors = ['#6366f1', '#f59e0b', '#10b981', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16'];
                     if (index < 0) return '#6c757d';
