@@ -868,8 +868,9 @@ def dispatcher_thread():
                         ids = [r['id'] for r in rows]
                         placeholders = ','.join(['?'] * len(ids))
                         conn.execute(f"UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id IN ({placeholders})", ids)
-                        
-                        # 放入节点队列
+
+                        # 放入节点队列；若放入失败则回滚对应 id 为 pending，避免永久卡住
+                        failed_ids = []
                         for row in rows:
                             try:
                                 task = {
@@ -880,8 +881,16 @@ def dispatcher_thread():
                                     'source': row['source']
                                 }
                                 node_queues[node_name].put(task, timeout=1)
-                            except:
-                                pass
+                            except Exception as e:
+                                failed_ids.append(row['id'])
+
+                        if failed_ids:
+                            try:
+                                ph = ','.join(['?'] * len(failed_ids))
+                                conn.execute(f"UPDATE queue SET status='pending', updated_at=datetime('now', '+08:00') WHERE id IN ({ph})", failed_ids)
+                                logger.warning(f"⚠️ 节点队列放入失败，已回滚 {len(failed_ids)} 个任务为 pending -> {node_name}")
+                            except Exception as e:
+                                logger.error(f"回滚失败的任务为 pending 时出错: {e}")
             
             time.sleep(0.1)  # 快速循环分发
             
