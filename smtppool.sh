@@ -675,16 +675,14 @@ def node_sender(node_name, task_queue):
                 except: pass
             threading.Thread(target=update_db, daemon=True).start()
             
-            # 日志汇总（每10封或60秒输出一次）
-            now = time.time()
-            if local_success >= 10 or local_fail >= 10 or (now - last_log_time) > 60:
+            # 日志汇总（每10封输出一次）
+            if local_success >= 10 or local_fail >= 10:
                 if local_success > 0:
                     logger.info(f"✅ [{node_name}] 发送成功 {local_success} 封")
                 if local_fail > 0:
                     logger.error(f"❌ [{node_name}] 发送失败 {local_fail} 封 | 错误: {error_msg[:50]}")
                 local_success = 0
                 local_fail = 0
-                last_log_time = now
             
             # 群发间隔控制
             if is_bulk:
