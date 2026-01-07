@@ -446,9 +446,6 @@ class RelayHandler:
             pass
         
         return '250 OK: Queued for redundant delivery'
-        logger.info(
-            f"📥 收到邮件 | 发件人: {envelope.mail_from} ..."
-        )
 
 # --- User Notification Helper ---
 def send_user_notification(email, notify_type, **kwargs):
