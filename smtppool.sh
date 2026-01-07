@@ -670,6 +670,7 @@ def node_sender(node_name, task_queue):
     last_log_time = time.time()
     local_success = 0
     local_fail = 0
+    node_last_sent = 0.0
     
     while not worker_stop_event.is_set():
         try:
@@ -722,6 +723,23 @@ def node_sender(node_name, task_queue):
                         msg_content = msg.as_bytes()
                     except: pass
                 
+                # 群发严格间隔控制：在发送前确保距离上次发送已达到节点设置的间隔
+                if is_bulk:
+                    try:
+                        limit_cfg = cfg.get('limit_config', {})
+                        min_int = float(node.get('min_interval') or limit_cfg.get('min_interval', 1))
+                        max_int = float(node.get('max_interval') or limit_cfg.get('max_interval', 5))
+                        if min_int < 0: min_int = 0
+                        if max_int < min_int: max_int = min_int
+                        chosen_delay = random.uniform(min_int, max_int)
+                    except Exception:
+                        chosen_delay = 1.0
+                    elapsed = time.time() - node_last_sent if node_last_sent else None
+                    if elapsed is None or elapsed < 0:
+                        elapsed = 0
+                    if elapsed < chosen_delay:
+                        time.sleep(chosen_delay - elapsed)
+
                 # 发送邮件
                 encryption = node.get('encryption', 'none')
                 host = node['host']
@@ -743,6 +761,7 @@ def node_sender(node_name, task_queue):
                 success = True
                 local_success += 1
                 node_hourly_count['count'] += 1
+                node_last_sent = time.time()
                 
                 with worker_stats['lock']:
                     worker_stats['success'] += 1
@@ -799,13 +818,7 @@ def node_sender(node_name, task_queue):
                 local_success = 0
                 local_fail = 0
             
-            # 群发间隔控制
-            if is_bulk:
-                global_limit = cfg.get('limit_config', {})
-                min_int = float(node.get('min_interval') or global_limit.get('min_interval', 1))
-                max_int = float(node.get('max_interval') or global_limit.get('max_interval', 5))
-                delay = random.uniform(min_int, max_int)
-                time.sleep(delay)
+            # 注意：群发间隔改为发送前严格控制，已在发送前等待，无需在此重复 sleep
             
             task_queue.task_done()
             
