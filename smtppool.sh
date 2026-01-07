@@ -1218,6 +1218,40 @@ def api_queue_list():
         rows = conn.execute("SELECT id, mail_from, rcpt_tos, assigned_node, status, retry_count, last_error, created_at, subject, smtp_user FROM queue ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
     return jsonify([dict(r) for r in rows])
 
+
+@app.route('/api/queue/drain', methods=['POST'])
+@login_required
+def api_queue_drain():
+    """Drain all in-memory node queues back to DB as pending for rebalancing."""
+    moved = 0
+    try:
+        with node_queue_lock:
+            # For each node queue, drain tasks
+            for node_name, q in list(node_queues.items()):
+                drained_ids = []
+                while True:
+                    try:
+                        task = q.get_nowait()
+                        if isinstance(task, dict) and task.get('id'):
+                            drained_ids.append(int(task['id']))
+                        q.task_done()
+                    except Exception:
+                        break
+
+                if drained_ids:
+                    try:
+                        ph = ','.join(['?'] * len(drained_ids))
+                        with get_db() as conn:
+                            conn.execute(f"UPDATE queue SET status='pending', assigned_node=NULL, updated_at=datetime('now', '+08:00') WHERE id IN ({ph})", drained_ids)
+                        moved += len(drained_ids)
+                    except Exception as e:
+                        logger.error(f"回滚内存队列任务到 DB 失败: {e}")
+        logger.info(f"🔁 已回收 {moved} 个内存排队任务，已置为 pending")
+        return jsonify({"status": "ok", "moved": moved})
+    except Exception as e:
+        logger.error(f"清空内存队列失败: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 @app.route('/api/domain/stats')
 @login_required
 def api_domain_stats():
