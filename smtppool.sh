@@ -2205,6 +2205,37 @@ EOF
                     </div>
                 </div>
 
+                <!-- Live Logs -->
+                <div class="card mb-4">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <div class="d-flex align-items-center gap-2">
+                            <span>实时日志</span>
+                            <span class="badge bg-success" v-if="liveLogsEnabled"><i class="bi bi-broadcast"></i> 实时</span>
+                            <span class="badge bg-secondary" v-else><i class="bi bi-pause-circle"></i> 已暂停</span>
+                        </div>
+                        <div class="d-flex gap-2">
+                            <button class="btn btn-sm" :class="liveLogsEnabled ? 'btn-warning' : 'btn-success'" @click="toggleLiveLogs">
+                                <i class="bi" :class="liveLogsEnabled ? 'bi-pause-fill' : 'bi-play-fill'"></i>
+                                [[ liveLogsEnabled ? '暂停' : '启用' ]]
+                            </button>
+                            <button class="btn btn-sm btn-outline-secondary" @click="clearLogs">
+                                <i class="bi bi-trash"></i> 清空
+                            </button>
+                            <button class="btn btn-sm btn-outline-primary" @click="refreshLogs">
+                                <i class="bi bi-arrow-clockwise"></i> 刷新
+                            </button>
+                        </div>
+                    </div>
+                    <div class="card-body p-0">
+                        <div ref="logContainer" class="log-container font-monospace small" style="height: 300px; overflow-y: auto; background: #1e1e1e; color: #d4d4d4; padding: 10px;">
+                            <div v-for="(log, idx) in liveLogs" :key="idx" class="log-line" :class="getLogClass(log)">
+                                [[ log ]]
+                            </div>
+                            <div v-if="liveLogs.length === 0" class="text-muted text-center py-4">暂无日志</div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Bulk Control Panel -->
                 <div class="card mb-4 border-0 shadow-sm" v-if="totalMails > 0 || bulkStatus == 'paused'">
                     <div class="card-body">
@@ -2364,37 +2395,6 @@ EOF
                                 <tr v-if="filteredQList.length===0"><td colspan="6" class="text-center py-5 text-muted">暂无记录</td></tr>
                             </tbody>
                         </table>
-                    </div>
-                </div>
-                
-                <!-- Live Logs -->
-                <div class="card mt-4">
-                    <div class="card-header d-flex justify-content-between align-items-center">
-                        <div class="d-flex align-items-center gap-2">
-                            <span>实时日志</span>
-                            <span class="badge bg-success" v-if="liveLogsEnabled"><i class="bi bi-broadcast"></i> 实时</span>
-                            <span class="badge bg-secondary" v-else><i class="bi bi-pause-circle"></i> 已暂停</span>
-                        </div>
-                        <div class="d-flex gap-2">
-                            <button class="btn btn-sm" :class="liveLogsEnabled ? 'btn-warning' : 'btn-success'" @click="toggleLiveLogs">
-                                <i class="bi" :class="liveLogsEnabled ? 'bi-pause-fill' : 'bi-play-fill'"></i>
-                                [[ liveLogsEnabled ? '暂停' : '启用' ]]
-                            </button>
-                            <button class="btn btn-sm btn-outline-secondary" @click="clearLogs">
-                                <i class="bi bi-trash"></i> 清空
-                            </button>
-                            <button class="btn btn-sm btn-outline-primary" @click="refreshLogs">
-                                <i class="bi bi-arrow-clockwise"></i> 刷新
-                            </button>
-                        </div>
-                    </div>
-                    <div class="card-body p-0">
-                        <div ref="logContainer" class="log-container font-monospace small" style="height: 300px; overflow-y: auto; background: #1e1e1e; color: #d4d4d4; padding: 10px;">
-                            <div v-for="(log, idx) in liveLogs" :key="idx" class="log-line" :class="getLogClass(log)">
-                                [[ log ]]
-                            </div>
-                            <div v-if="liveLogs.length === 0" class="text-muted text-center py-4">暂无日志</div>
-                        </div>
                     </div>
                 </div>
             </div>
