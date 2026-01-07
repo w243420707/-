@@ -2227,7 +2227,7 @@ EOF
                         </div>
                     </div>
                     <div class="card-body p-0">
-                        <div ref="logContainer" class="log-container font-monospace small" style="height: 300px; overflow-y: auto; background: #1e1e1e; color: #d4d4d4; padding: 10px;">
+                        <div ref="logContainer" class="log-container font-monospace small" style="height: 300px; overflow-y: auto; background: #1e1e1e; color: #d4d4d4; padding: 10px;" @scroll="onLogScroll">
                             <div v-for="(log, idx) in liveLogs" :key="idx" class="log-line" :class="getLogClass(log)">
                                 [[ log ]]
                             </div>
@@ -3247,6 +3247,7 @@ EOF
                     nodeChanges: {},  // Track pending count changes per node
                     liveLogs: [],  // Real-time logs
                     liveLogsEnabled: true,  // Auto-refresh logs
+                    logAtTop: true,  // Whether log container is scrolled to top
                     logTimer: null,  // Log refresh timer
                     theme: 'auto',
                     draggingIndex: null,
@@ -4326,17 +4327,19 @@ EOF
                 },
                 // 实时日志相关方法
                 async fetchLogs() {
+                    // 只有在顶部时才刷新
+                    if(!this.logAtTop) return;
                     try {
                         const res = await fetch('/api/logs?lines=100');
                         const data = await res.json();
                         if(data.logs) {
                             this.liveLogs = data.logs;
-                            this.$nextTick(() => {
-                                const container = this.$refs.logContainer;
-                                if(container) container.scrollTop = 0;  // 保持在顶部（最新日志）
-                            });
                         }
                     } catch(e) { console.error('获取日志失败:', e); }
+                },
+                onLogScroll(e) {
+                    // 检查是否滚动到顶部（允许 5px 的容差）
+                    this.logAtTop = e.target.scrollTop <= 5;
                 },
                 toggleLiveLogs() {
                     this.liveLogsEnabled = !this.liveLogsEnabled;
