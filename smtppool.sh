@@ -563,18 +563,9 @@ node_queues = {}  # { 'node_name': Queue() }
 node_workers = {}  # 节点工作线程
 node_queue_lock = threading.Lock()
 
-# 配置缓存（减少磁盘读取）
-_config_cache = {'data': None, 'time': 0}
-_config_lock = threading.Lock()
-
 def get_cached_config(max_age=2):
-    """获取缓存的配置（最多缓存2秒）"""
-    with _config_lock:
-        now = time.time()
-        if _config_cache['data'] is None or (now - _config_cache['time']) > max_age:
-            _config_cache['data'] = load_config()
-            _config_cache['time'] = now
-        return _config_cache['data']
+    """获取缓存的配置（直接使用 load_config 的缓存）"""
+    return load_config(use_cache=True)
 
 def node_sender(node_name, task_queue):
     """节点发送线程：从内存队列获取任务并发送"""
