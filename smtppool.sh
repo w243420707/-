@@ -304,74 +304,59 @@ class SMTPAuthenticator:
                 logger.warning(f"❌ SMTP Auth unsupported mechanism: {mechanism}")
                 return fail_result
             
-            # Verify user with retry
-            user = None
-            for retry in range(5):
-                try:
-                    with get_db() as conn:
-                        user = conn.execute(
-                            "SELECT * FROM smtp_users WHERE username=? AND password=? AND enabled=1",
-                            (username, password)
-                        ).fetchone()
-                    break
-                except Exception as e:
-                    if 'locked' in str(e) and retry < 4:
-                        time.sleep(0.2 * (retry + 1))
-                        continue
-                    raise
-            
-            if not user:
-                logger.warning(f"❌ SMTP Auth failed: {username}")
-                return fail_result
-            
-            # Check expiry
-            if user['expires_at']:
-                expires = datetime.strptime(user['expires_at'], '%Y-%m-%d %H:%M:%S')
-                if datetime.now() > expires:
-                    logger.warning(f"❌ SMTP Auth expired: {username}")
+            # Verify user
+            with get_db() as conn:
+                user = conn.execute(
+                    "SELECT * FROM smtp_users WHERE username=? AND password=? AND enabled=1",
+                    (username, password)
+                ).fetchone()
+                
+                if not user:
+                    logger.warning(f"❌ SMTP Auth failed: {username}")
                     return fail_result
-            
-            # Check hourly limit - reset if hour changed
-            now = datetime.now()
-            current_hour = now.strftime('%Y-%m-%d %H:00:00')
-            hourly_sent = user['hourly_sent'] or 0
-            hourly_reset_at = user['hourly_reset_at']
-            
-            # Reset hourly count if hour changed (with retry)
-            if hourly_reset_at != current_hour:
-                hourly_sent = 0
-                for retry in range(3):
-                    try:
-                        with get_db() as conn:
-                            conn.execute(
-                                "UPDATE smtp_users SET hourly_sent=0, hourly_reset_at=? WHERE id=?",
-                                (current_hour, user['id'])
-                            )
-                        break
-                    except:
-                        if retry < 2:
-                            time.sleep(0.1 * (retry + 1))
-            
-            # Check hourly limit
-            if user['email_limit'] > 0:
-                percent = int((hourly_sent / user['email_limit']) * 100)
-                if hourly_sent >= user['email_limit']:
-                    logger.warning(f"❌ SMTP Auth hourly limit reached: {username} ({hourly_sent}/{user['email_limit']}/h)")
-                    return fail_result
-                # 80%限额警告（每小时只提醒一次）
-                elif percent >= 80:
-                    notify_key = f"limit_{username}_{current_hour}"
-                    if notify_key not in limit_notify_cache:
-                        limit_notify_cache[notify_key] = True
-                        logger.warning(f"⚠️ 用户 {username} 已达 {percent}% 小时限额 ({hourly_sent}/{user['email_limit']})")
-                        # 异步发送通知邮件
-                        threading.Thread(target=send_user_notification, args=(username, 'limit'), kwargs={'used': hourly_sent, 'limit': user['email_limit'], 'percent': percent}, daemon=True).start()
-            
-            # Store username in session for later use
-            session.smtp_user = username
-            session.smtp_user_id = user['id']
-            logger.info(f"✅ SMTP认证成功: {username} (小时已发: {hourly_sent}/{user['email_limit']})")
-            return AuthResult(success=True)
+                
+                # Check expiry
+                if user['expires_at']:
+                    expires = datetime.strptime(user['expires_at'], '%Y-%m-%d %H:%M:%S')
+                    if datetime.now() > expires:
+                        logger.warning(f"❌ SMTP Auth expired: {username}")
+                        return fail_result
+                
+                # Check hourly limit - reset if hour changed
+                now = datetime.now()
+                current_hour = now.strftime('%Y-%m-%d %H:00:00')
+                hourly_sent = user['hourly_sent'] or 0
+                hourly_reset_at = user['hourly_reset_at']
+                
+                # Reset hourly count if hour changed
+                if hourly_reset_at != current_hour:
+                    hourly_sent = 0
+                    conn.execute(
+                        "UPDATE smtp_users SET hourly_sent=0, hourly_reset_at=? WHERE id=?",
+                        (current_hour, user['id'])
+                    )
+                
+                # Check hourly limit
+                if user['email_limit'] > 0:
+                    percent = int((hourly_sent / user['email_limit']) * 100)
+                    if hourly_sent >= user['email_limit']:
+                        logger.warning(f"❌ SMTP Auth hourly limit reached: {username} ({hourly_sent}/{user['email_limit']}/h)")
+                        return fail_result
+                    # 80%限额警告（每小时只提醒一次）
+                    elif percent >= 80:
+                        notify_key = f"limit_{username}_{current_hour}"
+                        if notify_key not in limit_notify_cache:
+                            limit_notify_cache[notify_key] = True
+                            logger.warning(f"⚠️ 用户 {username} 已达 {percent}% 小时限额 ({hourly_sent}/{user['email_limit']})")
+                            # 异步发送通知邮件
+                            threading.Thread(target=send_user_notification, args=(username, 'limit'), kwargs={'used': hourly_sent, 'limit': user['email_limit'], 'percent': percent}, daemon=True).start()
+                
+                # Store username in session for later use
+                session.smtp_user = username
+                session.smtp_user_id = user['id']
+                logger.info(f"✅ SMTP认证成功: {username} (小时已发: {hourly_sent}/{user['email_limit']})")
+                return AuthResult(success=True)
+        except Exception as e:
             logger.error(f"SMTP认证错误: {e}")
             return fail_result
 
@@ -739,85 +724,49 @@ def dispatcher_thread():
                         node_workers[node_name] = t
                         logger.info(f"🆕 启动节点发送线程: {node_name}")
             
-            # 优先处理中继邮件（relay）- 不管队列是否满都立即处理
-            with get_db() as conn:
-                relay_rows = conn.execute(
-                    "SELECT id, mail_from, rcpt_tos, content, source, assigned_node FROM queue WHERE status='pending' AND source='relay' ORDER BY id ASC LIMIT 50"
-                ).fetchall()
-                
-                for row in relay_rows:
-                    node_name = row['assigned_node']
-                    
-                    # 确保节点有队列
-                    if node_name not in node_queues:
-                        with node_queue_lock:
-                            if node_name not in node_queues:
-                                node_queues[node_name] = Queue(maxsize=100)
-                            if node_name not in node_workers or not node_workers[node_name].is_alive():
-                                q = node_queues[node_name]
-                                t = threading.Thread(target=node_sender, args=(node_name, q), daemon=True)
-                                t.start()
-                                node_workers[node_name] = t
-                    
-                    if node_name in node_queues:
-                        try:
-                            # 先标记为 processing
-                            conn.execute("UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id=?", (row['id'],))
-                            
-                            task = {
-                                'id': row['id'],
-                                'mail_from': row['mail_from'],
-                                'rcpt_tos': json.loads(row['rcpt_tos']),
-                                'content': row['content'],
-                                'source': row['source']
-                            }
-                            node_queues[node_name].put(task, timeout=5)  # 中继邮件等待更长时间
-                        except Exception as e:
-                            # 队列满了或其他错误，重置状态
-                            conn.execute("UPDATE queue SET status='pending' WHERE id=?", (row['id'],))
-                            logger.warning(f"中继邮件入队失败: {e}")
-            
             # 找出需要补充任务的节点（队列少于50个任务）
             nodes_need_tasks = []
             for node_name in enabled_nodes:
                 if node_name in node_queues and node_queues[node_name].qsize() < 50:
                     nodes_need_tasks.append(node_name)
             
-            # 批量从数据库获取群发任务并分发
-            if nodes_need_tasks:
-                with get_db() as conn:
-                    for node_name in nodes_need_tasks:
-                        if bulk_ctrl == 'paused':
-                            rows = conn.execute(
-                                "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
-                                (node_name,)
-                            ).fetchall()
-                        else:
-                            # 只取群发邮件，中继已经在上面处理了
-                            rows = conn.execute(
-                                "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source='bulk' ORDER BY id ASC LIMIT 20",
-                                (node_name,)
-                            ).fetchall()
+            if not nodes_need_tasks:
+                time.sleep(0.5)
+                continue
+            
+            # 批量从数据库获取任务并分发
+            with get_db() as conn:
+                for node_name in nodes_need_tasks:
+                    if bulk_ctrl == 'paused':
+                        rows = conn.execute(
+                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
+                            (node_name,)
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 20",
+                            (node_name,)
+                        ).fetchall()
+                    
+                    if rows:
+                        # 标记为处理中
+                        ids = [r['id'] for r in rows]
+                        placeholders = ','.join(['?'] * len(ids))
+                        conn.execute(f"UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id IN ({placeholders})", ids)
                         
-                        if rows:
-                            # 标记为处理中
-                            ids = [r['id'] for r in rows]
-                            placeholders = ','.join(['?'] * len(ids))
-                            conn.execute(f"UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id IN ({placeholders})", ids)
-                            
-                            # 放入节点队列
-                            for row in rows:
-                                try:
-                                    task = {
-                                        'id': row['id'],
-                                        'mail_from': row['mail_from'],
-                                        'rcpt_tos': json.loads(row['rcpt_tos']),
-                                        'content': row['content'],
-                                        'source': row['source']
-                                    }
-                                    node_queues[node_name].put(task, timeout=1)
-                                except:
-                                    pass
+                        # 放入节点队列
+                        for row in rows:
+                            try:
+                                task = {
+                                    'id': row['id'],
+                                    'mail_from': row['mail_from'],
+                                    'rcpt_tos': json.loads(row['rcpt_tos']),
+                                    'content': row['content'],
+                                    'source': row['source']
+                                }
+                                node_queues[node_name].put(task, timeout=1)
+                            except:
+                                pass
             
             time.sleep(0.1)  # 快速循环分发
             
