@@ -661,7 +661,7 @@ node_queue_lock = threading.Lock()
 # Background writer for bulk inserts: use a queue + batch executemany to improve throughput
 from queue import Queue as _LocalQueue, Empty as _LocalEmpty
 bulk_write_queue = _LocalQueue()
-_BULK_WRITE_BATCH = 2000
+_BULK_WRITE_BATCH = 5000
 
 # bulk write statistics
 bulk_stats_lock = threading.Lock()
