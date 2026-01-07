@@ -281,6 +281,8 @@ def send_telegram(msg):
         except: pass
 
 # --- SMTP Authenticator ---
+limit_notify_cache = {}  # 限额通知缓存，避免重复通知
+
 class SMTPAuthenticator:
     def __call__(self, server, session, envelope, mechanism, auth_data):
         fail_result = AuthResult(success=False, handled=True)
@@ -335,9 +337,19 @@ class SMTPAuthenticator:
                     )
                 
                 # Check hourly limit
-                if user['email_limit'] > 0 and hourly_sent >= user['email_limit']:
-                    logger.warning(f"❌ SMTP Auth hourly limit reached: {username} ({hourly_sent}/{user['email_limit']}/h)")
-                    return fail_result
+                if user['email_limit'] > 0:
+                    percent = int((hourly_sent / user['email_limit']) * 100)
+                    if hourly_sent >= user['email_limit']:
+                        logger.warning(f"❌ SMTP Auth hourly limit reached: {username} ({hourly_sent}/{user['email_limit']}/h)")
+                        return fail_result
+                    # 80%限额警告（每小时只提醒一次）
+                    elif percent >= 80:
+                        notify_key = f"limit_{username}_{current_hour}"
+                        if notify_key not in limit_notify_cache:
+                            limit_notify_cache[notify_key] = True
+                            logger.warning(f"⚠️ 用户 {username} 已达 {percent}% 小时限额 ({hourly_sent}/{user['email_limit']})")
+                            # 异步发送通知邮件
+                            threading.Thread(target=send_user_notification, args=(username, 'limit'), kwargs={'used': hourly_sent, 'limit': user['email_limit'], 'percent': percent}, daemon=True).start()
                 
                 # Store username in session for later use
                 session.smtp_user = username
@@ -442,27 +454,331 @@ class RelayHandler:
             logger.error(f"❌ 数据库错误: {e}")
             return '451 Temporary failure: DB Error'
 
-# --- Queue Worker (Consumer) ---
-def worker_thread():
-    logger.info("👷 Queue Worker Started (Smart Rate Limiting)")
+# --- User Notification Helper ---
+def send_user_notification(email, notify_type, **kwargs):
+    """发送用户通知邮件"""
+    try:
+        cfg = load_config()
+        pool = cfg.get('downstream_pool', [])
+        enabled_nodes = [n for n in pool if n.get('enabled', True)]
+        if not enabled_nodes:
+            logger.warning("❌ 无可用节点发送通知邮件")
+            return False
+        
+        node = enabled_nodes[0]  # 使用第一个可用节点
+        
+        # 构建邮件内容
+        if notify_type == 'expire':
+            expires_at = kwargs.get('expires_at', '未知')
+            subject = '【SMTP中继】账户即将过期提醒'
+            body = f'''
+<html>
+<body style="font-family: Arial, sans-serif; padding: 20px;">
+<h2>账户即将过期提醒</h2>
+<p>尊敬的用户 <strong>{email}</strong>：</p>
+<p>您的SMTP中继账户将于 <strong style="color: red;">{expires_at}</strong> 过期。</p>
+<p>过期后将无法继续发送邮件，请及时续费。</p>
+<hr>
+<p style="color: #666; font-size: 12px;">此邮件由系统自动发送，请勿回复。</p>
+</body>
+</html>
+'''
+        elif notify_type == 'limit':
+            used = kwargs.get('used', 0)
+            limit = kwargs.get('limit', 0)
+            percent = kwargs.get('percent', 0)
+            subject = '【SMTP中继】发送配额提醒'
+            body = f'''
+<html>
+<body style="font-family: Arial, sans-serif; padding: 20px;">
+<h2>发送配额提醒</h2>
+<p>尊敬的用户 <strong>{email}</strong>：</p>
+<p>您当前小时已发送 <strong style="color: orange;">{used}</strong> 封邮件，已达到配额的 <strong>{percent}%</strong>。</p>
+<p>小时限额: {limit} 封/小时</p>
+<p>配额将在整点重置。</p>
+<hr>
+<p style="color: #666; font-size: 12px;">此邮件由系统自动发送，请勿回复。</p>
+</body>
+</html>
+'''
+        else:
+            return False
+        
+        # 构建邮件
+        msg = MIMEMultipart('alternative')
+        msg['Subject'] = subject
+        msg['To'] = email
+        
+        # 设置发件人
+        if node.get('sender_domain'):
+            sender = f"notify@{node['sender_domain']}"
+        elif node.get('sender_email'):
+            sender = node['sender_email']
+        else:
+            sender = node.get('username', 'notify@smtp-relay.local')
+        msg['From'] = sender
+        
+        msg.attach(MIMEText(body, 'html', 'utf-8'))
+        
+        # 发送邮件
+        encryption = node.get('encryption', 'none')
+        host = node['host']
+        port = int(node['port'])
+        
+        if encryption == 'ssl':
+            with smtplib.SMTP_SSL(host, port, timeout=30) as s:
+                if node.get('username') and node.get('password'):
+                    s.login(node['username'], node['password'])
+                s.sendmail(sender, [email], msg.as_bytes())
+        else:
+            with smtplib.SMTP(host, port, timeout=30) as s:
+                if encryption == 'tls':
+                    s.starttls()
+                if node.get('username') and node.get('password'):
+                    s.login(node['username'], node['password'])
+                s.sendmail(sender, [email], msg.as_bytes())
+        
+        return True
+    except Exception as e:
+        logger.error(f"发送通知邮件失败: {e}")
+        return False
+
+# --- Queue Worker (Multi-threaded per Node) ---
+# 全局统计（线程安全）
+import threading
+worker_stats = {
+    'success': 0,
+    'fail': 0,
+    'minute_start': time.time(),
+    'minute_count': 0,
+    'lock': threading.Lock()
+}
+node_workers = {}  # 存储每个节点的工作线程
+worker_stop_event = threading.Event()
+
+def node_worker(node_name):
+    """每个节点独立的发送线程"""
+    logger.info(f"🚀 节点工作线程启动: {node_name}")
     
-    # Runtime state tracking
-    node_next_send_time = {}  # { 'node_name': timestamp }
-    node_hourly_counts = {}   # { 'node_name': { 'hour': 10, 'count': 50 } }
+    node_hourly_count = {'hour': -1, 'count': 0}
+    last_log_time = time.time()
+    local_success = 0
+    local_fail = 0
+    
+    while not worker_stop_event.is_set():
+        try:
+            cfg = load_config()
+            pool_cfg = {n['name']: n for n in cfg.get('downstream_pool', [])}
+            node = pool_cfg.get(node_name)
+            
+            # 节点被删除或禁用，退出线程
+            if not node or not node.get('enabled', True):
+                logger.info(f"🛑 节点 {node_name} 已禁用/删除，线程退出")
+                break
+            
+            # 检查群发控制状态
+            bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
+            
+            # 获取该节点的待发送任务
+            with get_db() as conn:
+                if bulk_ctrl == 'paused':
+                    # 暂停时只处理非群发任务
+                    row = conn.execute(
+                        "SELECT * FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 1",
+                        (node_name,)
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        "SELECT * FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 1",
+                        (node_name,)
+                    ).fetchone()
+            
+            if not row:
+                time.sleep(0.5)
+                continue
+            
+            row_id = row['id']
+            source = row['source']
+            is_bulk = (source == 'bulk')
+            
+            # 获取收件人信息
+            try:
+                rcpt_tos = json.loads(row['rcpt_tos'])
+                rcpt_domain = rcpt_tos[0].split('@')[-1].lower().strip() if rcpt_tos else ''
+            except:
+                rcpt_tos = []
+                rcpt_domain = ''
+            
+            # 检查域名是否被排除
+            rules = node.get('routing_rules', '')
+            if rules and rules.strip():
+                excluded = [d.strip().lower() for d in rules.split(',') if d.strip()]
+                if rcpt_domain in excluded:
+                    # 重新分配到其他节点
+                    available_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True) and (not is_bulk or n.get('allow_bulk', True))]
+                    new_node = select_node_for_recipient(available_nodes, rcpt_tos[0] if rcpt_tos else '', cfg.get('limit_config', {}), source=source)
+                    if new_node:
+                        with get_db() as conn:
+                            conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
+                    else:
+                        with get_db() as conn:
+                            conn.execute("UPDATE queue SET status='failed', last_error=? WHERE id=?", (f'No node for domain: {rcpt_domain}', row_id))
+                    continue
+            
+            # 群发限速检查
+            if is_bulk:
+                # 小时限额检查
+                max_ph = int(node.get('max_per_hour', 0))
+                if max_ph > 0:
+                    current_hour = (datetime.utcnow() + timedelta(hours=8)).hour
+                    if node_hourly_count['hour'] != current_hour:
+                        with get_db() as conn:
+                            cnt = conn.execute(
+                                "SELECT COUNT(*) FROM queue WHERE assigned_node=? AND status='sent' AND updated_at > datetime('now', '+08:00', '-1 hour')", 
+                                (node_name,)
+                            ).fetchone()[0]
+                        node_hourly_count = {'hour': current_hour, 'count': cnt}
+                    
+                    if node_hourly_count['count'] >= max_ph:
+                        logger.warning(f"⚠️ 节点 {node_name} 已达小时限额 ({node_hourly_count['count']}/{max_ph})，等待60秒")
+                        time.sleep(60)
+                        continue
+            
+            # 标记为处理中
+            with get_db() as conn:
+                updated = conn.execute("UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id=? AND status='pending'", (row_id,)).rowcount
+            if updated == 0:
+                continue  # 已被其他线程处理
+            
+            error_msg = ""
+            success = False
+            
+            try:
+                # 构建发件人
+                sender = None
+                if node.get('sender_domain'):
+                    domain = node['sender_domain']
+                    if node.get('sender_random'):
+                        prefix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
+                    else:
+                        prefix = node.get('sender_prefix', 'mail')
+                    sender = f"{prefix}@{domain}"
+                elif node.get('sender_email'):
+                    sender = node['sender_email']
+                else:
+                    sender = row['mail_from'] or node.get('username')
+                
+                msg_content = row['content']
+                
+                # Header rewrite
+                if sender and (node.get('sender_domain') or node.get('sender_email')):
+                    try:
+                        msg = message_from_bytes(msg_content)
+                        if 'From' in msg: del msg['From']
+                        msg['From'] = sender
+                        msg_content = msg.as_bytes()
+                    except: pass
+                
+                # 发送邮件
+                encryption = node.get('encryption', 'none')
+                host = node['host']
+                port = int(node['port'])
+                
+                if encryption == 'ssl':
+                    with smtplib.SMTP_SSL(host, port, timeout=30) as s:
+                        if node.get('username') and node.get('password'): 
+                            s.login(node['username'], node['password'])
+                        s.sendmail(sender, rcpt_tos, msg_content)
+                else:
+                    with smtplib.SMTP(host, port, timeout=30) as s:
+                        if encryption == 'tls':
+                            s.starttls()
+                        if node.get('username') and node.get('password'): 
+                            s.login(node['username'], node['password'])
+                        s.sendmail(sender, rcpt_tos, msg_content)
+                
+                success = True
+                local_success += 1
+                node_hourly_count['count'] += 1
+                
+                # 更新全局统计
+                with worker_stats['lock']:
+                    worker_stats['success'] += 1
+                    worker_stats['minute_count'] += 1
+                    
+                    # 每分钟输出一次速度统计
+                    if time.time() - worker_stats['minute_start'] >= 60:
+                        logger.info(f"📊 发送速度: {worker_stats['minute_count']} 封/分钟 | 总计: {worker_stats['success']} 封")
+                        worker_stats['minute_start'] = time.time()
+                        worker_stats['minute_count'] = 0
+                
+            except Exception as e:
+                error_msg = str(e)
+                local_fail += 1
+                with worker_stats['lock']:
+                    worker_stats['fail'] += 1
+            
+            # 更新数据库
+            with get_db() as conn:
+                if success:
+                    conn.execute("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", (row_id,))
+                else:
+                    conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", (error_msg, row_id))
+            
+            # 日志汇总（每10封或10秒输出一次）
+            now = time.time()
+            if local_success >= 10 or local_fail >= 10 or (now - last_log_time) > 10:
+                if local_success > 0:
+                    logger.info(f"✅ [{node_name}] 发送成功 {local_success} 封 | 最近: {rcpt_tos[0] if rcpt_tos else '?'}")
+                if local_fail > 0:
+                    logger.error(f"❌ [{node_name}] 发送失败 {local_fail} 封 | 最近错误: {error_msg[:50]}")
+                local_success = 0
+                local_fail = 0
+                last_log_time = now
+            
+            # 群发间隔控制
+            if is_bulk:
+                global_limit = cfg.get('limit_config', {})
+                min_int = float(node.get('min_interval') or global_limit.get('min_interval', 1))
+                max_int = float(node.get('max_interval') or global_limit.get('max_interval', 5))
+                delay = random.uniform(min_int, max_int)
+                time.sleep(delay)
+            
+        except Exception as e:
+            logger.error(f"[{node_name}] 工作线程错误: {e}")
+            time.sleep(5)
+    
+    logger.info(f"🛑 节点工作线程退出: {node_name}")
+
+def manager_thread():
+    """管理线程：负责维护任务、启动/停止节点工作线程"""
+    logger.info("👷 队列管理器启动 (多线程模式)")
+    
     last_cleanup_time = 0
     last_stuck_check_time = 0
+    last_user_check_time = 0
+    notified_users = {}
     
-    # 日志汇总计数器
-    log_batch_counter = {'success': 0, 'fail': 0, 'last_log_time': time.time()}
-    LOG_BATCH_SIZE = 10  # 每10封输出一次汇总
-    
-    # 发送速度统计
-    speed_stats = {'minute_start': time.time(), 'minute_count': 0, 'total_sent': 0}
-
-    while True:
+    while not worker_stop_event.is_set():
         try:
             cfg = load_config()
             now = time.time()
+            
+            # 获取所有启用的节点
+            enabled_nodes = {n['name'] for n in cfg.get('downstream_pool', []) if n.get('enabled', True)}
+            
+            # 启动新节点的工作线程
+            for node_name in enabled_nodes:
+                if node_name not in node_workers or not node_workers[node_name].is_alive():
+                    t = threading.Thread(target=node_worker, args=(node_name,), daemon=True)
+                    t.start()
+                    node_workers[node_name] = t
+                    logger.info(f"🆕 启动节点工作线程: {node_name}")
+            
+            # 清理已禁用节点的线程记录
+            dead_nodes = [n for n in node_workers if n not in enabled_nodes]
+            for n in dead_nodes:
+                del node_workers[n]
             
             # --- Reset stuck 'processing' items (every 2 minutes) ---
             if now - last_stuck_check_time > 120:
@@ -488,7 +804,6 @@ def worker_thread():
                 try:
                     days = int(cfg.get('log_config', {}).get('retention_days', 7))
                     if days > 0:
-                        # Calculate cutoff date in Python to avoid SQL injection
                         cutoff = (datetime.utcnow() + timedelta(hours=8) - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
                         with get_db() as conn:
                             conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed') AND updated_at < ?", (cutoff,))
@@ -496,9 +811,51 @@ def worker_thread():
                 except Exception as e:
                     logger.error(f"自动清理失败: {e}")
                 last_cleanup_time = now
-
-            # --- Activate Scheduled Emails (every loop) ---
-            # Change status from 'scheduled' to 'pending' when scheduled_at time has passed
+            
+            # --- User Management Tasks (Every 10 minutes) ---
+            if now - last_user_check_time > 600:
+                try:
+                    current_time = datetime.now()
+                    with get_db() as conn:
+                        expired = conn.execute(
+                            "UPDATE smtp_users SET enabled=0 WHERE enabled=1 AND expires_at IS NOT NULL AND expires_at < ?",
+                            (current_time.strftime('%Y-%m-%d %H:%M:%S'),)
+                        ).rowcount
+                        if expired > 0:
+                            logger.info(f"🚫 自动禁用了 {expired} 个已过期用户")
+                        
+                        cutoff_10days = (current_time - timedelta(days=10)).strftime('%Y-%m-%d %H:%M:%S')
+                        deleted = conn.execute(
+                            "DELETE FROM smtp_users WHERE expires_at IS NOT NULL AND expires_at < ?",
+                            (cutoff_10days,)
+                        ).rowcount
+                        if deleted > 0:
+                            logger.info(f"🗑️ 自动删除了 {deleted} 个过期超过10天的用户")
+                        
+                        warn_cutoff = (current_time + timedelta(days=3)).strftime('%Y-%m-%d %H:%M:%S')
+                        expiring_users = conn.execute(
+                            "SELECT username, expires_at FROM smtp_users WHERE enabled=1 AND expires_at IS NOT NULL AND expires_at > ? AND expires_at < ?",
+                            (current_time.strftime('%Y-%m-%d %H:%M:%S'), warn_cutoff)
+                        ).fetchall()
+                        
+                        for user in expiring_users:
+                            username = user['username']
+                            expires_at = user['expires_at']
+                            notify_key = f"expire_{username}"
+                            if notify_key not in notified_users:
+                                send_user_notification(username, 'expire', expires_at=expires_at)
+                                notified_users[notify_key] = current_time
+                                logger.info(f"📧 已发送过期提醒邮件给 {username}")
+                        
+                        old_keys = [k for k, v in notified_users.items() if (current_time - v).total_seconds() > 86400]
+                        for k in old_keys:
+                            del notified_users[k]
+                            
+                except Exception as e:
+                    logger.error(f"用户管理任务失败: {e}")
+                last_user_check_time = now
+            
+            # --- Activate Scheduled Emails ---
             for retry in range(3):
                 try:
                     current_time = (datetime.utcnow() + timedelta(hours=8)).strftime('%Y-%m-%d %H:%M:%S')
@@ -514,257 +871,18 @@ def worker_thread():
                     if 'locked' in str(e) and retry < 2:
                         time.sleep(0.5 * (retry + 1))
                         continue
-                    logger.error(f"定时邮件激活失败: {e}")
                 except Exception as e:
-                    logger.error(f"定时邮件激活失败: {e}")
                     break
-
-            pool_cfg = {n['name']: n for n in cfg.get('downstream_pool', [])}
             
-            # Global Bulk Control
-            bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
+            time.sleep(5)  # 管理线程每5秒检查一次
             
-            # 1. Identify nodes that are currently cooling down (for BULK only)
-            # If a node is cooling, we should NOT fetch BULK tasks for it, 
-            # but we MUST fetch RELAY tasks for it.
-            blocked_nodes = []
-            for name, next_time in node_next_send_time.items():
-                if now < next_time:
-                    blocked_nodes.append(name)
-            
-            # 2. Fetch pending items with smart filtering
-            # Priority: Relay tasks (source != 'bulk') should be processed first (Jump Queue)
-            with get_db() as conn:
-                if bulk_ctrl == 'paused':
-                    # If paused, only fetch non-bulk (relay)
-                    rows = conn.execute("SELECT * FROM queue WHERE status='pending' AND source != 'bulk' ORDER BY id ASC LIMIT 50").fetchall()
-                elif blocked_nodes:
-                    # Fetch: (All Non-Bulk) OR (Bulk for Non-Blocked Nodes)
-                    placeholders = ','.join(['?'] * len(blocked_nodes))
-                    query = f"SELECT * FROM queue WHERE status='pending' AND (source != 'bulk' OR assigned_node NOT IN ({placeholders})) ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 50"
-                    rows = conn.execute(query, tuple(blocked_nodes)).fetchall()
-                else:
-                    # Fetch everything, but prioritize relay
-                    rows = conn.execute("SELECT * FROM queue WHERE status='pending' ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 50").fetchall()
-
-            if not rows:
-                time.sleep(1)
-                continue
-
-            did_work = False
-
-            for row in rows:
-                row_id = row['id']
-                node_name = row['assigned_node']
-                source = row['source']
-                is_bulk = (source == 'bulk')
-                
-                node = pool_cfg.get(node_name)
-                
-                # Get recipient domain for routing check
-                try:
-                    rcpt_tos = json.loads(row['rcpt_tos'])
-                    rcpt_domain = rcpt_tos[0].split('@')[-1].lower().strip() if rcpt_tos else ''
-                except:
-                    rcpt_domain = ''
-                
-                # Re-route if node removed or disabled
-                if not node or not node.get('enabled', True):
-                    active_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
-                    new_node = select_node_for_recipient(active_nodes, rcpt_tos[0] if rcpt_tos else '', cfg.get('limit_config', {}), source=source) if active_nodes else None
-                    if new_node:
-                        logger.info(f"🔄 重新分配 ID:{row_id} 从 '{node_name}' 到 '{new_node['name']}'")
-                        with get_db() as conn:
-                            conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
-                    else:
-                        with get_db() as conn:
-                            conn.execute("UPDATE queue SET status='failed', last_error='No active nodes available' WHERE id=?", (row_id,))
-                    continue
-
-                # Re-route bulk mails if node's allow_bulk is disabled
-                if is_bulk and not node.get('allow_bulk', True):
-                    bulk_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True) and n.get('allow_bulk', True)]
-                    new_node = select_node_for_recipient(bulk_nodes, rcpt_tos[0] if rcpt_tos else '', cfg.get('limit_config', {}), source=source) if bulk_nodes else None
-                    if new_node:
-                        logger.info(f"🔄 群发重新分配 ID:{row_id} 从 '{node_name}' (禁止群发) 到 '{new_node['name']}'")
-                        with get_db() as conn:
-                            conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
-                    else:
-                        with get_db() as conn:
-                            conn.execute("UPDATE queue SET status='failed', last_error='No bulk-enabled nodes available' WHERE id=?", (row_id,))
-                    continue
-
-                # Re-route if domain is excluded by current node's routing rules
-                rules = node.get('routing_rules', '')
-                if rules and rules.strip():
-                    excluded = [d.strip().lower() for d in rules.split(',') if d.strip()]
-                    if rcpt_domain in excluded:
-                        # Find another node that doesn't exclude this domain
-                        available_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True) and (not is_bulk or n.get('allow_bulk', True))]
-                        new_node = select_node_for_recipient(available_nodes, rcpt_tos[0] if rcpt_tos else '', cfg.get('limit_config', {}), source=source)
-                        if new_node:
-                            logger.info(f"🔄 重新分配 ID:{row_id} 从 '{node_name}' (域名{rcpt_domain}被排除) 到 '{new_node['name']}'")
-                            with get_db() as conn:
-                                conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
-                        else:
-                            with get_db() as conn:
-                                conn.execute("UPDATE queue SET status='failed', last_error='No node available for domain: ' || ? WHERE id=?", (rcpt_domain, row_id))
-                        continue
-
-                # --- Rate Limiting Checks (BULK ONLY) ---
-                if is_bulk:
-                    # A. Interval Check
-                    if now < node_next_send_time.get(node_name, 0):
-                        continue # Should be filtered by SQL, but double check
-
-                    # B. Hourly Limit Check
-                    max_ph = int(node.get('max_per_hour', 0))
-                    if max_ph > 0:
-                        current_hour = (datetime.utcnow() + timedelta(hours=8)).hour
-                        # Reset/Init counter
-                        if node_name not in node_hourly_counts or node_hourly_counts[node_name]['hour'] != current_hour:
-                            with get_db() as conn:
-                                cnt = conn.execute(
-                                    "SELECT COUNT(*) FROM queue WHERE assigned_node=? AND status='sent' AND updated_at > datetime('now', '+08:00', '-1 hour')", 
-                                    (node_name,)
-                                ).fetchone()[0]
-                            node_hourly_counts[node_name] = {'hour': current_hour, 'count': cnt}
-                        
-                        if node_hourly_counts[node_name]['count'] >= max_ph:
-                            # Limit reached, block this node for a while (e.g. 1 min)
-                            node_next_send_time[node_name] = now + 60
-                            logger.warning(f"⚠️ 节点 {node_name} 已达小时限额 ({node_hourly_counts[node_name]['count']}/{max_ph})，暂停60秒")
-                            continue
-                        elif node_hourly_counts[node_name]['count'] >= max_ph * 0.8:
-                            # 80% warning
-                            logger.warning(f"⚠️ 节点 {node_name} 已达 80% 小时限额 ({node_hourly_counts[node_name]['count']}/{max_ph})")
-
-                # --- Processing ---
-                did_work = True
-                
-                # Mark processing
-                with get_db() as conn:
-                    conn.execute("UPDATE queue SET status='processing', updated_at=datetime('now', '+08:00') WHERE id=?", (row_id,))
-
-                # Double check node still exists (in case config changed during batch processing)
-                fresh_cfg = load_config()
-                fresh_pool = {n['name']: n for n in fresh_cfg.get('downstream_pool', [])}
-                node = fresh_pool.get(node_name)
-                if not node or not node.get('enabled', True):
-                    # Node was deleted/disabled, re-route
-                    active_nodes = [n for n in fresh_cfg.get('downstream_pool', []) if n.get('enabled', True)]
-                    new_node = select_node_for_recipient(active_nodes, rcpt_tos[0] if rcpt_tos else '', fresh_cfg.get('limit_config', {}), source=source) if active_nodes else None
-                    if new_node:
-                        logger.info(f"🔄 紧急重新分配 ID:{row_id} 从已删除/禁用节点 '{node_name}' 到 '{new_node['name']}'")
-                        with get_db() as conn:
-                            conn.execute("UPDATE queue SET assigned_node=?, status='pending' WHERE id=?", (new_node['name'], row_id))
-                    else:
-                        with get_db() as conn:
-                            conn.execute("UPDATE queue SET status='failed', last_error='Node deleted and no alternatives' WHERE id=?", (row_id,))
-                    continue
-
-                error_msg = ""
-                success = False
-                
-                try:
-                    # Build sender address
-                    sender = None
-                    if node.get('sender_domain'):
-                        domain = node['sender_domain']
-                        if node.get('sender_random'):
-                            # Random 6-char prefix
-                            prefix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6))
-                        else:
-                            prefix = node.get('sender_prefix', 'mail')
-                        sender = f"{prefix}@{domain}"
-                    elif node.get('sender_email'):
-                        sender = node['sender_email']
-                    else:
-                        sender = row['mail_from'] or node.get('username')
-                    
-                    rcpt_tos = json.loads(row['rcpt_tos'])
-                    msg_content = row['content']
-
-                    # Header rewrite
-                    if sender and (node.get('sender_domain') or node.get('sender_email')):
-                        try:
-                            msg = message_from_bytes(msg_content)
-                            if 'From' in msg: del msg['From']
-                            msg['From'] = sender
-                            msg_content = msg.as_bytes()
-                        except: pass
-
-                    # Handle different encryption modes
-                    encryption = node.get('encryption', 'none')
-                    host = node['host']
-                    port = int(node['port'])
-                    
-                    if encryption == 'ssl':
-                        # SSL mode (usually port 465) - use SMTP_SSL
-                        with smtplib.SMTP_SSL(host, port, timeout=30) as s:
-                            if node.get('username') and node.get('password'): s.login(node['username'], node['password'])
-                            s.sendmail(sender, rcpt_tos, msg_content)
-                    else:
-                        # None or TLS mode (usually port 25/587) - use SMTP with optional STARTTLS
-                        with smtplib.SMTP(host, port, timeout=30) as s:
-                            if encryption == 'tls':
-                                s.starttls()
-                            if node.get('username') and node.get('password'): s.login(node['username'], node['password'])
-                            s.sendmail(sender, rcpt_tos, msg_content)
-                    
-                    success = True
-                    # 汇总日志：每10封输出一次
-                    log_batch_counter['success'] += 1
-                    speed_stats['minute_count'] += 1
-                    speed_stats['total_sent'] += 1
-                    
-                    # 每分钟输出一次速度统计
-                    if time.time() - speed_stats['minute_start'] >= 60:
-                        logger.info(f"📊 发送速度: {speed_stats['minute_count']} 封/分钟 | 本次总计: {speed_stats['total_sent']} 封")
-                        speed_stats['minute_start'] = time.time()
-                        speed_stats['minute_count'] = 0
-                    
-                    if log_batch_counter['success'] >= LOG_BATCH_SIZE or (time.time() - log_batch_counter['last_log_time']) > 10:
-                        logger.info(f"✅ 发送成功 {log_batch_counter['success']} 封 | 最近: {rcpt_tos[0] if rcpt_tos else '未知'} | 节点: {node_name} | 来源: {source}")
-                        log_batch_counter['success'] = 0
-                        log_batch_counter['last_log_time'] = time.time()
-                    
-                    # Update hourly count (All traffic counts towards limit)
-                    if node_name in node_hourly_counts:
-                        node_hourly_counts[node_name]['count'] += 1
-
-                except Exception as e:
-                    error_msg = str(e)
-                    # 失败日志汇总
-                    log_batch_counter['fail'] += 1
-                    if log_batch_counter['fail'] >= LOG_BATCH_SIZE or (time.time() - log_batch_counter['last_log_time']) > 10:
-                        logger.error(f"❌ 发送失败 {log_batch_counter['fail']} 封 | 最近: {rcpt_tos[0] if rcpt_tos else '未知'} | 节点: {node_name} | 错误: {e}")
-                        log_batch_counter['fail'] = 0
-                        log_batch_counter['last_log_time'] = time.time()
-
-                # Update DB
-                with get_db() as conn:
-                    if success:
-                        conn.execute("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", (row_id,))
-                    else:
-                        conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", (error_msg, row_id))
-
-                # --- Set Next Available Time ---
-                # We update the cooling timer for ALL successful sends to pace the connection,
-                # BUT only Bulk items will respect it in the next loop.
-                global_limit = cfg.get('limit_config', {})
-                min_int = int(node.get('min_interval') or global_limit.get('min_interval', 1))
-                max_int = int(node.get('max_interval') or global_limit.get('max_interval', 5))
-                
-                delay = random.uniform(min_int, max_int)
-                node_next_send_time[node_name] = time.time() + delay
-
-            if not did_work:
-                time.sleep(0.5)
-
         except Exception as e:
-            logger.error(f"工作线程错误: {e}")
+            logger.error(f"管理线程错误: {e}")
             time.sleep(5)
+
+def worker_thread():
+    """主入口：启动管理线程"""
+    manager_thread()
 
 # --- Web App ---
 app = Flask(__name__)
