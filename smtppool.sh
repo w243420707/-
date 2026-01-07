@@ -772,15 +772,35 @@ def index(): return render_template('index.html', config=load_config())
 @app.route('/api/save', methods=['POST'])
 @login_required
 def api_save():
+    # Get old config to detect changes
+    old_cfg = load_config(use_cache=False)
+    old_nodes = set(n['name'] for n in old_cfg.get('downstream_pool', []) if n.get('enabled', True))
+    
     save_config(request.json)
     global logger
     logger = setup_logging()
+    
+    # Get new config
+    new_cfg = load_config(use_cache=False)
+    new_nodes = set(n['name'] for n in new_cfg.get('downstream_pool', []) if n.get('enabled', True))
+    
+    # Check if new nodes were added
+    added_nodes = new_nodes - old_nodes
+    
     # Auto rebalance after save (in background thread to avoid blocking)
     def async_rebalance():
         try:
-            count = rebalance_queue_internal()
-            if count > 0:
-                logger.info(f"✅ Auto-rebalanced {count} items after config save")
+            if added_nodes:
+                # New nodes added - do a force rebalance to distribute load
+                logger.info(f"🆕 New nodes detected: {added_nodes}, performing force rebalance...")
+                count = force_rebalance_internal()
+                if count > 0:
+                    logger.info(f"✅ Force rebalanced {count} items after adding new nodes")
+            else:
+                # Normal rebalance (only fix invalid assignments)
+                count = rebalance_queue_internal()
+                if count > 0:
+                    logger.info(f"✅ Auto-rebalanced {count} items after config save")
         except Exception as e:
             logger.error(f"Auto-rebalance failed: {e}")
     threading.Thread(target=async_rebalance, daemon=True).start()
@@ -1723,119 +1743,127 @@ def api_queue_rebalance():
 def api_queue_force_rebalance():
     """Force rebalance: redistribute ALL pending items evenly based on weight, respecting routing rules"""
     try:
-        cfg = load_config(use_cache=False)
-        pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
-        if not pool:
-            return jsonify({"error": "No enabled nodes available"}), 400
+        result = force_rebalance_internal()
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Force rebalance error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+def force_rebalance_internal():
+    """Internal function for force rebalance, returns count and stats"""
+    cfg = load_config(use_cache=False)
+    pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
+    if not pool:
+        return {"status": "ok", "count": 0, "failed": 0, "distribution": {}}
+    
+    bulk_pool = [n for n in pool if n.get('allow_bulk', True)]
+    if not bulk_pool:
+        bulk_pool = pool
+    
+    limit_cfg = cfg.get('limit_config', {})
+    
+    # Pre-compute routing exclusion sets for each node
+    node_exclusions = {}
+    for n in pool:
+        rules = n.get('routing_rules', '')
+        if rules and rules.strip():
+            node_exclusions[n['name']] = set(d.strip().lower() for d in rules.split(',') if d.strip())
+        else:
+            node_exclusions[n['name']] = set()
+    
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, source, rcpt_tos FROM queue WHERE status IN ('pending', 'scheduled') ORDER BY id"
+        ).fetchall()
         
-        bulk_pool = [n for n in pool if n.get('allow_bulk', True)]
-        if not bulk_pool:
-            bulk_pool = pool
+        if not rows:
+            return {"status": "ok", "count": 0, "failed": 0, "distribution": {}}
         
-        limit_cfg = cfg.get('limit_config', {})
+        # Calculate weights for each node based on speed
+        def calc_weight(node):
+            min_i = float(node.get('min_interval') or limit_cfg.get('min_interval', 1))
+            max_i = float(node.get('max_interval') or limit_cfg.get('max_interval', 5))
+            avg_i = (min_i + max_i) / 2
+            if avg_i <= 0.01: avg_i = 0.01
+            speed = 3600 / avg_i
+            max_ph = int(node.get('max_per_hour', 0))
+            if max_ph > 0: speed = min(speed, max_ph)
+            return speed
         
-        # Pre-compute routing exclusion sets for each node
-        node_exclusions = {}
+        pool_weights = {n['name']: calc_weight(n) for n in pool}
+        bulk_weights = {n['name']: calc_weight(n) for n in bulk_pool}
+        
+        # Distribute items proportionally based on weights, respecting routing rules
+        updates = []
+        failures = []
+        # Track assignments per node - include all nodes from both pools
+        all_node_names = set(n['name'] for n in pool) | set(n['name'] for n in bulk_pool)
+        node_counts = {name: 0 for name in all_node_names}
+        
+        # Calculate "flexibility" for each node (how many domains it can accept)
+        # Nodes with fewer exclusions should get more tasks
+        node_flexibility = {}
         for n in pool:
-            rules = n.get('routing_rules', '')
-            if rules and rules.strip():
-                node_exclusions[n['name']] = set(d.strip().lower() for d in rules.split(',') if d.strip())
-            else:
-                node_exclusions[n['name']] = set()
+            excluded = node_exclusions.get(n['name'], set())
+            # Fewer exclusions = higher flexibility score
+            node_flexibility[n['name']] = 1.0 / (1 + len(excluded) * 0.5)  # More exclusions = lower score
         
-        with get_db() as conn:
-            rows = conn.execute(
-                "SELECT id, source, rcpt_tos FROM queue WHERE status IN ('pending', 'scheduled') ORDER BY id"
-            ).fetchall()
+        for r in rows:
+            source = r['source']
             
-            if not rows:
-                return jsonify({"status": "ok", "count": 0, "message": "No items to rebalance"})
+            # Extract domain from recipient
+            try:
+                rcpts = json.loads(r['rcpt_tos'])
+                rcpt = rcpts[0] if rcpts else ''
+                domain = rcpt.split('@')[-1].lower().strip() if '@' in rcpt else ''
+            except:
+                domain = ''
             
-            # Calculate weights for each node based on speed
-            def calc_weight(node):
-                min_i = float(node.get('min_interval') or limit_cfg.get('min_interval', 1))
-                max_i = float(node.get('max_interval') or limit_cfg.get('max_interval', 5))
-                avg_i = (min_i + max_i) / 2
-                if avg_i <= 0.01: avg_i = 0.01
-                speed = 3600 / avg_i
-                max_ph = int(node.get('max_per_hour', 0))
-                if max_ph > 0: speed = min(speed, max_ph)
-                return speed
-            
-            pool_weights = {n['name']: calc_weight(n) for n in pool}
-            bulk_weights = {n['name']: calc_weight(n) for n in bulk_pool}
-            
-            # Distribute items proportionally based on weights, respecting routing rules
-            updates = []
-            failures = []
-            # Track assignments per node - include all nodes from both pools
-            all_node_names = set(n['name'] for n in pool) | set(n['name'] for n in bulk_pool)
-            node_counts = {name: 0 for name in all_node_names}
-            
-            # Calculate "flexibility" for each node (how many domains it can accept)
-            # Nodes with fewer exclusions should get more tasks
-            node_flexibility = {}
-            for n in pool:
+            # Get candidate nodes that accept this domain
+            target_pool = bulk_pool if source == 'bulk' else pool
+            candidates = []
+            for n in target_pool:
                 excluded = node_exclusions.get(n['name'], set())
-                # Fewer exclusions = higher flexibility score
-                node_flexibility[n['name']] = 1.0 / (1 + len(excluded) * 0.5)  # More exclusions = lower score
+                if not domain or domain not in excluded:
+                    candidates.append(n)
             
-            for r in rows:
-                source = r['source']
-                
-                # Extract domain from recipient
-                try:
-                    rcpts = json.loads(r['rcpt_tos'])
-                    rcpt = rcpts[0] if rcpts else ''
-                    domain = rcpt.split('@')[-1].lower().strip() if '@' in rcpt else ''
-                except:
-                    domain = ''
-                
-                # Get candidate nodes that accept this domain
-                target_pool = bulk_pool if source == 'bulk' else pool
-                candidates = []
-                for n in target_pool:
-                    excluded = node_exclusions.get(n['name'], set())
-                    if not domain or domain not in excluded:
-                        candidates.append(n)
-                
-                if not candidates:
-                    # No node accepts this domain
-                    failures.append((r['id'],))
-                    continue
-                
-                # NEW LOGIC: Prioritize nodes with no exclusions (they can handle any domain)
-                # and prefer nodes with lower current load
-                weights = (pool_weights if source != 'bulk' else bulk_weights)
-                
-                # Sort candidates: 
-                # 1. First by flexibility (nodes with no exclusions first)
-                # 2. Then by current load / weight ratio (lower is better)
-                def node_score(n):
-                    name = n['name']
-                    current_load = node_counts[name]
-                    weight = weights.get(name, 1)
-                    flexibility = node_flexibility.get(name, 1)
-                    # Lower score = better choice
-                    # Nodes with high flexibility should have lower base score
-                    # Nodes with fewer current tasks should be preferred
-                    return (current_load + 1) / (weight * flexibility + 0.001)
-                
-                best_node = min(candidates, key=node_score)
-                node_counts[best_node['name']] += 1
-                updates.append((best_node['name'], r['id']))
+            if not candidates:
+                # No node accepts this domain
+                failures.append((r['id'],))
+                continue
             
-            if updates:
-                conn.executemany("UPDATE queue SET assigned_node=? WHERE id=?", updates)
-            if failures:
-                conn.executemany("UPDATE queue SET status='failed', last_error='No node accepts this domain' WHERE id=?", failures)
+            # NEW LOGIC: Prioritize nodes with no exclusions (they can handle any domain)
+            # and prefer nodes with lower current load
+            weights = (pool_weights if source != 'bulk' else bulk_weights)
             
-            logger.info(f"⚡ Force rebalanced {len(updates)} items across nodes, {len(failures)} failed")
+            # Sort candidates: 
+            # 1. First by flexibility (nodes with no exclusions first)
+            # 2. Then by current load / weight ratio (lower is better)
+            def node_score(n):
+                name = n['name']
+                current_load = node_counts[name]
+                weight = weights.get(name, 1)
+                flexibility = node_flexibility.get(name, 1)
+                # Lower score = better choice
+                # Nodes with high flexibility should have lower base score
+                # Nodes with fewer current tasks should be preferred
+                return (current_load + 1) / (weight * flexibility + 0.001)
             
-            # Return distribution stats
-            stats = {n['name']: node_counts.get(n['name'], 0) for n in pool}
-            
-            return jsonify({"status": "ok", "count": len(updates), "failed": len(failures), "distribution": stats})
+            best_node = min(candidates, key=node_score)
+            node_counts[best_node['name']] += 1
+            updates.append((best_node['name'], r['id']))
+        
+        if updates:
+            conn.executemany("UPDATE queue SET assigned_node=? WHERE id=?", updates)
+        if failures:
+            conn.executemany("UPDATE queue SET status='failed', last_error='No node accepts this domain' WHERE id=?", failures)
+        
+        logger.info(f"⚡ Force rebalanced {len(updates)} items across nodes, {len(failures)} failed")
+        
+        # Return distribution stats
+        stats = {n['name']: node_counts.get(n['name'], 0) for n in pool}
+        
+        return {"status": "ok", "count": len(updates), "failed": len(failures), "distribution": stats}
     except Exception as e:
         logger.error(f"Force rebalance error: {e}")
         return jsonify({"error": str(e)}), 500
