@@ -935,12 +935,13 @@ def manager_thread():
                 dispatcher.start()
                 logger.warning("🔄 重启调度器线程")
             
-            # --- Reset stuck 'processing' items (every 2 minutes) ---
-            if now - last_stuck_check_time > 120:
+            # --- Reset stuck 'processing' items (every 30 seconds, mild) ---
+            if now - last_stuck_check_time > 30:
                 for retry in range(3):
                     try:
                         with get_db() as conn:
-                            stuck = conn.execute("UPDATE queue SET status='pending' WHERE status='processing' AND updated_at < datetime('now', '+08:00', '-5 minutes')").rowcount
+                            # 温和模式：判定为卡住的阈值为 2 分钟，避免误判正在发送的任务
+                            stuck = conn.execute("UPDATE queue SET status='pending' WHERE status='processing' AND updated_at < datetime('now', '+08:00', '-2 minutes')").rowcount
                             if stuck > 0:
                                 logger.info(f"🔄 已重置 {stuck} 个卡住的任务")
                         break
@@ -1383,6 +1384,20 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
     try:
         # Process recipients in background to avoid blocking
         recipients = [r.strip() for r in raw_recipients.split('\n') if r.strip()]
+        # If user pasted as a single line with commas/semicolons, handle that too
+        if len(recipients) == 1 and (',' in raw_recipients or ';' in raw_recipients):
+            try:
+                import re
+                parts = re.split(r'[;,\n]+', raw_recipients)
+                recipients = [r.strip() for r in parts if r.strip()]
+            except Exception:
+                pass
+
+        # Log raw size and parsed count for troubleshooting large imports
+        try:
+            logger.info(f"开始群发导入: 原始大小 {len(raw_recipients)} 字节, 解析后收件数 {len(recipients)}")
+        except Exception:
+            pass
         random.shuffle(recipients) # Shuffle for better distribution
         
         cfg = load_config()
