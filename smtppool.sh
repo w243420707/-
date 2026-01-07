@@ -417,7 +417,7 @@ class RelayHandler:
         logger.info(
             f"📥 收到邮件 | 发件人: {envelope.mail_from} | 收件人: {envelope.rcpt_tos[0] if envelope.rcpt_tos else '?'} | 主题: {subject_short} | 节点: {[n['name'] for n in selected_nodes]}"
         )
-                
+        
         # 3. Queue for all selected nodes (No Direct Send anymore to ensure async redundancy)
         try:
             with get_db() as conn:
