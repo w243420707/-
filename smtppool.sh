@@ -2650,93 +2650,23 @@ EOF
                 </div>
 
                 <!-- Live Logs -->
-                <!-- Server Charts: 4 cards with circular percent + small charts -->
+                <!-- Simplified System Overview: text + progress bars to reduce rendering overhead -->
                 <div class="card mb-4">
                     <div class="card-body">
-                        <div class="row g-3">
-                            <div class="col-md-3 col-6">
-                                <div class="card h-100">
-                                    <div class="card-body">
-                                        <div class="d-flex justify-content-between align-items-center">
-                                            <div>
-                                                <div class="small text-muted">CPU</div>
-                                                <div class="fw-bold">[[ system.cpu_percent.toFixed(1) ]]%</div>
-                                            </div>
-                                            <div style="width:56px;height:56px">
-                                                <svg viewBox="0 0 100 100" style="width:56px;height:56px">
-                                                    <circle cx="50" cy="50" r="45" stroke="#e9ecef" stroke-width="8" fill="none"></circle>
-                                                    <circle cx="50" cy="50" r="45" stroke="#ff6b6b" stroke-width="8" fill="none" stroke-linecap="round"
-                                                        :style="{ strokeDasharray: (system.cpu_percent * 2.827433388230814) + ' 282.7433388230814', transform: 'rotate(-90deg) translate(-100px)' }"></circle>
-                                                    <text x="50" y="56" font-size="10" text-anchor="middle" fill="#333">[[ system.cpu_percent.toFixed(0) ]]%</text>
-                                                </svg>
-                                            </div>
-                                        </div>
-                                        <div class="mt-2" style="height:60px"><canvas id="chartCpu" height="60"></canvas></div>
-                                    </div>
-                                </div>
+                        <div class="row g-3 align-items-stretch">
+                            <div class="col-12 col-md-6">
+                                <div class="d-flex justify-content-between small text-muted"><div>CPU</div><div>[[ system.cpu_percent.toFixed(1) ]]%</div></div>
+                                <div class="progress mb-2" style="height:8px;"><div class="progress-bar bg-danger" :style="{width: system.cpu_percent + '%'}"></div></div>
+                                <div class="d-flex justify-content-between small text-muted"><div>Memory</div><div>[[ system.mem_percent.toFixed(1) ]]%</div></div>
+                                <div class="progress mb-2" style="height:8px;"><div class="progress-bar bg-info" :style="{width: system.mem_percent + '%'}"></div></div>
+                                <div class="d-flex justify-content-between small text-muted"><div>Swap</div><div>[[ system.swap_percent.toFixed(1) ]]%</div></div>
+                                <div class="progress mb-2" style="height:8px;"><div class="progress-bar bg-secondary" :style="{width: system.swap_percent + '%'}"></div></div>
                             </div>
-                            <div class="col-md-3 col-6">
-                                <div class="card h-100">
-                                    <div class="card-body">
-                                        <div class="d-flex justify-content-between align-items-center">
-                                            <div>
-                                                <div class="small text-muted">Memory</div>
-                                                <div class="fw-bold">[[ system.mem_percent.toFixed(1) ]]%</div>
-                                            </div>
-                                            <div style="width:56px;height:56px">
-                                                <svg viewBox="0 0 100 100" style="width:56px;height:56px">
-                                                    <circle cx="50" cy="50" r="45" stroke="#e9ecef" stroke-width="8" fill="none"></circle>
-                                                    <circle cxa="50" cy="50" r="45" stroke="#36a2eb" stroke-width="8" fill="none" stroke-linecap="round"
-                                                        :style="{ strokeDasharray: (system.mem_percent * 2.827433388230814) + ' 282.7433388230814', transform: 'rotate(-90deg) translate(-100px)' }"></circle>
-                                                    <text x="50" y="56" font-size="10" text-anchor="middle" fill="#333">[[ system.mem_percent.toFixed(0) ]]%</text>
-                                                </svg>
-                                            </div>
-                                        </div>
-                                        <div class="mt-2" style="height:60px"><canvas id="chartMem" height="60"></canvas></div>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="col-md-3 col-6">
-                                <div class="card h-100">
-                                    <div class="card-body">
-                                        <div class="d-flex justify-content-between align-items-center">
-                                            <div>
-                                                <div class="small text-muted">Swap</div>
-                                                <div class="fw-bold">[[ system.swap_percent.toFixed(1) ]]%</div>
-                                            </div>
-                                            <div style="width:56px;height:56px">
-                                                <svg viewBox="0 0 100 100" style="width:56px;height:56px">
-                                                    <circle cx="50" cy="50" r="45" stroke="#e9ecef" stroke-width="8" fill="none"></circle>
-                                                    <circle cx="50" cy="50" r="45" stroke="#888" stroke-width="8" fill="none" stroke-linecap="round"
-                                                        :style="{ strokeDasharray: (system.swap_percent * 2.827433388230814) + ' 282.7433388230814', transform: 'rotate(-90deg) translate(-100px)' }"></circle>
-                                                    <text x="50" y="56" font-size="10" text-anchor="middle" fill="#333">[[ system.swap_percent.toFixed(0) ]]%</text>
-                                                </svg>
-                                            </div>
-                                        </div>
-                                        <div class="mt-2" style="height:60px"><canvas id="chartSwap" height="60"></canvas></div>
-                                    </div>
-                                </div>
-                            </div>
-                            <div class="col-md-3 col-6">
-                                <div class="card h-100">
-                                    <div class="card-body">
-                                        <div class="d-flex justify-content-between align-items-center">
-                                            <div>
-                                                <div class="small text-muted">Network</div>
-                                                <div class="fw-bold">TX [[ bytesToHuman(system.net_sent) ]] · RX [[ bytesToHuman(system.net_recv) ]]</div>
-                                            </div>
-                                            <div style="width:56px;height:56px">
-                                                <svg viewBox="0 0 100 100" style="width:56px;height:56px">
-                                                    <circle cx="50" cy="50" r="45" stroke="#e9ecef" stroke-width="8" fill="none"></circle>
-                                                    <circle cx="50" cy="50" r="45" stroke="#4bc0c0" stroke-width="8" fill="none" stroke-linecap="round"
-                                                        :style="{ strokeDasharray: ((Math.min(100, (system.net_sent/1024))) * 2.827433388230814) + ' 282.7433388230814', transform: 'rotate(-90deg) translate(-100px)' }"></circle>
-                                                    <text x="50" y="56" font-size="8" text-anchor="middle" fill="#333">[[ bytesToHuman(system.net_sent) ]]</text>
-                                                </svg>
-                                            </div>
-                                        </div>
-                                        <div class="mt-2" style="height:60px"><canvas id="chartNet" height="60"></canvas></div>
-                                    </div>
-                                </div>
+                            <div class="col-12 col-md-6">
+                                <div class="d-flex justify-content-between small text-muted"><div>Disk</div><div>[[ system.disk_percent.toFixed(1) ]]%</div></div>
+                                <div class="progress mb-2" style="height:8px;"><div class="progress-bar bg-warning" :style="{width: system.disk_percent + '%'}"></div></div>
+                                <div class="small text-muted mt-2">Net TX: [[ bytesToHuman(system.net_sent) ]] · RX: [[ bytesToHuman(system.net_recv) ]]</div>
+                                <div class="small text-muted mt-1">Mem: [[ bytesToHuman(system.mem_used) ]] / [[ bytesToHuman(system.mem_total) ]] · Swap: [[ bytesToHuman(system.swap_used) ]] / [[ bytesToHuman(system.swap_total) ]]</div>
                             </div>
                         </div>
                     </div>
