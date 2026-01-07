@@ -304,59 +304,74 @@ class SMTPAuthenticator:
                 logger.warning(f"❌ SMTP Auth unsupported mechanism: {mechanism}")
                 return fail_result
             
-            # Verify user
-            with get_db() as conn:
-                user = conn.execute(
-                    "SELECT * FROM smtp_users WHERE username=? AND password=? AND enabled=1",
-                    (username, password)
-                ).fetchone()
-                
-                if not user:
-                    logger.warning(f"❌ SMTP Auth failed: {username}")
+            # Verify user with retry
+            user = None
+            for retry in range(5):
+                try:
+                    with get_db() as conn:
+                        user = conn.execute(
+                            "SELECT * FROM smtp_users WHERE username=? AND password=? AND enabled=1",
+                            (username, password)
+                        ).fetchone()
+                    break
+                except Exception as e:
+                    if 'locked' in str(e) and retry < 4:
+                        time.sleep(0.2 * (retry + 1))
+                        continue
+                    raise
+            
+            if not user:
+                logger.warning(f"❌ SMTP Auth failed: {username}")
+                return fail_result
+            
+            # Check expiry
+            if user['expires_at']:
+                expires = datetime.strptime(user['expires_at'], '%Y-%m-%d %H:%M:%S')
+                if datetime.now() > expires:
+                    logger.warning(f"❌ SMTP Auth expired: {username}")
                     return fail_result
-                
-                # Check expiry
-                if user['expires_at']:
-                    expires = datetime.strptime(user['expires_at'], '%Y-%m-%d %H:%M:%S')
-                    if datetime.now() > expires:
-                        logger.warning(f"❌ SMTP Auth expired: {username}")
-                        return fail_result
-                
-                # Check hourly limit - reset if hour changed
-                now = datetime.now()
-                current_hour = now.strftime('%Y-%m-%d %H:00:00')
-                hourly_sent = user['hourly_sent'] or 0
-                hourly_reset_at = user['hourly_reset_at']
-                
-                # Reset hourly count if hour changed
-                if hourly_reset_at != current_hour:
-                    hourly_sent = 0
-                    conn.execute(
-                        "UPDATE smtp_users SET hourly_sent=0, hourly_reset_at=? WHERE id=?",
-                        (current_hour, user['id'])
-                    )
-                
-                # Check hourly limit
-                if user['email_limit'] > 0:
-                    percent = int((hourly_sent / user['email_limit']) * 100)
-                    if hourly_sent >= user['email_limit']:
-                        logger.warning(f"❌ SMTP Auth hourly limit reached: {username} ({hourly_sent}/{user['email_limit']}/h)")
-                        return fail_result
-                    # 80%限额警告（每小时只提醒一次）
-                    elif percent >= 80:
-                        notify_key = f"limit_{username}_{current_hour}"
-                        if notify_key not in limit_notify_cache:
-                            limit_notify_cache[notify_key] = True
-                            logger.warning(f"⚠️ 用户 {username} 已达 {percent}% 小时限额 ({hourly_sent}/{user['email_limit']})")
-                            # 异步发送通知邮件
-                            threading.Thread(target=send_user_notification, args=(username, 'limit'), kwargs={'used': hourly_sent, 'limit': user['email_limit'], 'percent': percent}, daemon=True).start()
-                
-                # Store username in session for later use
-                session.smtp_user = username
-                session.smtp_user_id = user['id']
-                logger.info(f"✅ SMTP认证成功: {username} (小时已发: {hourly_sent}/{user['email_limit']})")
-                return AuthResult(success=True)
-        except Exception as e:
+            
+            # Check hourly limit - reset if hour changed
+            now = datetime.now()
+            current_hour = now.strftime('%Y-%m-%d %H:00:00')
+            hourly_sent = user['hourly_sent'] or 0
+            hourly_reset_at = user['hourly_reset_at']
+            
+            # Reset hourly count if hour changed (with retry)
+            if hourly_reset_at != current_hour:
+                hourly_sent = 0
+                for retry in range(3):
+                    try:
+                        with get_db() as conn:
+                            conn.execute(
+                                "UPDATE smtp_users SET hourly_sent=0, hourly_reset_at=? WHERE id=?",
+                                (current_hour, user['id'])
+                            )
+                        break
+                    except:
+                        if retry < 2:
+                            time.sleep(0.1 * (retry + 1))
+            
+            # Check hourly limit
+            if user['email_limit'] > 0:
+                percent = int((hourly_sent / user['email_limit']) * 100)
+                if hourly_sent >= user['email_limit']:
+                    logger.warning(f"❌ SMTP Auth hourly limit reached: {username} ({hourly_sent}/{user['email_limit']}/h)")
+                    return fail_result
+                # 80%限额警告（每小时只提醒一次）
+                elif percent >= 80:
+                    notify_key = f"limit_{username}_{current_hour}"
+                    if notify_key not in limit_notify_cache:
+                        limit_notify_cache[notify_key] = True
+                        logger.warning(f"⚠️ 用户 {username} 已达 {percent}% 小时限额 ({hourly_sent}/{user['email_limit']})")
+                        # 异步发送通知邮件
+                        threading.Thread(target=send_user_notification, args=(username, 'limit'), kwargs={'used': hourly_sent, 'limit': user['email_limit'], 'percent': percent}, daemon=True).start()
+            
+            # Store username in session for later use
+            session.smtp_user = username
+            session.smtp_user_id = user['id']
+            logger.info(f"✅ SMTP认证成功: {username} (小时已发: {hourly_sent}/{user['email_limit']})")
+            return AuthResult(success=True)
             logger.error(f"SMTP认证错误: {e}")
             return fail_result
 
