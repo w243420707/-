@@ -3181,8 +3181,16 @@ EOF
                                 <div class="d-flex align-items-center gap-1">
                                     <span class="small"><i class="bi bi-speedometer2"></i></span>
                                     <input v-model.number="batchEdit.max_per_hour" type="number" class="form-control form-control-sm bg-dark text-white border-secondary" style="width: 60px;" placeholder="/h">
-                                    <button class="btn btn-sm btn-outline-light" @click="applyBatchSpeed">应用速度</button>
                                 </div>
+                                <!-- 批量间隔 -->
+                                <div class="d-flex align-items-center gap-1">
+                                    <span class="small"><i class="bi bi-clock"></i></span>
+                                    <input v-model.number="batchEdit.min_interval" type="number" class="form-control form-control-sm bg-dark text-white border-secondary" style="width: 50px;" placeholder="最小">
+                                    <span class="small">-</span>
+                                    <input v-model.number="batchEdit.max_interval" type="number" class="form-control form-control-sm bg-dark text-white border-secondary" style="width: 50px;" placeholder="最大">
+                                    <span class="small text-muted">秒</span>
+                                </div>
+                                <button class="btn btn-sm btn-outline-light" @click="applyBatchSpeed">应用速度/间隔</button>
                                 <!-- 批量分组 -->
                                 <div class="d-flex align-items-center gap-1" v-if="config.node_groups && config.node_groups.length > 0">
                                     <span class="small"><i class="bi bi-folder"></i></span>
