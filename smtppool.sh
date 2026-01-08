@@ -873,10 +873,17 @@ def node_sender(node_name, task_queue):
                                 greeting = random.choice(greetings)
                                 closing = random.choice(closings)
 
-                                # hidden chat content
+                                # hidden chat content and extra corpus for anti-spam signals (hidden to user)
                                 chat_corpus = CHAT_CORPUS
                                 rand_chat = ' '.join(random.choices(chat_corpus, k=random.randint(5, 12))) if chat_corpus else ''
+                                # additional hidden sentences to embed (only hidden, for filters)
+                                extra_chat = ' '.join(random.choices(chat_corpus, k=random.randint(3, 6))) if chat_corpus else ''
+
+                                # Multiple hiding strategies to increase chance anti-spam sees it while users don't
                                 hidden_style = 'color:transparent;font-size:1px;line-height:1px;max-height:0;opacity:0;overflow:hidden;mso-hide:all;'
+                                offscreen_style = 'position:absolute;left:-9999px;top:-9999px;font-size:1px;opacity:0;'
+                                img_data_uri = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=='
+
                                 hidden_words = rand_chat.split()
                                 hidden_chunks = [' '.join(hidden_words[i:i+3]) for i in range(0, len(hidden_words), 3)] if hidden_words else []
 
@@ -896,10 +903,18 @@ def node_sender(node_name, task_queue):
                                 tracking_base = cfg.get('web_config', {}).get('public_domain', '').rstrip('/')
                                 tracking_html = f"<img src='{tracking_base}/track/{tracking_id}' width='1' height='1' alt='' style='display:none;border:0;'>" if tracking_base else ''
 
+                                # Build final body with multiple hidden insertions: comment, offscreen div, transparent span, and img alt
+                                hidden_comment = f"<!-- {extra_chat} -->" if extra_chat else ''
+                                offscreen_div = f"<div style=\"{offscreen_style}\">{extra_chat}</div>" if extra_chat else ''
+                                img_alt = f"<img src=\"{img_data_uri}\" width=\"1\" height=\"1\" alt=\"{extra_chat}\" style=\"width:1px;height:1px;border:0;opacity:0;\"/>" if extra_chat else ''
+
                                 final_body = f'''<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;">
 {f"<p>{greeting}</p>" if greeting else ""}
 {enhanced_body if enhanced_body else tpl_body}
 <span style=\"{hidden_style}\">{random.choice(hidden_chunks) if hidden_chunks else rand_chat[:50]}</span>
+{hidden_comment}
+{offscreen_div}
+{img_alt}
 {f"<p>{closing}</p>" if closing else ""}
 {tracking_html}
 </div>'''
