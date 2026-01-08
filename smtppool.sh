@@ -2,6 +2,7 @@
 
 # =========================================================
 # SMTP Relay Manager - 终极完美版 (含Web端改密)
+# Version: 20260108123535
 # =========================================================
 
 APP_DIR="/opt/smtp-relay"
@@ -24,6 +25,7 @@ fi
 
 install_smtp() {
     echo -e "${GREEN}🚀 初始化环境...${PLAIN}"
+    echo -e "${GREEN}🔖 安装脚本版本: ${SCRIPT_VERSION}${PLAIN}"
     apt-get update -y
     apt-get install -y python3 python3-venv python3-pip supervisor git ufw curl
 
