@@ -1,9 +1,13 @@
 #!/bin/bash
 
 # =========================================================
-# SMTP Relay Manager - 终极完美版 (含Web端改密)
+# SMTP Relay Manager
 # Version: 20260108123535
 # =========================================================
+# Last update: 2026-01-08 - 20260108123535.2
+# - 在发送时动态增强模板：在 `node_sender` 发送阶段加入随机主题后缀、随机问候/结尾、插入隐藏 chat 内容并生成纯文本部分（保证每封邮件变化）。
+#
+# NOTE: 本文件顶部仅保留最后一次更新记录以便于查阅；每次修改请手动覆盖此条为最新更新内容（保持 `SCRIPT_VERSION` 同步）。
 
 APP_DIR="/opt/smtp-relay"
 LOG_DIR="/var/log/smtp-relay"
@@ -11,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260108123535.2"
+SCRIPT_VERSION="20260108123535.3"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -841,25 +845,82 @@ def node_sender(node_name, task_queue):
                         if tpl:
                             # 确保 tracking_id
                             tracking_id = task.get('tracking_id') or str(uuid.uuid4())
-                            # 基本个性化替换
+                            # 基本接收人
                             recipient = rcpt_tos[0] if isinstance(rcpt_tos, (list, tuple)) and len(rcpt_tos) > 0 else ''
-                            subj = tpl.get('subject') or ''
-                            body = tpl.get('body') or ''
-                            # 常见占位符替换
+                            # 原始模板内容
+                            tpl_subj = tpl.get('subject') or ''
+                            tpl_body = tpl.get('body') or ''
+
+                            # 在发送时动态增强模板：随机主题形式、随机问候/结尾、插入隐藏内容
                             try:
-                                body = body.replace('{{tracking_id}}', tracking_id).replace('{tracking_id}', tracking_id)
-                                body = body.replace('{{email}}', recipient).replace('{email}', recipient).replace('{{rcpt}}', recipient).replace('{rcpt}', recipient)
-                            except Exception:
-                                pass
-                            # 构建 MIME
-                            try:
+                                # random suffix for subject
+                                charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+                                rand_sub = ''.join(random.choices(charset, k=random.randint(4, 8)))
+                                subject_formats = [
+                                    f"{tpl_subj} {rand_sub}",
+                                    f"{tpl_subj} - {rand_sub}",
+                                    f"Re: {tpl_subj}",
+                                    f"Fwd: {tpl_subj}",
+                                    f"{tpl_subj}",
+                                    f"{tpl_subj} #{rand_sub[:4]}",
+                                ]
+                                final_subject = random.choice(subject_formats)
+
+                                # personalization
+                                rcpt_name = recipient.split('@')[0].replace('.', ' ').replace('_', ' ').replace('-', ' ').title()[:20]
+                                greetings = ['', f'Hi,', f'Hello,', f'Hey,', f'{rcpt_name},', f'Hi {rcpt_name},', f'Dear {rcpt_name},', '你好，', '您好，', '']
+                                closings = ['', 'Best,', 'Thanks,', 'Cheers,', 'Regards,', '祝好', '谢谢', '']
+                                greeting = random.choice(greetings)
+                                closing = random.choice(closings)
+
+                                # hidden chat content
+                                chat_corpus = CHAT_CORPUS
+                                rand_chat = ' '.join(random.choices(chat_corpus, k=random.randint(5, 12))) if chat_corpus else ''
+                                hidden_style = 'color:transparent;font-size:1px;line-height:1px;max-height:0;opacity:0;overflow:hidden;mso-hide:all;'
+                                hidden_words = rand_chat.split()
+                                hidden_chunks = [' '.join(hidden_words[i:i+3]) for i in range(0, len(hidden_words), 3)] if hidden_words else []
+
+                                # Interleave hidden content with template body
+                                try:
+                                    body_parts = tpl_body.split('</p>') if tpl_body else ['']
+                                except Exception:
+                                    body_parts = [tpl_body]
+                                enhanced_body = ''
+                                for i, part in enumerate(body_parts):
+                                    enhanced_body += part
+                                    if part.strip() and i < len(hidden_chunks):
+                                        enhanced_body += f"<span style=\"{hidden_style}\">{hidden_chunks[i]}</span>"
+                                    if part.strip() and '<p' in part.lower():
+                                        enhanced_body += '</p>'
+
+                                tracking_base = cfg.get('web_config', {}).get('public_domain', '').rstrip('/')
+                                tracking_html = f"<img src='{tracking_base}/track/{tracking_id}' width='1' height='1' alt='' style='display:none;border:0;'>" if tracking_base else ''
+
+                                final_body = f'''<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;">
+{f"<p>{greeting}</p>" if greeting else ""}
+{enhanced_body if enhanced_body else tpl_body}
+<span style=\"{hidden_style}\">{random.choice(hidden_chunks) if hidden_chunks else rand_chat[:50]}</span>
+{f"<p>{closing}</p>" if closing else ""}
+{tracking_html}
+</div>'''
+
+                                # plain text
+                                import re
+                                plain_text = f"{greeting}\n\n{tpl_body.replace('<br>', chr(10)).replace('<br/>', chr(10)).replace('</p>', chr(10))}\n\n{closing}".strip()
+                                plain_text = re.sub(r'<[^>]+>', '', plain_text)
+
+                                # 构建 MIME
                                 m = MIMEMultipart('alternative')
-                                m['Subject'] = subj
+                                m['Subject'] = final_subject
                                 m['To'] = recipient
                                 m['From'] = sender
-                                m.attach(MIMEText(body, 'html', 'utf-8'))
+                                part1 = MIMEText(plain_text, 'plain', 'utf-8')
+                                part2 = MIMEText(final_body, 'html', 'utf-8')
+                                m.attach(part1)
+                                m.attach(part2)
                                 msg_content = m.as_bytes()
-                                # 确保任务的 tracking_id 写回 DB（异步）以便后续跟踪
+
+                                # 写回 tracking_id（异步）
                                 def write_tracking(rid=row_id, tid=tracking_id):
                                     try:
                                         with get_db() as c:
@@ -2027,9 +2088,21 @@ def api_generate_bulk_templates():
         replace = bool(data.get('replace', False))
         if count <= 0:
             return jsonify({'error': 'Invalid count'}), 400
+
+        # Support multiple subjects and multiple bodies for varied templates
+        subjects = data.get('subjects') or []
+        if isinstance(subjects, str):
+            subjects = [s.strip() for s in subjects.split('\n') if s.strip()]
+        # fallback to single subject string
         subject = data.get('subject', '(No Subject)')
+
+        bodies = data.get('bodies') or []
+        if isinstance(bodies, str):
+            bodies = [b.strip() for b in bodies.split('|||') if b.strip()]
+        # fallback to single body
         body = data.get('body', '')
-        # Prepare rows for batch insert
+
+        # Prepare rows for batch insert, picking random subject/body per template
         rows = []
         now = datetime.utcnow().isoformat() + 'Z'
         for i in range(count):
@@ -2038,8 +2111,16 @@ def api_generate_bulk_templates():
                 suffix = '-' + uuid.uuid4().hex[:6]
             except Exception:
                 suffix = '-' + str(i)
-            subj = subject
-            rows.append((subj + suffix, body, json.dumps({'gen': now, 'idx': i})))
+            # choose subject and body randomly if arrays provided
+            try:
+                chosen_subj = random.choice(subjects) if subjects else subject
+            except Exception:
+                chosen_subj = subject
+            try:
+                chosen_body = random.choice(bodies) if bodies else body
+            except Exception:
+                chosen_body = body
+            rows.append((chosen_subj + suffix, chosen_body, json.dumps({'gen': now, 'idx': i})))
 
         deleted = 0
         with get_db() as conn:
@@ -4668,7 +4749,14 @@ EOF
                     if (!confirm('确定生成 ' + this.templateGenerateCount + ' 个邮件模板吗？')) return;
                     this.generatingTemplates = true;
                     try {
-                            const payload = { count: this.templateGenerateCount, subject: this.bulk.subject || '(No Subject)', body: (this.bulk.bodyList && this.bulk.bodyList[0]) || '', replace: !!this.templateReplace };
+                            // send subjects array (split by lines) and bodies array for varied templates
+                            const subjects = (this.bulk.subject || '').split('\n').map(s => s.trim()).filter(s => s);
+                            const payload = {
+                                count: this.templateGenerateCount,
+                                subjects: subjects.length ? subjects : [this.bulk.subject || '(No Subject)'],
+                                bodies: Array.isArray(this.bulk.bodyList) ? this.bulk.bodyList.filter(b => b && b.trim()) : [(this.bulk.bodyList && this.bulk.bodyList[0]) || ''],
+                                replace: !!this.templateReplace
+                            };
                             const res = await fetch('/api/bulk/templates/generate', {
                                 method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
                             });
