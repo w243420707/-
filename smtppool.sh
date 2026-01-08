@@ -3245,6 +3245,10 @@ EOF
                                         <span v-if="generatingTemplates" class="spinner-border spinner-border-sm me-1"></span>
                                         生成模板
                                     </button>
+                                    <div class="form-check form-check-inline ms-2">
+                                        <input class="form-check-input" type="checkbox" id="tplReplaceCheck" v-model="templateReplace">
+                                        <label class="form-check-label small text-muted" for="tplReplaceCheck">替换旧模板</label>
+                                    </div>
                                     <div class="form-text ms-2" style="font-size:0.85rem;">使用左边的数量生成预置模板（用于加速导入，仅存模板引用）</div>
                                 </div>
                                 <div class="d-flex align-items-center mb-2">
@@ -4061,6 +4065,8 @@ EOF
                     sending: false,
                     templateGenerateCount: 500,
                     generatingTemplates: false,
+                    templateReplace: false,
+                    templateDeleted: 0,
                     contactCount: 0,
                     bulkStatus: 'running',
                     rebalancing: false,
@@ -4662,18 +4668,21 @@ EOF
                     if (!confirm('确定生成 ' + this.templateGenerateCount + ' 个邮件模板吗？')) return;
                     this.generatingTemplates = true;
                     try {
-                        const payload = { count: this.templateGenerateCount, subject: this.bulk.subject || '(No Subject)', body: (this.bulk.bodyList && this.bulk.bodyList[0]) || '' };
-                        const res = await fetch('/api/bulk/templates/generate', {
-                            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
-                        });
-                        const data = await res.json();
-                        if (res.ok && data.inserted) {
-                            alert('已生成 ' + data.inserted + ' 个模板');
-                            this.fetchTemplateCount();
-                        } else {
-                            alert('生成失败: ' + (data.error || '未知错误'));
-                        }
-                    } catch (e) { alert('生成失败: ' + e); }
+                            const payload = { count: this.templateGenerateCount, subject: this.bulk.subject || '(No Subject)', body: (this.bulk.bodyList && this.bulk.bodyList[0]) || '', replace: !!this.templateReplace };
+                            const res = await fetch('/api/bulk/templates/generate', {
+                                method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+                            });
+                            const data = await res.json();
+                            if (res.ok && data.inserted) {
+                                let msg = '已生成 ' + data.inserted + ' 个模板';
+                                if (data.deleted && data.deleted > 0) msg += '；已删除 ' + data.deleted + ' 个旧模板';
+                                alert(msg);
+                                this.templateDeleted = data.deleted || 0;
+                                this.fetchTemplateCount();
+                            } else {
+                                alert('生成失败: ' + (data.error || '未知错误'));
+                            }
+                        } catch (e) { alert('生成失败: ' + e); }
                     this.generatingTemplates = false;
                 },
                 async controlBulk(action) {
