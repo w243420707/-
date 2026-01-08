@@ -4844,7 +4844,7 @@ EOF
                         const server = (this.config.server_smtp && this.config.server_smtp.address) ? this.config.server_smtp.address : (window.location.hostname || 'localhost');
                         const port = (this.config.server_smtp && this.config.server_smtp.port) ? this.config.server_smtp.port : (this.config.server_config && this.config.server_config.port) || 587;
                         const fromAddress = '业务英文名@随便填，例：ARIPORT@qq.com';
-                        const text = `SMTP服务器: ${server}\n端口: ${port}\n用户名: ${u.username}\n密码: ${u.password || ''}\n发件地址: ${fromAddress}\n用户类型: ${u.user_type || '-'}\n到期: ${u.expires_at || '永不过期'}`;
+                        const text = `SMTP服务器: ${server}\n端口: ${port}\n加密：留空\n用户名: ${u.username}\n密码: ${u.password || ''}\n发件地址: ${fromAddress}\n用户类型: ${u.user_type || '-'}\n到期: ${u.expires_at || '永不过期'}`;
                         if (navigator.clipboard && navigator.clipboard.writeText) {
                             await navigator.clipboard.writeText(text);
                         } else {
