@@ -220,6 +220,17 @@ def init_db():
                 conn.execute("ALTER TABLE smtp_users ADD COLUMN hourly_sent INTEGER DEFAULT 0")
             if 'hourly_reset_at' not in cols:
                 conn.execute("ALTER TABLE smtp_users ADD COLUMN hourly_reset_at TIMESTAMP")
+            # Per-user send interval (seconds) - optional
+            if 'min_interval' not in cols:
+                try:
+                    conn.execute("ALTER TABLE smtp_users ADD COLUMN min_interval REAL")
+                except Exception:
+                    pass
+            if 'max_interval' not in cols:
+                try:
+                    conn.execute("ALTER TABLE smtp_users ADD COLUMN max_interval REAL")
+                except Exception:
+                    pass
         except: pass
 
         # bulk_templates table to store pre-generated templates
@@ -683,6 +694,10 @@ worker_stats = {
 }
 worker_stop_event = threading.Event()
 
+# Per-smtp-user last sent timestamps to enforce per-user intervals (in-memory)
+smtp_user_last_sent = {}
+smtp_user_last_lock = threading.Lock()
+
 # 每个节点的内存任务队列
 node_queues = {}  # { 'node_name': Queue() }
 node_workers = {}  # 节点工作线程
@@ -721,7 +736,8 @@ bulk_stats = {
 
 def bulk_writer_thread():
     batch = []
-    insert_sql = "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    # include smtp_user in bulk insert for per-user interval enforcement
+    insert_sql = "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     while True:
         try:
             item = bulk_write_queue.get(timeout=1)
@@ -818,6 +834,7 @@ def node_sender(node_name, task_queue):
             msg_content = task['content']
             source = task['source']
             is_bulk = (source == 'bulk')
+            smtp_user = task.get('smtp_user') if isinstance(task, dict) else None
             
             error_msg = ""
             success = False
@@ -961,22 +978,70 @@ def node_sender(node_name, task_queue):
                         msg_content = msg.as_bytes()
                     except: pass
                 
-                # 群发严格间隔控制：在发送前确保距离上次发送已达到节点设置的间隔
+                # 群发严格间隔控制：在发送前确保距离上次发送已达到节点/用户设置的间隔
                 if is_bulk:
                     try:
                         limit_cfg = cfg.get('limit_config', {})
-                        min_int = float(node.get('min_interval') or limit_cfg.get('min_interval', 1))
-                        max_int = float(node.get('max_interval') or limit_cfg.get('max_interval', 5))
-                        if min_int < 0: min_int = 0
-                        if max_int < min_int: max_int = min_int
-                        chosen_delay = random.uniform(min_int, max_int)
+                        # default to node-level or global limits
+                        node_min = float(node.get('min_interval') or limit_cfg.get('min_interval', 1))
+                        node_max = float(node.get('max_interval') or limit_cfg.get('max_interval', 5))
                     except Exception:
-                        chosen_delay = 1.0
-                    elapsed = time.time() - node_last_sent if node_last_sent else None
-                    if elapsed is None or elapsed < 0:
-                        elapsed = 0
-                    if elapsed < chosen_delay:
-                        time.sleep(chosen_delay - elapsed)
+                        node_min = 1.0
+                        node_max = 1.0
+
+                    # Try per-user overrides if smtp_user present
+                    user_min = None
+                    user_max = None
+                    if smtp_user:
+                        try:
+                            with get_db() as c:
+                                row = c.execute("SELECT min_interval, max_interval FROM smtp_users WHERE username=?", (smtp_user,)).fetchone()
+                                if row:
+                                    # row may return None for columns if not set
+                                    user_min = row['min_interval'] if 'min_interval' in row.keys() else None
+                                    user_max = row['max_interval'] if 'max_interval' in row.keys() else None
+                        except Exception:
+                            user_min = None
+                            user_max = None
+
+                    # Choose which limits to apply: user if set, else node/global
+                    try:
+                        if user_min is not None and user_max is not None:
+                            min_int = float(user_min)
+                            max_int = float(user_max)
+                        elif user_min is not None:
+                            min_int = float(user_min)
+                            max_int = float(user_min)
+                        else:
+                            min_int = float(node_min)
+                            max_int = float(node_max)
+                    except Exception:
+                        min_int = 1.0
+                        max_int = 1.0
+
+                    if min_int < 0: min_int = 0
+                    if max_int < min_int: max_int = min_int
+                    chosen_delay = random.uniform(min_int, max_int) if max_int > min_int else min_int
+
+                    # Enforce per-node spacing as before (node_last_sent), but also per-smtp-user spacing
+                    elapsed_node = time.time() - node_last_sent if node_last_sent else 0
+                    if elapsed_node < 0: elapsed_node = 0
+
+                    need_sleep = 0
+                    if elapsed_node < chosen_delay:
+                        need_sleep = chosen_delay - elapsed_node
+
+                    if smtp_user:
+                        with smtp_user_last_lock:
+                            last = smtp_user_last_sent.get(smtp_user, 0)
+                        elapsed_user = time.time() - last if last else None
+                        if elapsed_user is None:
+                            elapsed_user = 0
+                        if elapsed_user < chosen_delay:
+                            need_sleep = max(need_sleep, chosen_delay - elapsed_user)
+
+                    if need_sleep > 0:
+                        time.sleep(need_sleep)
 
                 # 发送邮件
                 encryption = node.get('encryption', 'none')
@@ -1000,6 +1065,13 @@ def node_sender(node_name, task_queue):
                 local_success += 1
                 node_hourly_count['count'] += 1
                 node_last_sent = time.time()
+                # update per-smtp-user last sent timestamp
+                if smtp_user:
+                    try:
+                        with smtp_user_last_lock:
+                            smtp_user_last_sent[smtp_user] = time.time()
+                    except Exception:
+                        pass
                 
                 with worker_stats['lock']:
                     worker_stats['success'] += 1
@@ -1105,12 +1177,12 @@ def dispatcher_thread():
                 for node_name in nodes_need_tasks:
                     if bulk_ctrl == 'paused':
                         rows = conn.execute(
-                                "SELECT id, mail_from, rcpt_tos, content, source, template_id, tracking_id FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
+                                "SELECT id, mail_from, rcpt_tos, content, source, template_id, tracking_id, smtp_user FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
                                 (node_name,)
                             ).fetchall()
                     else:
                         rows = conn.execute(
-                            "SELECT id, mail_from, rcpt_tos, content, source, template_id, tracking_id FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 20",
+                            "SELECT id, mail_from, rcpt_tos, content, source, template_id, tracking_id, smtp_user FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 20",
                             (node_name,)
                         ).fetchall()
                     
@@ -1131,6 +1203,7 @@ def dispatcher_thread():
                                     'content': row['content'],
                                     'template_id': row['template_id'] if 'template_id' in row.keys() else None,
                                     'tracking_id': row['tracking_id'] if 'tracking_id' in row.keys() else None,
+                                    'smtp_user': row['smtp_user'] if 'smtp_user' in row.keys() else None,
                                     'source': row['source']
                                 }
                                 node_queues[node_name].put(task, timeout=1)
@@ -1978,9 +2051,11 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 # If we have pre-generated templates, only write recipient + template_id to DB
                 if template_ids:
                     chosen_tid = random.choice(template_ids)
-                    record = ('', json.dumps([rcpt]), None, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, chosen_tid)
+                    # smtp_user unknown for bulk imports initiated by UI; leave as NULL
+                    record = ('', json.dumps([rcpt]), None, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, chosen_tid)
                 else:
-                    record = ('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None)
+                    # smtp_user unknown for bulk imports initiated by UI; leave as NULL
+                    record = ('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, None)
                 count += 1
                 # increment expected total and set start_time if first
                 try:
@@ -1998,7 +2073,7 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                     try:
                         with get_db() as conn:
                             conn.execute(
-                                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                     record
                             )
                         with bulk_stats_lock:
@@ -2179,7 +2254,7 @@ def api_bulk_templates_count():
 @login_required
 def api_smtp_users_list():
     with get_db() as conn:
-        rows = conn.execute("SELECT id, username, email_limit, email_sent, hourly_sent, hourly_reset_at, expires_at, enabled, created_at, last_used_at FROM smtp_users ORDER BY id DESC").fetchall()
+        rows = conn.execute("SELECT id, username, email_limit, email_sent, hourly_sent, hourly_reset_at, expires_at, enabled, created_at, last_used_at, min_interval, max_interval FROM smtp_users ORDER BY id DESC").fetchall()
     return jsonify([dict(r) for r in rows])
 
 @app.route('/api/smtp-users', methods=['POST'])
@@ -2190,6 +2265,8 @@ def api_smtp_users_create():
     password = data.get('password', '').strip()
     email_limit = int(data.get('email_limit', 0))
     expires_at = data.get('expires_at', '').strip() or None
+    min_interval = data.get('min_interval')
+    max_interval = data.get('max_interval')
     
     if not username or not password:
         return jsonify({"error": "Username and password required"}), 400
@@ -2197,8 +2274,8 @@ def api_smtp_users_create():
     try:
         with get_db() as conn:
             conn.execute(
-                "INSERT INTO smtp_users (username, password, email_limit, expires_at, enabled) VALUES (?, ?, ?, ?, 1)",
-                (username, password, email_limit, expires_at)
+                "INSERT INTO smtp_users (username, password, email_limit, expires_at, enabled, min_interval, max_interval) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                (username, password, email_limit, expires_at, min_interval, max_interval)
             )
         return jsonify({"status": "ok"})
     except sqlite3.IntegrityError:
@@ -2223,6 +2300,12 @@ def api_smtp_users_update(user_id):
     if 'enabled' in data:
         updates.append("enabled=?")
         params.append(1 if data['enabled'] else 0)
+    if 'min_interval' in data:
+        updates.append("min_interval=?")
+        params.append(float(data['min_interval']) if data['min_interval'] is not None and data['min_interval'] != '' else None)
+    if 'max_interval' in data:
+        updates.append("max_interval=?")
+        params.append(float(data['max_interval']) if data['max_interval'] is not None and data['max_interval'] != '' else None)
     if 'reset_count' in data and data['reset_count']:
         updates.append("email_sent=0")
     
