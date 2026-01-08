@@ -2348,6 +2348,30 @@ def api_smtp_users_batch():
         'yearly': (user_limits.get('yearly', 1000), 365)
     }
     email_limit, days = limit_map.get(user_type, (100, None))
+    # Determine per-type default intervals (can be configured in config.json as "user_intervals": {"free":  [min, max] or {"min":x,"max":y}, ...})
+    user_intervals = cfg.get('user_intervals', {})
+    # helper to normalize interval entry
+    def _norm_interval(val):
+        try:
+            if val is None:
+                return (None, None)
+            if isinstance(val, (list, tuple)) and len(val) >= 2:
+                return (float(val[0]) if val[0] is not None else None, float(val[1]) if val[1] is not None else None)
+            if isinstance(val, dict):
+                return (float(val.get('min')) if val.get('min') is not None else None, float(val.get('max')) if val.get('max') is not None else None)
+            # single numeric value -> use as both min & max
+            return (float(val), float(val))
+        except Exception:
+            return (None, None)
+
+    default_intervals = {
+        'free': (None, None),
+        'monthly': (None, None),
+        'quarterly': (None, None),
+        'yearly': (None, None)
+    }
+    raw_iv = user_intervals.get(user_type, user_intervals.get('default', default_intervals.get(user_type)))
+    min_interval_default, max_interval_default = _norm_interval(raw_iv)
     
     # Generate users
     generated = []
@@ -2364,15 +2388,24 @@ def api_smtp_users_batch():
                 expires_at = (datetime.now() + timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
             
             try:
+                # use type-default intervals when creating users in batch
+                try:
+                    min_i = min_interval_default
+                    max_i = max_interval_default
+                except Exception:
+                    min_i = None
+                    max_i = None
                 conn.execute(
-                    "INSERT INTO smtp_users (username, password, email_limit, expires_at, enabled) VALUES (?, ?, ?, ?, 1)",
-                    (username, password, email_limit, expires_at)
+                    "INSERT INTO smtp_users (username, password, email_limit, expires_at, enabled, min_interval, max_interval) VALUES (?, ?, ?, ?, 1, ?, ?)",
+                    (username, password, email_limit, expires_at, min_i, max_i)
                 )
                 generated.append({
                     'username': username,
                     'password': password,
                     'email_limit': email_limit,
                     'expires_at': expires_at or '永久有效',
+                    'min_interval': min_i,
+                    'max_interval': max_i,
                     'type': user_type
                 })
             except sqlite3.IntegrityError:
