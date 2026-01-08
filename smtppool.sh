@@ -4797,7 +4797,13 @@ EOF
                     if (!this.editingUser && !this.userForm.password) { alert('请输入密码'); return; }
                     try {
                         const payload = { ...this.userForm };
-                        if (payload.expires_at) payload.expires_at = payload.expires_at.replace('T', ' ');
+                        if (payload.expires_at) {
+                            payload.expires_at = payload.expires_at.replace('T', ' ');
+                            // 如果只有到分钟，则补上秒
+                            if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/.test(payload.expires_at)) {
+                                payload.expires_at = payload.expires_at + ':00';
+                            }
+                        }
                         if (this.editingUser) {
                             await fetch('/api/smtp-users/' + this.editingUser.id, {
                                 method: 'PUT',
@@ -4838,7 +4844,7 @@ EOF
                         const server = (this.config.server_smtp && this.config.server_smtp.address) ? this.config.server_smtp.address : (window.location.hostname || 'localhost');
                         const port = (this.config.server_smtp && this.config.server_smtp.port) ? this.config.server_smtp.port : (this.config.server_config && this.config.server_config.port) || 587;
                         const fromAddress = '业务英文名@随便填，例：ARIPORT@qq.com';
-                        const text = `SMTP服务器: ${server}:${port}\n用户名: ${u.username}\n密码: ${u.password || ''}\n发件地址: ${fromAddress}\n用户类型: ${u.user_type || '-'}\n到期: ${u.expires_at || '永不过期'}`;
+                        const text = `SMTP服务器: ${server}\n端口: ${port}\n用户名: ${u.username}\n密码: ${u.password || ''}\n发件地址: ${fromAddress}\n用户类型: ${u.user_type || '-'}\n到期: ${u.expires_at || '永不过期'}`;
                         if (navigator.clipboard && navigator.clipboard.writeText) {
                             await navigator.clipboard.writeText(text);
                         } else {
