@@ -160,8 +160,12 @@ def init_db():
                 conn.execute("ALTER TABLE queue ADD COLUMN smtp_user TEXT")
             if 'scheduled_at' not in cols:
                 conn.execute("ALTER TABLE queue ADD COLUMN scheduled_at TIMESTAMP")
-                if 'template_id' not in cols:
+            # Ensure template_id column exists independently of scheduled_at
+            if 'template_id' not in cols:
+                try:
                     conn.execute("ALTER TABLE queue ADD COLUMN template_id INTEGER")
+                except Exception:
+                    pass
         except Exception as e:
             print(f"DB Init Warning: {e}")
 
