@@ -2259,7 +2259,7 @@ def api_bulk_templates_count():
 @login_required
 def api_smtp_users_list():
     with get_db() as conn:
-        rows = conn.execute("SELECT id, username, email_limit, email_sent, hourly_sent, hourly_reset_at, expires_at, enabled, created_at, last_used_at, min_interval, max_interval, user_type FROM smtp_users ORDER BY id DESC").fetchall()
+        rows = conn.execute("SELECT id, username, password, email_limit, email_sent, hourly_sent, hourly_reset_at, expires_at, enabled, created_at, last_used_at, min_interval, max_interval, user_type FROM smtp_users ORDER BY id DESC").fetchall()
     return jsonify([dict(r) for r in rows])
 
 @app.route('/api/smtp-users', methods=['POST'])
@@ -3689,7 +3689,7 @@ EOF
                             </thead>
                             <tbody>
                                 <tr v-if="smtpUsers.length==0">
-                                    <td colspan="7" class="text-center text-muted py-4">暂无用户数据</td>
+                                    <td colspan="8" class="text-center text-muted py-4">暂无用户数据</td>
                                 </tr>
                                 <tr v-for="u in smtpUsers" :key="u.id">
                                     <td><strong>[[ u.username ]]</strong></td>
@@ -3719,6 +3719,9 @@ EOF
                                         </button>
                                         <button class="btn btn-sm btn-outline-primary me-1" @click="showEditUserModal(u)" title="编辑">
                                             <i class="bi bi-pencil"></i>
+                                        </button>
+                                        <button class="btn btn-sm btn-outline-secondary me-1" @click="copyUserConfig(u)" title="复制配置">
+                                            <i class="bi bi-clipboard"></i>
                                         </button>
                                         <button class="btn btn-sm btn-outline-danger" @click="deleteSmtpUser(u)" title="删除">
                                             <i class="bi bi-trash"></i>
@@ -3891,6 +3894,14 @@ EOF
                                     <label class="form-label">追踪域名 (Tracking URL)</label>
                                     <input type="text" v-model="config.web_config.public_domain" class="form-control" placeholder="http://YOUR_IP:8080">
                                     <div class="form-text">用于生成邮件打开追踪链接，请填写公网可访问地址。</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">外发 SMTP 服务器 (用于复制给用户)</label>
+                                    <div class="input-group">
+                                        <input type="text" v-model="config.server_smtp.address" class="form-control" placeholder="smtp.example.com">
+                                        <input type="number" v-model.number="config.server_smtp.port" class="form-control" style="max-width:120px;" placeholder="587">
+                                    </div>
+                                    <div class="form-text">可选，填写后“复制配置”会使用此服务器地址与端口；留空则使用当前面板或节点域名。</div>
                                 </div>
                             </div>
                         </div>
@@ -4571,6 +4582,7 @@ EOF
                 if(!this.config.log_config) this.config.log_config = { max_mb: 50, backups: 3, retention_days: 7 };
                 if(!this.config.user_limits) this.config.user_limits = { free: 10, monthly: 100, quarterly: 500, yearly: 1000 };
                 if(!this.config.user_intervals) this.config.user_intervals = { free: {min: null, max: null}, monthly: {min: null, max: null}, quarterly: {min: null, max: null}, yearly: {min: null, max: null}, default: {min: null, max: null} };
+                if(!this.config.server_smtp) this.config.server_smtp = { address: '', port: this.config.server_config?.port || 587 };
                 if(!this.config.node_groups) this.config.node_groups = [];
                 this.config.downstream_pool.forEach(n => { 
                     if(n.enabled === undefined) n.enabled = true; 
@@ -4810,6 +4822,26 @@ EOF
                         });
                         this.fetchSmtpUsers();
                     } catch(e) { alert('重置失败: ' + e.message); }
+                },
+                async copyUserConfig(u) {
+                    try {
+                        const server = (this.config.server_smtp && this.config.server_smtp.address) ? this.config.server_smtp.address : (window.location.hostname || 'localhost');
+                        const port = (this.config.server_smtp && this.config.server_smtp.port) ? this.config.server_smtp.port : (this.config.server_config && this.config.server_config.port) || 587;
+                        const fromDomain = (this.config.web_config && this.config.web_config.public_domain) ? this.config.web_config.public_domain.replace(/^https?:\/\//, '').split(':')[0] : (this.config.downstream_pool && this.config.downstream_pool.length ? (this.config.downstream_pool[0].sender_domain || '') : 'example.com');
+                        const fromAddress = u.from_address || (u.username + '@' + (fromDomain || 'example.com'));
+                        const text = `SMTP服务器: ${server}:${port}\n用户名: ${u.username}\n密码: ${u.password || ''}\n发件地址: ${fromAddress}\n用户类型: ${u.user_type || '-'}\n到期: ${u.expires_at || '永不过期'}`;
+                        if (navigator.clipboard && navigator.clipboard.writeText) {
+                            await navigator.clipboard.writeText(text);
+                        } else {
+                            const ta = document.createElement('textarea');
+                            ta.value = text;
+                            document.body.appendChild(ta);
+                            ta.select();
+                            document.execCommand('copy');
+                            document.body.removeChild(ta);
+                        }
+                        alert('已复制配置到剪切板');
+                    } catch(e) { alert('复制失败: ' + e); }
                 },
                 async batchGenerateUsers() {
                     if (!this.batchUserForm.count || this.batchUserForm.count < 1) {
