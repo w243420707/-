@@ -3571,6 +3571,7 @@ EOF
                                     <th>累计</th>
                                     <th>到期时间</th>
                                     <th>状态</th>
+                                    <th>间隔(s)</th>
                                     <th style="width:180px">操作</th>
                                 </tr>
                             </thead>
@@ -3592,6 +3593,10 @@ EOF
                                     </td>
                                     <td>
                                         <span class="badge" :class="u.enabled ? 'bg-success' : 'bg-secondary'">[[ u.enabled ? '启用' : '禁用' ]]</span>
+                                    </td>
+                                    <td>
+                                        <span v-if="u.min_interval || u.max_interval">[[ u.min_interval || '-' ]] / [[ u.max_interval || '-' ]]</span>
+                                        <span v-else class="text-muted">-</span>
                                     </td>
                                     <td>
                                         <button class="btn btn-sm btn-outline-secondary me-1" @click="resetUserCount(u)" title="重置计数">
@@ -3631,6 +3636,18 @@ EOF
                                     <label class="form-label">发送限额 (每小时)</label>
                                     <input type="number" class="form-control" v-model.number="userForm.email_limit" min="0" placeholder="0表示无限制">
                                     <div class="form-text">每小时允许发送的邮件数量，0为不限制</div>
+                                </div>
+                                <div class="row g-2">
+                                    <div class="col-6 mb-3">
+                                        <label class="form-label">用户最小间隔 (秒)</label>
+                                        <input type="number" class="form-control" v-model.number="userForm.min_interval" min="0" placeholder="留空使用节点/全局设置">
+                                        <div class="form-text">每个用户的最小发送间隔，单位秒（可选）</div>
+                                    </div>
+                                    <div class="col-6 mb-3">
+                                        <label class="form-label">用户最大间隔 (秒)</label>
+                                        <input type="number" class="form-control" v-model.number="userForm.max_interval" min="0" placeholder="留空使用节点/全局设置">
+                                        <div class="form-text">每个用户的最大发送间隔，单位秒（可选）</div>
+                                    </div>
                                 </div>
                                 <div class="mb-3">
                                     <label class="form-label">到期时间</label>
@@ -4274,7 +4291,7 @@ EOF
                     smtpUsers: [],
                     showUserModal: false,
                     editingUser: null,
-                    userForm: { username: '', password: '', email_limit: 0, expires_at: '', enabled: true },
+                    userForm: { username: '', password: '', email_limit: 0, expires_at: '', enabled: true, min_interval: null, max_interval: null },
                     showBatchUserModal: false,
                     batchUserForm: { type: 'monthly', count: 10, prefix: '' },
                     batchGenerating: false,
@@ -4572,7 +4589,7 @@ EOF
                 },
                 showAddUserModal() {
                     this.editingUser = null;
-                    this.userForm = { username: '', password: '', email_limit: 0, expires_at: '', enabled: true };
+                    this.userForm = { username: '', password: '', email_limit: 0, expires_at: '', enabled: true, min_interval: null, max_interval: null };
                     this.showUserModal = true;
                 },
                 showEditUserModal(u) {
@@ -4582,7 +4599,9 @@ EOF
                         password: '', 
                         email_limit: u.email_limit, 
                         expires_at: u.expires_at ? u.expires_at.replace(' ', 'T') : '',
-                        enabled: u.enabled 
+                        enabled: u.enabled,
+                        min_interval: u.min_interval !== undefined ? u.min_interval : null,
+                        max_interval: u.max_interval !== undefined ? u.max_interval : null
                     };
                     this.showUserModal = true;
                 },
