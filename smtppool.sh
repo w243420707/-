@@ -8,6 +8,9 @@ APP_DIR="/opt/smtp-relay"
 LOG_DIR="/var/log/smtp-relay"
 VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
+# 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
+# 格式建议：YYYYMMDD.N (例如 20260108.1)
+SCRIPT_VERSION="20260108123535"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -281,9 +284,11 @@ def setup_logging():
     logger = logging.getLogger('SMTP-Relay')
     logger.setLevel(logging.INFO)
     logger.handlers = []
-    handler = RotatingFileHandler(LOG_FILE, maxBytes=log_cfg.get('max_mb', 50)*1024*1024, backupCount=log_cfg.get('backups', 3))
+    handler = RotatingFileHandler(LOG_FILE, maxBytes=log_cfg.get('max_mb', 50)*1024*1024, backupCount=log_cfg.get('backups', 3), encoding='utf-8')
     handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     logger.addHandler(handler)
+    # Prevent messages propagating to root handlers (which may use system encoding)
+    logger.propagate = False
     return logger
 
 logger = setup_logging()
@@ -746,7 +751,7 @@ def bulk_writer_thread():
                 batch = []
         except _LocalEmpty:
             # flush any remaining batch
-                    if batch:
+            if batch:
                 try:
                     with get_db() as conn:
                         conn.executemany(insert_sql, batch)
@@ -2693,9 +2698,19 @@ def start_services():
     print(f"SMTP Port: {port}, Auth Required: {require_auth}")
     
     # Start SMTP Server
+    # On Windows using '0.0.0.0' as the controller hostname causes a connect() check to fail.
+    bind_host = '0.0.0.0'
+    controller_host = bind_host
+    try:
+        import sys as _sys
+        if _sys.platform and _sys.platform.startswith('win'):
+            controller_host = '127.0.0.1'
+    except Exception:
+        controller_host = bind_host
+
     controller = AuthController(
-        RelayHandler(), 
-        hostname='0.0.0.0', 
+        RelayHandler(),
+        hostname=controller_host,
         port=port,
         require_auth=require_auth
     )
@@ -2710,6 +2725,22 @@ def start_services():
 if __name__ == '__main__':
     start_services()
 EOF
+
+    # --- Installer: inject installer script version into generated app.py and write a version file ---
+    # This helps to verify the installer applied the expected version.
+    echo "# Installer injected version" >> "$APP_DIR/app.py"
+    echo "SCRIPT_VERSION = \"${SCRIPT_VERSION}\"" >> "$APP_DIR/app.py"
+    cat >> "$APP_DIR/app.py" << EOF
+try:
+    @app.route('/api/script_version')
+    def api_script_version():
+        return jsonify({'script_version': SCRIPT_VERSION})
+except Exception:
+    pass
+EOF
+
+    # Also write a simple version file for quick checks
+    echo "${SCRIPT_VERSION}" > "$APP_DIR/INSTALLER_VERSION"
 
     # --- 2. 写入 index.html (前端增加队列管理) ---
     cat > "$APP_DIR/templates/index.html" << 'EOF'
