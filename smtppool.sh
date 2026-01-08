@@ -363,8 +363,16 @@ class SMTPAuthenticator:
                 
                 # Check expiry
                 if user['expires_at']:
-                    expires = datetime.strptime(user['expires_at'], '%Y-%m-%d %H:%M:%S')
-                    if datetime.now() > expires:
+                    expires = None
+                    try:
+                        expires = datetime.strptime(user['expires_at'], '%Y-%m-%d %H:%M:%S')
+                    except ValueError:
+                        try:
+                            expires = datetime.strptime(user['expires_at'], '%Y-%m-%d %H:%M')
+                        except Exception as e:
+                            logger.error(f"SMTP认证错误: 时间格式不支持: {user['expires_at']} ({e})")
+                            return fail_result
+                    if expires and datetime.now() > expires:
                         logger.warning(f"❌ SMTP Auth expired: {username}")
                         return fail_result
                 
