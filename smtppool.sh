@@ -3897,11 +3897,13 @@ EOF
                                 </div>
                                 <div class="mb-3">
                                     <label class="form-label">外发 SMTP 服务器 (用于复制给用户)</label>
-                                    <div class="input-group">
-                                        <input type="text" v-model="config.server_smtp.address" class="form-control" placeholder="smtp.example.com">
-                                        <input type="number" v-model.number="config.server_smtp.port" class="form-control" style="max-width:120px;" placeholder="587">
-                                    </div>
-                                    <div class="form-text">可选，填写后“复制配置”会使用此服务器地址与端口；留空则使用当前面板或节点域名。</div>
+                                    <input type="text" v-model="config.server_smtp.address" class="form-control" placeholder="smtp.example.com">
+                                    <div class="form-text">填写用于复制到用户的 SMTP 地址（如 smtp.example.com）。留空则使用面板主机名或节点域名。</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">外发 SMTP 端口</label>
+                                    <input type="number" v-model.number="config.server_smtp.port" class="form-control" placeholder="587">
+                                    <div class="form-text">填写端口号（如 587）。</div>
                                 </div>
                             </div>
                         </div>
@@ -4827,8 +4829,7 @@ EOF
                     try {
                         const server = (this.config.server_smtp && this.config.server_smtp.address) ? this.config.server_smtp.address : (window.location.hostname || 'localhost');
                         const port = (this.config.server_smtp && this.config.server_smtp.port) ? this.config.server_smtp.port : (this.config.server_config && this.config.server_config.port) || 587;
-                        const fromDomain = (this.config.web_config && this.config.web_config.public_domain) ? this.config.web_config.public_domain.replace(/^https?:\/\//, '').split(':')[0] : (this.config.downstream_pool && this.config.downstream_pool.length ? (this.config.downstream_pool[0].sender_domain || '') : 'example.com');
-                        const fromAddress = u.from_address || (u.username + '@' + (fromDomain || 'example.com'));
+                        const fromAddress = '业务英文名@随便填，例：ARIPORT@qq.com';
                         const text = `SMTP服务器: ${server}:${port}\n用户名: ${u.username}\n密码: ${u.password || ''}\n发件地址: ${fromAddress}\n用户类型: ${u.user_type || '-'}\n到期: ${u.expires_at || '永不过期'}`;
                         if (navigator.clipboard && navigator.clipboard.writeText) {
                             await navigator.clipboard.writeText(text);
