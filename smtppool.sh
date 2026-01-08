@@ -3826,6 +3826,43 @@ EOF
                                     </div>
                                 </div>
                                 <div class="form-text mt-2">批量生成用户时将使用这些每小时发送限额</div>
+
+                                <hr/>
+                                <div class="row g-3 mt-2">
+                                    <div class="col-md-3 col-6">
+                                        <label class="form-label">免费用户 间隔 (秒)</label>
+                                        <div class="input-group">
+                                            <input type="number" v-model.number="config.user_intervals.free.min" class="form-control" placeholder="min">
+                                            <span class="input-group-text">~</span>
+                                            <input type="number" v-model.number="config.user_intervals.free.max" class="form-control" placeholder="max">
+                                        </div>
+                                    </div>
+                                    <div class="col-md-3 col-6">
+                                        <label class="form-label">月度用户 间隔 (秒)</label>
+                                        <div class="input-group">
+                                            <input type="number" v-model.number="config.user_intervals.monthly.min" class="form-control" placeholder="min">
+                                            <span class="input-group-text">~</span>
+                                            <input type="number" v-model.number="config.user_intervals.monthly.max" class="form-control" placeholder="max">
+                                        </div>
+                                    </div>
+                                    <div class="col-md-3 col-6">
+                                        <label class="form-label">季度用户 间隔 (秒)</label>
+                                        <div class="input-group">
+                                            <input type="number" v-model.number="config.user_intervals.quarterly.min" class="form-control" placeholder="min">
+                                            <span class="input-group-text">~</span>
+                                            <input type="number" v-model.number="config.user_intervals.quarterly.max" class="form-control" placeholder="max">
+                                        </div>
+                                    </div>
+                                    <div class="col-md-3 col-6">
+                                        <label class="form-label">年度用户 间隔 (秒)</label>
+                                        <div class="input-group">
+                                            <input type="number" v-model.number="config.user_intervals.yearly.min" class="form-control" placeholder="min">
+                                            <span class="input-group-text">~</span>
+                                            <input type="number" v-model.number="config.user_intervals.yearly.max" class="form-control" placeholder="max">
+                                        </div>
+                                    </div>
+                                </div>
+                                <div class="form-text mt-2">批量生成用户时将使用这些每用户的发送间隔（秒）。可留空使用默认节点/全局设置。</div>
                             </div>
                         </div>
                     </div>
@@ -4440,6 +4477,7 @@ EOF
                 if(!this.config.limit_config) this.config.limit_config = { max_per_hour: 0, min_interval: 1, max_interval: 5 };
                 if(!this.config.log_config) this.config.log_config = { max_mb: 50, backups: 3, retention_days: 7 };
                 if(!this.config.user_limits) this.config.user_limits = { free: 10, monthly: 100, quarterly: 500, yearly: 1000 };
+                if(!this.config.user_intervals) this.config.user_intervals = { free: {min: null, max: null}, monthly: {min: null, max: null}, quarterly: {min: null, max: null}, yearly: {min: null, max: null}, default: {min: null, max: null} };
                 if(!this.config.node_groups) this.config.node_groups = [];
                 this.config.downstream_pool.forEach(n => { 
                     if(n.enabled === undefined) n.enabled = true; 
