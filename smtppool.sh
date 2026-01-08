@@ -908,21 +908,25 @@ def node_sender(node_name, task_queue):
                                 offscreen_div = f"<div style=\"{offscreen_style}\">{extra_chat}</div>" if extra_chat else ''
                                 img_alt = f"<img src=\"{img_data_uri}\" width=\"1\" height=\"1\" alt=\"{extra_chat}\" style=\"width:1px;height:1px;border:0;opacity:0;\"/>" if extra_chat else ''
 
+                                # 将问候语和结尾从可见 HTML 中隐藏，并且不要写入纯文本部分（避免在纯文本客户端中显示）
+                                hidden_greeting_html = f"<span style=\"{hidden_style}\">{greeting}</span>" if greeting else ""
+                                hidden_closing_html = f"<span style=\"{hidden_style}\">{closing}</span>" if closing else ""
+
                                 final_body = f'''<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;">
-{f"<p>{greeting}</p>" if greeting else ""}
+{hidden_greeting_html}
 {enhanced_body if enhanced_body else tpl_body}
-<span style=\"{hidden_style}\">{random.choice(hidden_chunks) if hidden_chunks else rand_chat[:50]}</span>
+<span style=\"{hidden_style}\">{random.choice(hidden_chunks) if hidden_chunks else (rand_chat[:50] if rand_chat else '')}</span>
 {hidden_comment}
 {offscreen_div}
 {img_alt}
-{f"<p>{closing}</p>" if closing else ""}
+{hidden_closing_html}
 {tracking_html}
 </div>'''
 
-                                # plain text
+                                # 纯文本部分不包含问候语/结尾，避免在只显示纯文本的客户端中可见
                                 import re
-                                plain_text = f"{greeting}\n\n{tpl_body.replace('<br>', chr(10)).replace('<br/>', chr(10)).replace('</p>', chr(10))}\n\n{closing}".strip()
-                                plain_text = re.sub(r'<[^>]+>', '', plain_text)
+                                plain_text = tpl_body.replace('<br>', chr(10)).replace('<br/>', chr(10)).replace('</p>', chr(10)) if tpl_body else ''
+                                plain_text = re.sub(r'<[^>]+>', '', plain_text).strip()
 
                                 # 构建 MIME
                                 m = MIMEMultipart('alternative')
