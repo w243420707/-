@@ -220,6 +220,11 @@ def init_db():
                 conn.execute("ALTER TABLE smtp_users ADD COLUMN hourly_sent INTEGER DEFAULT 0")
             if 'hourly_reset_at' not in cols:
                 conn.execute("ALTER TABLE smtp_users ADD COLUMN hourly_reset_at TIMESTAMP")
+            if 'user_type' not in cols:
+                try:
+                    conn.execute("ALTER TABLE smtp_users ADD COLUMN user_type TEXT")
+                except Exception:
+                    pass
             # Per-user send interval (seconds) - optional
             if 'min_interval' not in cols:
                 try:
@@ -2254,7 +2259,7 @@ def api_bulk_templates_count():
 @login_required
 def api_smtp_users_list():
     with get_db() as conn:
-        rows = conn.execute("SELECT id, username, email_limit, email_sent, hourly_sent, hourly_reset_at, expires_at, enabled, created_at, last_used_at, min_interval, max_interval FROM smtp_users ORDER BY id DESC").fetchall()
+        rows = conn.execute("SELECT id, username, email_limit, email_sent, hourly_sent, hourly_reset_at, expires_at, enabled, created_at, last_used_at, min_interval, max_interval, user_type FROM smtp_users ORDER BY id DESC").fetchall()
     return jsonify([dict(r) for r in rows])
 
 @app.route('/api/smtp-users', methods=['POST'])
@@ -2263,19 +2268,57 @@ def api_smtp_users_create():
     data = request.json
     username = data.get('username', '').strip()
     password = data.get('password', '').strip()
-    email_limit = int(data.get('email_limit', 0))
+    # allow creating by type; if type provided, apply defaults from config
+    email_limit = data.get('email_limit')
+    try:
+        email_limit = int(email_limit) if email_limit is not None and email_limit != '' else None
+    except Exception:
+        email_limit = None
     expires_at = data.get('expires_at', '').strip() or None
     min_interval = data.get('min_interval')
     max_interval = data.get('max_interval')
+    user_type = data.get('type') or data.get('user_type')
     
     if not username or not password:
         return jsonify({"error": "Username and password required"}), 400
     
     try:
+        # Determine defaults from config when type provided
+        cfg = load_config()
+        user_limits = cfg.get('user_limits', {})
+        user_intervals = cfg.get('user_intervals', {})
+
+        def _norm_interval(val):
+            try:
+                if val is None:
+                    return (None, None)
+                if isinstance(val, (list, tuple)) and len(val) >= 2:
+                    return (float(val[0]) if val[0] is not None else None, float(val[1]) if val[1] is not None else None)
+                if isinstance(val, dict):
+                    return (float(val.get('min')) if val.get('min') is not None else None, float(val.get('max')) if val.get('max') is not None else None)
+                return (float(val), float(val))
+            except Exception:
+                return (None, None)
+
+        if user_type:
+            # apply email limit default when not explicitly provided
+            if email_limit is None:
+                email_limit = user_limits.get(user_type, user_limits.get('default', None))
+            raw_iv = user_intervals.get(user_type, user_intervals.get('default', None))
+            di_min, di_max = _norm_interval(raw_iv)
+            if min_interval is None:
+                min_interval = di_min
+            if max_interval is None:
+                max_interval = di_max
+
+        # Fallbacks
+        if email_limit is None:
+            email_limit = 0
+
         with get_db() as conn:
             conn.execute(
-                "INSERT INTO smtp_users (username, password, email_limit, expires_at, enabled, min_interval, max_interval) VALUES (?, ?, ?, ?, 1, ?, ?)",
-                (username, password, email_limit, expires_at, min_interval, max_interval)
+                "INSERT INTO smtp_users (username, password, email_limit, expires_at, enabled, min_interval, max_interval, user_type) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+                (username, password, email_limit, expires_at, min_interval, max_interval, user_type)
             )
         return jsonify({"status": "ok"})
     except sqlite3.IntegrityError:
@@ -2306,6 +2349,42 @@ def api_smtp_users_update(user_id):
     if 'max_interval' in data:
         updates.append("max_interval=?")
         params.append(float(data['max_interval']) if data['max_interval'] is not None and data['max_interval'] != '' else None)
+    if 'type' in data or 'user_type' in data:
+        # allow changing type; apply defaults from config unless explicit limits provided
+        new_type = data.get('type') or data.get('user_type')
+        if new_type is not None:
+            updates.append("user_type=?")
+            params.append(new_type)
+            # apply defaults if not provided explicitly
+            cfg = load_config()
+            user_limits = cfg.get('user_limits', {})
+            user_intervals = cfg.get('user_intervals', {})
+            def _norm_interval(val):
+                try:
+                    if val is None:
+                        return (None, None)
+                    if isinstance(val, (list, tuple)) and len(val) >= 2:
+                        return (float(val[0]) if val[0] is not None else None, float(val[1]) if val[1] is not None else None)
+                    if isinstance(val, dict):
+                        return (float(val.get('min')) if val.get('min') is not None else None, float(val.get('max')) if val.get('max') is not None else None)
+                    return (float(val), float(val))
+                except Exception:
+                    return (None, None)
+            # only set email_limit/min/max if they are not in payload
+            if 'email_limit' not in data:
+                default_limit = user_limits.get(new_type, user_limits.get('default', None))
+                if default_limit is not None:
+                    updates.append("email_limit=?")
+                    params.append(int(default_limit))
+            if 'min_interval' not in data or 'max_interval' not in data:
+                raw_iv = user_intervals.get(new_type, user_intervals.get('default', None))
+                di_min, di_max = _norm_interval(raw_iv)
+                if 'min_interval' not in data and di_min is not None:
+                    updates.append("min_interval=?")
+                    params.append(di_min)
+                if 'max_interval' not in data and di_max is not None:
+                    updates.append("max_interval=?")
+                    params.append(di_max)
     if 'reset_count' in data and data['reset_count']:
         updates.append("email_sent=0")
     
@@ -3628,6 +3707,9 @@ EOF
                                         <span class="badge" :class="u.enabled ? 'bg-success' : 'bg-secondary'">[[ u.enabled ? '启用' : '禁用' ]]</span>
                                     </td>
                                     <td>
+                                        <span class="small text-muted">[[ u.user_type || '-' ]]</span>
+                                    </td>
+                                    <td>
                                         <span v-if="u.min_interval || u.max_interval">[[ u.min_interval || '-' ]] / [[ u.max_interval || '-' ]]</span>
                                         <span v-else class="text-muted">-</span>
                                     </td>
@@ -3669,6 +3751,17 @@ EOF
                                     <label class="form-label">发送限额 (每小时)</label>
                                     <input type="number" class="form-control" v-model.number="userForm.email_limit" min="0" placeholder="0表示无限制">
                                     <div class="form-text">每小时允许发送的邮件数量，0为不限制</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label">用户类型</label>
+                                    <select class="form-select" v-model="userForm.type">
+                                        <option value="">(不指定)</option>
+                                        <option value="free">免费 (free)</option>
+                                        <option value="monthly">月度 (monthly)</option>
+                                        <option value="quarterly">季度 (quarterly)</option>
+                                        <option value="yearly">年度 (yearly)</option>
+                                    </select>
+                                    <div class="form-text">选择类型后，若未填写限额/间隔将使用套餐默认值</div>
                                 </div>
                                 <div class="row g-2">
                                     <div class="col-6 mb-3">
@@ -4361,7 +4454,7 @@ EOF
                     smtpUsers: [],
                     showUserModal: false,
                     editingUser: null,
-                    userForm: { username: '', password: '', email_limit: 0, expires_at: '', enabled: true, min_interval: null, max_interval: null },
+                    userForm: { username: '', password: '', email_limit: 0, expires_at: '', enabled: true, min_interval: null, max_interval: null, type: '' },
                     showBatchUserModal: false,
                     batchUserForm: { type: 'monthly', count: 10, prefix: '' },
                     batchGenerating: false,
@@ -4672,7 +4765,8 @@ EOF
                         expires_at: u.expires_at ? u.expires_at.replace(' ', 'T') : '',
                         enabled: u.enabled,
                         min_interval: u.min_interval !== undefined ? u.min_interval : null,
-                        max_interval: u.max_interval !== undefined ? u.max_interval : null
+                        max_interval: u.max_interval !== undefined ? u.max_interval : null,
+                        type: u.user_type || ''
                     };
                     this.showUserModal = true;
                 },
