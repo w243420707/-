@@ -155,6 +155,8 @@ def init_db():
                 conn.execute("ALTER TABLE queue ADD COLUMN smtp_user TEXT")
             if 'scheduled_at' not in cols:
                 conn.execute("ALTER TABLE queue ADD COLUMN scheduled_at TIMESTAMP")
+                if 'template_id' not in cols:
+                    conn.execute("ALTER TABLE queue ADD COLUMN template_id INTEGER")
         except Exception as e:
             print(f"DB Init Warning: {e}")
 
@@ -206,6 +208,19 @@ def init_db():
             if 'hourly_reset_at' not in cols:
                 conn.execute("ALTER TABLE smtp_users ADD COLUMN hourly_reset_at TIMESTAMP")
         except: pass
+
+        # bulk_templates table to store pre-generated templates
+        try:
+            conn.execute('''CREATE TABLE IF NOT EXISTS bulk_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject TEXT,
+                body TEXT,
+                meta TEXT,
+                created_at TIMESTAMP DEFAULT (datetime('now', '+08:00'))
+            )''')
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_bulk_templates_created ON bulk_templates (created_at)")
+        except Exception:
+            pass
 
 # --- Config Cache (TTL-based) ---
 _config_cache = {'data': None, 'time': 0, 'ttl': 3}  # 3 seconds TTL
@@ -664,6 +679,22 @@ bulk_write_queue = _LocalQueue()
 _BULK_WRITE_BATCH = 5000
 
 # bulk write statistics
+
+# simple in-memory template cache
+bulk_template_cache = {}
+def get_template(tid):
+    try:
+        if tid in bulk_template_cache:
+            return bulk_template_cache[tid]
+        with get_db() as conn:
+            row = conn.execute("SELECT id, subject, body, meta FROM bulk_templates WHERE id=?", (tid,)).fetchone()
+            if row:
+                tpl = { 'id': row['id'], 'subject': row['subject'], 'body': row['body'], 'meta': row['meta'] }
+                bulk_template_cache[tid] = tpl
+                return tpl
+    except Exception:
+        return None
+    return None
 bulk_stats_lock = threading.Lock()
 bulk_stats = {
     'total_expected': 0,
@@ -675,7 +706,7 @@ bulk_stats = {
 
 def bulk_writer_thread():
     batch = []
-    insert_sql = "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    insert_sql = "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     while True:
         try:
             item = bulk_write_queue.get(timeout=1)
@@ -715,7 +746,7 @@ def bulk_writer_thread():
                 batch = []
         except _LocalEmpty:
             # flush any remaining batch
-            if batch:
+                    if batch:
                 try:
                     with get_db() as conn:
                         conn.executemany(insert_sql, batch)
@@ -790,6 +821,45 @@ def node_sender(node_name, task_queue):
                     sender = node['sender_email']
                 else:
                     sender = task.get('mail_from') or node.get('username')
+
+                # 如果任务使用模板（content 为空且有 template_id），在发送时渲染模板为完整消息
+                tpl_id = task.get('template_id')
+                if (not msg_content) and tpl_id:
+                    try:
+                        tpl = get_template(tpl_id)
+                        if tpl:
+                            # 确保 tracking_id
+                            tracking_id = task.get('tracking_id') or str(uuid.uuid4())
+                            # 基本个性化替换
+                            recipient = rcpt_tos[0] if isinstance(rcpt_tos, (list, tuple)) and len(rcpt_tos) > 0 else ''
+                            subj = tpl.get('subject') or ''
+                            body = tpl.get('body') or ''
+                            # 常见占位符替换
+                            try:
+                                body = body.replace('{{tracking_id}}', tracking_id).replace('{tracking_id}', tracking_id)
+                                body = body.replace('{{email}}', recipient).replace('{email}', recipient).replace('{{rcpt}}', recipient).replace('{rcpt}', recipient)
+                            except Exception:
+                                pass
+                            # 构建 MIME
+                            try:
+                                m = MIMEMultipart('alternative')
+                                m['Subject'] = subj
+                                m['To'] = recipient
+                                m['From'] = sender
+                                m.attach(MIMEText(body, 'html', 'utf-8'))
+                                msg_content = m.as_bytes()
+                                # 确保任务的 tracking_id 写回 DB（异步）以便后续跟踪
+                                def write_tracking(rid=row_id, tid=tracking_id):
+                                    try:
+                                        with get_db() as c:
+                                            c.execute("UPDATE queue SET tracking_id=? WHERE id=?", (tid, rid))
+                                    except Exception:
+                                        pass
+                                threading.Thread(target=write_tracking, daemon=True).start()
+                            except Exception:
+                                msg_content = None
+                    except Exception:
+                        pass
                 
                 # Header rewrite
                 if sender and (node.get('sender_domain') or node.get('sender_email')):
@@ -944,12 +1014,12 @@ def dispatcher_thread():
                 for node_name in nodes_need_tasks:
                     if bulk_ctrl == 'paused':
                         rows = conn.execute(
-                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
-                            (node_name,)
-                        ).fetchall()
+                                "SELECT id, mail_from, rcpt_tos, content, source, template_id, tracking_id FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
+                                (node_name,)
+                            ).fetchall()
                     else:
                         rows = conn.execute(
-                            "SELECT id, mail_from, rcpt_tos, content, source FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 20",
+                            "SELECT id, mail_from, rcpt_tos, content, source, template_id, tracking_id FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 20",
                             (node_name,)
                         ).fetchall()
                     
@@ -968,6 +1038,8 @@ def dispatcher_thread():
                                     'mail_from': row['mail_from'],
                                     'rcpt_tos': json.loads(row['rcpt_tos']),
                                     'content': row['content'],
+                                    'template_id': row['template_id'] if 'template_id' in row.keys() else None,
+                                    'tracking_id': row['tracking_id'] if 'tracking_id' in row.keys() else None,
                                     'source': row['source']
                                 }
                                 node_queues[node_name].put(task, timeout=1)
@@ -1506,6 +1578,23 @@ def select_node_for_recipient(pool, recipient, global_limit, source='relay', for
 
 def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
     try:
+        # Pause bulk sending while we import and write to DB to prioritize writes
+        try:
+            cfg = load_config()
+            if 'bulk_control' not in cfg: cfg['bulk_control'] = {}
+            cfg['bulk_control']['status'] = 'paused'
+            save_config(cfg)
+        except Exception:
+            pass
+
+        # Initialize bulk stats for this import
+        with bulk_stats_lock:
+            bulk_stats['total_expected'] = 0
+            bulk_stats['inserted'] = 0
+            bulk_stats['start_time'] = None
+            bulk_stats['last_update'] = 0.0
+            bulk_stats['last_rate'] = 0.0
+
         # Process recipients in background to avoid blocking
         recipients = [r.strip() for r in raw_recipients.split('\n') if r.strip()]
         # If user pasted as a single line with commas/semicolons, handle that too
@@ -1523,6 +1612,15 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
         except Exception:
             pass
         random.shuffle(recipients) # Shuffle for better distribution
+
+        # Load available template ids (if any)
+        template_ids = []
+        try:
+            with get_db() as conn:
+                rows = conn.execute("SELECT id FROM bulk_templates").fetchall()
+                template_ids = [r[0] for r in rows]
+        except Exception:
+            template_ids = []
         
         cfg = load_config()
         limit_cfg = cfg.get('limit_config', {})
@@ -1786,7 +1884,12 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 initial_status = 'scheduled' if schedule_time and schedule_time > datetime.now() else 'pending'
                 scheduled_at_str = schedule_time.strftime('%Y-%m-%d %H:%M:%S') if schedule_time else None
                 
-                record = ('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject)
+                # If we have pre-generated templates, only write recipient + template_id to DB
+                if template_ids:
+                    chosen_tid = random.choice(template_ids)
+                    record = ('', json.dumps([rcpt]), None, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, chosen_tid)
+                else:
+                    record = ('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None)
                 count += 1
                 # increment expected total and set start_time if first
                 try:
@@ -1804,8 +1907,8 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                     try:
                         with get_db() as conn:
                             conn.execute(
-                                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                record
+                                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                    record
                             )
                         with bulk_stats_lock:
                             bulk_stats['inserted'] += 1
@@ -1816,7 +1919,29 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 continue
 
         # No local DB writes here; remaining records (if any) already pushed to bulk_write_queue.
-        logger.info(f"群发导入完成: 共 {count} 封邮件")
+        logger.info(f"群发导入完成: 共 {count} 封邮件, 等待后台写入完成...")
+        # Wait for background writer to finish inserting expected records (with timeout)
+        wait_start = time.time()
+        timeout = 60 * 30  # 30 minutes max wait
+        while True:
+            with bulk_stats_lock:
+                expected = bulk_stats.get('total_expected', 0)
+                inserted = bulk_stats.get('inserted', 0)
+            if expected == 0 or inserted >= expected:
+                break
+            if time.time() - wait_start > timeout:
+                logger.warning(f"等待后台写入超时: 已写入 {inserted}/{expected}")
+                break
+            time.sleep(0.5)
+        # Resume bulk sending
+        try:
+            cfg = load_config()
+            if 'bulk_control' not in cfg: cfg['bulk_control'] = {}
+            cfg['bulk_control']['status'] = 'running'
+            save_config(cfg)
+        except Exception:
+            pass
+        logger.info(f"群发导入写入阶段结束: 已写入 {bulk_stats.get('inserted', 0)} / {bulk_stats.get('total_expected', 0)}")
     except Exception as e:
         logger.error(f"群发导入任务失败: {e}")
 
@@ -1880,6 +2005,56 @@ def api_bulk_stats():
     except Exception as e:
         logger.error(f"Failed to get bulk stats: {e}")
         return jsonify({}), 500
+
+
+@app.route('/api/bulk/templates/generate', methods=['POST'])
+@login_required
+def api_generate_bulk_templates():
+    try:
+        data = request.json or {}
+        count = int(data.get('count', 0))
+        if count <= 0:
+            return jsonify({'error': 'Invalid count'}), 400
+        subject = data.get('subject', '(No Subject)')
+        body = data.get('body', '')
+        # Prepare rows for batch insert
+        rows = []
+        now = datetime.utcnow().isoformat() + 'Z'
+        for i in range(count):
+            # add a small random suffix to subject to avoid strict duplicates if desired
+            try:
+                suffix = '-' + uuid.uuid4().hex[:6]
+            except Exception:
+                suffix = '-' + str(i)
+            subj = subject
+            rows.append((subj + suffix, body, json.dumps({'gen': now, 'idx': i})))
+
+        with get_db() as conn:
+            conn.executemany("INSERT INTO bulk_templates (subject, body, meta) VALUES (?, ?, ?)", rows)
+
+        # Invalidate in-memory cache so new templates are visible
+        try:
+            bulk_template_cache.clear()
+        except Exception:
+            pass
+
+        return jsonify({'status': 'ok', 'inserted': count})
+    except Exception as e:
+        logger.error(f"Failed to generate templates: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/bulk/templates/count')
+@login_required
+def api_bulk_templates_count():
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT COUNT(1) as c FROM bulk_templates").fetchone()
+            cnt = row['c'] if row else 0
+        return jsonify({'count': cnt})
+    except Exception as e:
+        logger.error(f"Failed to get template count: {e}")
+        return jsonify({'count': 0}), 500
 
 # --- SMTP Users Management API ---
 @app.route('/api/smtp-users')
@@ -3019,7 +3194,21 @@ EOF
                                     <button class="btn btn-outline-success flex-grow-1" @click="saveContacts"><i class="bi bi-cloud-upload"></i> 保存当前</button>
                                     <button class="btn btn-outline-danger" @click="clearContacts"><i class="bi bi-trash"></i> 清空</button>
                                 </div>
-                                
+                                <!-- Template generator -->
+                                <div class="input-group mb-2">
+                                    <input type="number" v-model.number="templateGenerateCount" class="form-control form-control-sm" min="1" style="max-width:120px;" />
+                                    <button class="btn btn-outline-secondary btn-sm" @click="generateTemplates" :disabled="generatingTemplates">
+                                        <span v-if="generatingTemplates" class="spinner-border spinner-border-sm me-1"></span>
+                                        生成模板
+                                    </button>
+                                    <div class="form-text ms-2" style="font-size:0.85rem;">使用左边的数量生成预置模板（用于加速导入，仅存模板引用）</div>
+                                </div>
+                                <div class="d-flex align-items-center mb-2">
+                                    <small class="text-muted me-2">预置模板:</small>
+                                    <span class="badge bg-secondary">[[ templateCount ]]</span>
+                                    <button class="btn btn-link btn-sm ms-2 p-0" @click="fetchTemplateCount" title="刷新模板数量"><i class="bi bi-arrow-clockwise"></i></button>
+                                </div>
+
                                 <div v-if="contactCount > 50000" class="mb-2">
                                     <div class="d-flex flex-wrap gap-2" style="max-height: 150px; overflow-y: auto;">
                                         <button v-for="i in Math.ceil(contactCount / 50000)" :key="i" 
@@ -3826,6 +4015,8 @@ EOF
                     queueFilter: '',
                     bulk: { sender: '', subject: '', recipients: '', body: '', bodyList: [''], enableSchedule: false, scheduledAt: '' },
                     sending: false,
+                    templateGenerateCount: 500,
+                    generatingTemplates: false,
                     contactCount: 0,
                     bulkStatus: 'running',
                     rebalancing: false,
@@ -3863,6 +4054,7 @@ EOF
                         ,
                     system: { cpu_percent: 0, mem_total: 0, mem_used: 0, mem_percent: 0, swap_total: 0, swap_used: 0, swap_percent: 0, disk_percent: 0, net_sent: 0, net_recv: 0 },
                     bulkStats: { total_expected: 0, inserted: 0, last_rate: 0.0, percent: 0.0 },
+                    templateCount: 0,
                     history: {
                         labels: [],
                         cpu: [],
@@ -3985,6 +4177,7 @@ EOF
                 this.fetchContactDomainStats();
                 this.fetchBulkStatus();
                 this.fetchBulkStats();
+                this.fetchTemplateCount();
                 this.fetchTopDomains();
                 this.fetchSystemStats();
                 // Initialize charts after first fetch
@@ -3999,6 +4192,8 @@ EOF
                 setInterval(() => { this.fetchSystemStats(); }, 5000);
                 // Poll bulk stats more frequently
                 setInterval(() => { this.fetchBulkStats(); }, 2000);
+                // Poll template count periodically
+                setInterval(() => { this.fetchTemplateCount(); }, 5000);
                 // Refresh domain stats less frequently (every 30 seconds)
                 setInterval(() => {
                     this.fetchTopDomains();
@@ -4408,6 +4603,34 @@ EOF
                             this.bulkStats.percent = d.percent || 0.0;
                         }
                     } catch(e) { /* ignore */ }
+                },
+                async fetchTemplateCount() {
+                    try {
+                        const res = await fetch('/api/bulk/templates/count');
+                        if (res.ok) {
+                            const d = await res.json();
+                            this.templateCount = d.count || 0;
+                        }
+                    } catch(e) { }
+                },
+                async generateTemplates() {
+                    if (!this.templateGenerateCount || this.templateGenerateCount <= 0) return alert('请输入有效的数量');
+                    if (!confirm('确定生成 ' + this.templateGenerateCount + ' 个邮件模板吗？')) return;
+                    this.generatingTemplates = true;
+                    try {
+                        const payload = { count: this.templateGenerateCount, subject: this.bulk.subject || '(No Subject)', body: (this.bulk.bodyList && this.bulk.bodyList[0]) || '' };
+                        const res = await fetch('/api/bulk/templates/generate', {
+                            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)
+                        });
+                        const data = await res.json();
+                        if (res.ok && data.inserted) {
+                            alert('已生成 ' + data.inserted + ' 个模板');
+                            this.fetchTemplateCount();
+                        } else {
+                            alert('生成失败: ' + (data.error || '未知错误'));
+                        }
+                    } catch (e) { alert('生成失败: ' + e); }
+                    this.generatingTemplates = false;
                 },
                 async controlBulk(action) {
                     if(action === 'stop' && !confirm('确定停止并清空所有待发送的群发邮件吗？')) return;
