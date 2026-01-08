@@ -11,7 +11,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260108123535"
+SCRIPT_VERSION="20260108123535.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -2024,6 +2024,7 @@ def api_generate_bulk_templates():
     try:
         data = request.json or {}
         count = int(data.get('count', 0))
+        replace = bool(data.get('replace', False))
         if count <= 0:
             return jsonify({'error': 'Invalid count'}), 400
         subject = data.get('subject', '(No Subject)')
@@ -2040,7 +2041,13 @@ def api_generate_bulk_templates():
             subj = subject
             rows.append((subj + suffix, body, json.dumps({'gen': now, 'idx': i})))
 
+        deleted = 0
         with get_db() as conn:
+            if replace:
+                try:
+                    deleted = conn.execute("DELETE FROM bulk_templates").rowcount
+                except Exception:
+                    deleted = 0
             conn.executemany("INSERT INTO bulk_templates (subject, body, meta) VALUES (?, ?, ?)", rows)
 
         # Invalidate in-memory cache so new templates are visible
@@ -2049,7 +2056,7 @@ def api_generate_bulk_templates():
         except Exception:
             pass
 
-        return jsonify({'status': 'ok', 'inserted': count})
+        return jsonify({'status': 'ok', 'inserted': count, 'deleted': deleted, 'replaced': bool(replace)})
     except Exception as e:
         logger.error(f"Failed to generate templates: {e}")
         return jsonify({'error': str(e)}), 500
