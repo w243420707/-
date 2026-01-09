@@ -807,18 +807,18 @@ def get_template(tid):
             return bulk_template_cache[tid]
         with get_db() as conn:
             row = conn.execute("SELECT id, subject, body, meta FROM bulk_templates WHERE id=?", (tid,)).fetchone()
-                if row:
-                    tpl = { 'id': row['id'], 'subject': row['subject'], 'body': row['body'], 'meta': row['meta'] }
-                    # Simple cache with size limit: evict arbitrary oldest entries when over limit
-                    bulk_template_cache[tid] = tpl
-                    try:
-                        if len(bulk_template_cache) > _BULK_TEMPLATE_CACHE_MAX:
-                            # pop an arbitrary item
-                            k = next(iter(bulk_template_cache))
-                            bulk_template_cache.pop(k, None)
-                    except Exception:
-                        pass
-                    return tpl
+            if row:
+                tpl = { 'id': row['id'], 'subject': row['subject'], 'body': row['body'], 'meta': row['meta'] }
+                # Simple cache with size limit: evict arbitrary oldest entries when over limit
+                bulk_template_cache[tid] = tpl
+                try:
+                    if len(bulk_template_cache) > _BULK_TEMPLATE_CACHE_MAX:
+                        # pop an arbitrary item
+                        k = next(iter(bulk_template_cache))
+                        bulk_template_cache.pop(k, None)
+                except Exception:
+                    pass
+                return tpl
     except Exception:
         return None
     return None
