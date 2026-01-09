@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260108123535.5"
+SCRIPT_VERSION="20260108123535.6"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -48,7 +48,7 @@ install_smtp() {
         python3 -m venv venv
     fi
     "$VENV_DIR/bin/pip" install --upgrade pip
-    "$VENV_DIR/bin/pip" install flask requests aiosmtpd psutil
+    "$VENV_DIR/bin/pip" install flask requests aiosmtpd psutil redis
 
     if [ -f "/tmp/smtp_config_backup.json" ]; then
         mv "/tmp/smtp_config_backup.json" "$CONFIG_FILE"
@@ -64,6 +64,7 @@ install_smtp() {
     "limit_config": { "max_per_hour": 0, "min_interval": 1, "max_interval": 5 },
     "bulk_control": { "status": "running" },
     "tmp_cleanup": { "enabled": true, "ttl_hours": 24, "interval_minutes": 60 },
+    "redis": { "host": "127.0.0.1", "port": 6379, "db": 0, "stream": "bulk_stream", "group": "bulk_group" },
     "downstream_pool": [],
     "node_groups": []
 }
@@ -90,6 +91,7 @@ from io import StringIO
 import tempfile
 import os
 from email.header import decode_header
+import redis
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.utils import formatdate, make_msgid, formataddr
@@ -108,6 +110,12 @@ try:
     os.makedirs(TMP_DIR, exist_ok=True)
 except Exception:
     pass
+
+# Redis client (optional). Initialized in start_services via config.
+redis_client = None
+REDIS_STREAM = 'bulk_stream'
+REDIS_GROUP = 'bulk_group'
+REDIS_CONSUMER = f'consumer-{uuid.uuid4().hex[:8]}'
 
 def write_temp_content(content_str):
     try:
@@ -169,6 +177,91 @@ def temp_file_gc_loop():
 def start_temp_gc_thread():
     t = threading.Thread(target=temp_file_gc_loop, daemon=True)
     t.start()
+
+
+def init_redis_client():
+    global redis_client, REDIS_STREAM, REDIS_GROUP, REDIS_CONSUMER
+    try:
+        cfg = load_config()
+        rcfg = cfg.get('redis', {}) if isinstance(cfg, dict) else {}
+        host = rcfg.get('host', '127.0.0.1')
+        port = int(rcfg.get('port', 6379))
+        db = int(rcfg.get('db', 0))
+        stream = rcfg.get('stream', 'bulk_stream')
+        group = rcfg.get('group', 'bulk_group')
+        consumer = rcfg.get('consumer', REDIS_CONSUMER)
+        redis_client = redis.Redis(host=host, port=port, db=db, decode_responses=True)
+        REDIS_STREAM = stream
+        REDIS_GROUP = group
+        REDIS_CONSUMER = consumer
+        # ensure group exists
+        try:
+            redis_client.xgroup_create(REDIS_STREAM, REDIS_GROUP, id='0', mkstream=True)
+        except Exception:
+            # group may already exist
+            pass
+        logger.info(f"Redis queue enabled: {host}:{port} stream={REDIS_STREAM} group={REDIS_GROUP}")
+    except Exception as e:
+        redis_client = None
+        logger.warning(f"Redis init failed or not configured: {e}")
+
+
+def redis_to_sql_writer_thread():
+    """Consume messages from Redis stream and write them into SQLite queue in batches.
+    This decouples fast producers (imports) from DB writes and prevents Python memory spikes.
+    """
+    global redis_client, REDIS_STREAM, REDIS_GROUP, REDIS_CONSUMER
+    if not redis_client:
+        return
+    BATCH = 200
+    while True:
+        try:
+            # Read pending first to recover unacked messages
+            try:
+                entries = redis_client.xreadgroup(REDIS_GROUP, REDIS_CONSUMER, {REDIS_STREAM: '>'}, count=BATCH, block=2000)
+            except Exception:
+                entries = None
+            if not entries:
+                time.sleep(0.5)
+                continue
+            # entries is list of (stream, [(id, {fields})])
+            to_write = []
+            ids = []
+            for stream_name, msgs in entries:
+                for mid, fields in msgs:
+                    try:
+                        rcpt = fields.get('rcpt')
+                        content = fields.get('content')  # could be FILE:... or empty
+                        template_id = fields.get('template_id')
+                        node_name = fields.get('node')
+                        subj = fields.get('subject')
+                        tracking = fields.get('tracking_id')
+                        scheduled = fields.get('scheduled_at')
+                        mail_from = fields.get('mail_from') or ''
+                        # Store as same tuple used by sqlite queue
+                        record = (mail_from, json.dumps([rcpt]), content, node_name, 'pending', 'bulk', tracking, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled, subj, None, int(template_id) if template_id else None)
+                        to_write.append(record)
+                        ids.append(mid)
+                    except Exception:
+                        # skip malformed
+                        continue
+            if to_write:
+                try:
+                    with get_db() as conn:
+                        conn.executemany("INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", to_write)
+                    # ACK and optionally delete
+                    for mid in ids:
+                        try:
+                            redis_client.xack(REDIS_STREAM, REDIS_GROUP, mid)
+                            redis_client.xdel(REDIS_STREAM, mid)
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logger.error(f"Redis->SQL writer failed to write batch: {e}")
+                    # do not ack so messages will be retried
+                    time.sleep(1)
+        except Exception:
+            time.sleep(1)
 
 # --- Database ---
 def db_retry(max_retries=3, delay=0.5):
@@ -2255,7 +2348,7 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
         tasks = []
         count = 0
         # Batch size for streaming writes to limit memory usage
-        CHUNK_SIZE = 200
+        CHUNK_SIZE = 500
         batch_records = []
 
         for rcpt in recipients_iter:
@@ -2388,7 +2481,101 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 # Accumulate into in-memory chunk; flush when chunk full
                 batch_records.append(record)
                 if len(batch_records) >= CHUNK_SIZE:
-                    # Directly write batches to the DB to avoid queuing thousands of in-memory records
+                    # Primary path: push lightweight messages to Redis stream to decouple import from DB writes
+                    if redis_client:
+                        try:
+                            pipe = redis_client.pipeline()
+                            for rec in batch_records:
+                                try:
+                                    mail_from, rcpt_tos, content_field, node_name, status_field, source_field, tracking_id_field, created_at_field, updated_at_field, scheduled_at_field, subject_field, smtp_user_field, template_id_field = rec
+                                    # rcpt_tos is JSON list; extract single rcpt for stream message
+                                    try:
+                                        rcpts = json.loads(rcpt_tos)
+                                        rcpt_single = rcpts[0] if rcpts else ''
+                                    except Exception:
+                                        rcpt_single = ''
+                                    msg = {
+                                        'mail_from': mail_from or '',
+                                        'rcpt': rcpt_single or '',
+                                        'content': content_field or '',
+                                        'node': node_name or '',
+                                        'subject': subject_field or '',
+                                        'tracking_id': tracking_id_field or '',
+                                        'scheduled_at': scheduled_at_field or '',
+                                        'template_id': str(template_id_field) if template_id_field else ''
+                                    }
+                                    pipe.xadd(REDIS_STREAM, msg)
+                                except Exception:
+                                    continue
+                            pipe.execute()
+                            with bulk_stats_lock:
+                                bulk_stats['inserted'] += len(batch_records)
+                        except Exception as e:
+                            logger.error(f"Redis XADD failed during bulk import: {e}; falling back to DB write")
+                            try:
+                                with get_db() as conn:
+                                    conn.executemany(
+                                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                        batch_records
+                                    )
+                                with bulk_stats_lock:
+                                    bulk_stats['inserted'] += len(batch_records)
+                            except Exception as e:
+                                logger.error(f"Bulk import DB fallback failed: {e}")
+                    else:
+                        # No redis configured: write directly to DB
+                        try:
+                            with get_db() as conn:
+                                conn.executemany(
+                                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                    batch_records
+                                )
+                            with bulk_stats_lock:
+                                bulk_stats['inserted'] += len(batch_records)
+                        except Exception as e:
+                            logger.error(f"Bulk import executemany failed: {e}; attempting per-item enqueue fallback")
+                            for rec in batch_records:
+                                try:
+                                    bulk_write_queue.put(rec, block=False)
+                                except Exception:
+                                    pass
+                    batch_records = []
+            except Exception as e:
+                logger.error(f"准备邮件失败 {rcpt}: {e}")
+                continue
+
+        # Flush any remaining batch_records
+        if batch_records:
+            # Flush remaining records: prefer Redis stream for decoupling, otherwise DB
+            if redis_client:
+                try:
+                    pipe = redis_client.pipeline()
+                    for rec in batch_records:
+                        try:
+                            mail_from, rcpt_tos, content_field, node_name, status_field, source_field, tracking_id_field, created_at_field, updated_at_field, scheduled_at_field, subject_field, smtp_user_field, template_id_field = rec
+                            try:
+                                rcpts = json.loads(rcpt_tos)
+                                rcpt_single = rcpts[0] if rcpts else ''
+                            except Exception:
+                                rcpt_single = ''
+                            msg = {
+                                'mail_from': mail_from or '',
+                                'rcpt': rcpt_single or '',
+                                'content': content_field or '',
+                                'node': node_name or '',
+                                'subject': subject_field or '',
+                                'tracking_id': tracking_id_field or '',
+                                'scheduled_at': scheduled_at_field or '',
+                                'template_id': str(template_id_field) if template_id_field else ''
+                            }
+                            pipe.xadd(REDIS_STREAM, msg)
+                        except Exception:
+                            continue
+                    pipe.execute()
+                    with bulk_stats_lock:
+                        bulk_stats['inserted'] += len(batch_records)
+                except Exception as e:
+                    logger.error(f"Redis XADD final flush failed: {e}; falling back to DB")
                     try:
                         with get_db() as conn:
                             conn.executemany(
@@ -2398,37 +2585,23 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                         with bulk_stats_lock:
                             bulk_stats['inserted'] += len(batch_records)
                     except Exception as e:
-                        logger.error(f"Bulk import executemany failed: {e}; attempting per-item enqueue fallback")
-                        # Fallback: try best-effort enqueue to bulk_write_queue for existing writer compatibility
-                        for rec in batch_records:
-                            try:
-                                bulk_write_queue.put(rec, block=False)
-                            except Exception:
-                                # if even fallback fails, skip to avoid memory blowup
-                                pass
-                    batch_records = []
-            except Exception as e:
-                logger.error(f"准备邮件失败 {rcpt}: {e}")
-                continue
-
-        # Flush any remaining batch_records
-        if batch_records:
-            # Prefer direct DB write for remaining records to avoid keeping them in memory
-            try:
-                with get_db() as conn:
-                    conn.executemany(
-                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        batch_records
-                    )
-                with bulk_stats_lock:
-                    bulk_stats['inserted'] += len(batch_records)
-            except Exception as e:
-                logger.error(f"Bulk import final executemany failed: {e}; attempting per-item enqueue fallback")
-                for rec in batch_records:
-                    try:
-                        bulk_write_queue.put(rec, block=False)
-                    except Exception:
-                        pass
+                        logger.error(f"Bulk import final DB fallback failed: {e}")
+            else:
+                try:
+                    with get_db() as conn:
+                        conn.executemany(
+                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            batch_records
+                        )
+                    with bulk_stats_lock:
+                        bulk_stats['inserted'] += len(batch_records)
+                except Exception as e:
+                    logger.error(f"Bulk import final executemany failed: {e}; attempting per-item enqueue fallback")
+                    for rec in batch_records:
+                        try:
+                            bulk_write_queue.put(rec, block=False)
+                        except Exception:
+                            pass
 
         logger.info(f"群发导入完成: 共 {count} 封邮件, 等待后台写入完成...")
         # Wait for background writer to finish inserting expected records (with timeout)
@@ -3369,6 +3542,14 @@ def start_services():
         start_temp_gc_thread()
     except Exception:
         logger.warning('Failed to start temp-file GC thread')
+
+    # Init Redis and start Redis->SQLite writer thread (if configured)
+    try:
+        init_redis_client()
+        if redis_client:
+            threading.Thread(target=redis_to_sql_writer_thread, daemon=True).start()
+    except Exception:
+        logger.warning('Redis writer thread failed to start')
 
     # Start Worker
     t = threading.Thread(target=worker_thread, daemon=True)
