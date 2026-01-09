@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260108123535.12"
+SCRIPT_VERSION="20260108123535.13"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -87,16 +87,7 @@ import uuid
 import functools
 from datetime import datetime, timedelta
 from email import message_from_bytes
-        # Removed large inline chat corpus to reduce memory usage.
-        try:
-            redis_client.xgroup_create(REDIS_STREAM, REDIS_GROUP, id='0', mkstream=True)
-        except Exception:
-            # group may already exist or operation failed; proceed if ping succeeded
-            pass
-        logger.info(f"Redis queue enabled: {host}:{port} stream={REDIS_STREAM} group={REDIS_GROUP}")
-    except Exception as e:
-        redis_client = None
-        logger.warning(f"Redis init failed or not configured: {e}")
+        # module imports complete
 
 
 def redis_to_sql_writer_thread():
