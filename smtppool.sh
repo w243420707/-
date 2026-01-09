@@ -194,11 +194,18 @@ def init_redis_client():
         REDIS_STREAM = stream
         REDIS_GROUP = group
         REDIS_CONSUMER = consumer
+        # verify connection
+        try:
+            redis_client.ping()
+        except Exception as e:
+            redis_client = None
+            logger.warning(f"Redis ping failed: {e}; disabling Redis integration")
+            return
         # ensure group exists
         try:
             redis_client.xgroup_create(REDIS_STREAM, REDIS_GROUP, id='0', mkstream=True)
         except Exception:
-            # group may already exist
+            # group may already exist or operation failed; proceed if ping succeeded
             pass
         logger.info(f"Redis queue enabled: {host}:{port} stream={REDIS_STREAM} group={REDIS_GROUP}")
     except Exception as e:
