@@ -648,30 +648,96 @@ def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=
         # 解析并重写消息头：保留所有原始头部，仅覆盖 From 和 Sender，并添加 X-Original-* 供追踪
         msg_bytes = content
         try:
-            if isinstance(content, (bytes, bytearray)):
+            # 如果 content 是导入时保存的轻量 JSON 字符串，先把它构建成完整 MIME
+            if isinstance(content, str):
+                try:
+                    parsed = json.loads(content)
+                    if isinstance(parsed, dict) and ('html' in parsed or 'plain' in parsed):
+                        m = MIMEMultipart('alternative')
+                        m['Subject'] = subject or ''
+                        m['To'] = rcpt_tos[0] if isinstance(rcpt_tos, (list, tuple)) and rcpt_tos else ''
+                        m['From'] = sender
+                        p1 = MIMEText(parsed.get('plain', ''), 'plain', 'utf-8')
+                        p2 = MIMEText(parsed.get('html', parsed.get('plain', '')), 'html', 'utf-8')
+                        m.attach(p1)
+                        m.attach(p2)
+                        msg = m
+                    else:
+                        msg = message_from_bytes(content.encode('utf-8'))
+                except Exception:
+                    # fallback: try to parse as raw bytes string
+                    try:
+                        msg = message_from_bytes(content.encode('utf-8'))
+                    except Exception:
+                        msg = None
+            elif isinstance(content, (bytes, bytearray)):
                 msg = message_from_bytes(content)
             else:
-                msg = message_from_bytes(content.encode('utf-8'))
+                msg = None
 
-            original_from = msg.get('From')
-            original_sender = msg.get('Sender')
-            if original_from:
-                # 添加原始 From 作为附加头，保留供追溯
-                msg['X-Original-From'] = original_from
-            if original_sender:
-                msg['X-Original-Sender'] = original_sender
+            if msg:
+                original_from = msg.get('From')
+                original_sender = msg.get('Sender')
+                if original_from:
+                    msg['X-Original-From'] = original_from
+                if original_sender:
+                    msg['X-Original-Sender'] = original_sender
 
-            # 覆盖 From/Sender
-            if 'From' in msg:
-                del msg['From']
-            msg['From'] = sender
-            if 'Sender' in msg:
-                del msg['Sender']
-            msg['Sender'] = sender
+                # 覆盖 From/Sender
+                if 'From' in msg:
+                    del msg['From']
+                msg['From'] = sender
+                if 'Sender' in msg:
+                    del msg['Sender']
+                msg['Sender'] = sender
 
-            msg_bytes = msg.as_bytes()
+                msg_bytes = msg.as_bytes()
+            else:
+                msg_bytes = content
         except Exception:
             msg_bytes = content
+
+        # 如果是认证用户（smtp_user），在直接转发前尊重该用户的发送间隔设置
+        if smtp_user:
+            try:
+                with get_db() as c:
+                    row = c.execute("SELECT min_interval, max_interval FROM smtp_users WHERE username=?", (smtp_user,)).fetchone()
+                    user_min = row['min_interval'] if row and 'min_interval' in row.keys() else None
+                    user_max = row['max_interval'] if row and 'max_interval' in row.keys() else None
+            except Exception:
+                user_min = None
+                user_max = None
+
+            try:
+                if user_min is not None and user_max is not None:
+                    min_int = float(user_min)
+                    max_int = float(user_max)
+                elif user_min is not None:
+                    min_int = float(user_min)
+                    max_int = float(user_min)
+                else:
+                    # fallback to small delay
+                    min_int = 0.0
+                    max_int = 0.0
+            except Exception:
+                min_int = 0.0
+                max_int = 0.0
+
+            if min_int < 0: min_int = 0.0
+            if max_int < min_int: max_int = min_int
+            chosen_delay = random.uniform(min_int, max_int) if max_int > min_int else min_int
+
+            # 基于内存时间戳计算需要等待的时间
+            need_sleep = 0
+            with smtp_user_last_lock:
+                last = smtp_user_last_sent.get(smtp_user, 0)
+            elapsed_user = time.time() - last if last else None
+            if elapsed_user is None:
+                elapsed_user = 0
+            if elapsed_user < chosen_delay:
+                need_sleep = chosen_delay - elapsed_user
+            if need_sleep > 0:
+                time.sleep(need_sleep)
 
         if encryption == 'ssl':
             with smtplib.SMTP_SSL(host, port, timeout=30) as s:
@@ -687,6 +753,13 @@ def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=
                 s.sendmail(sender, rcpt_tos, msg_bytes)
 
         logger.info(f"🔁 直接转发成功 -> {node.get('name')} | 收件: {rcpt_tos[0] if rcpt_tos else '?'} | 主题: {subject or ''}")
+        # 更新内存中的 per-user 发送时间戳
+        if smtp_user:
+            try:
+                with smtp_user_last_lock:
+                    smtp_user_last_sent[smtp_user] = time.time()
+            except Exception:
+                pass
         return True
     except Exception as e:
         logger.error(f"🔁 直接转发到节点 {node.get('name')} 失败: {e}")
@@ -718,23 +791,34 @@ node_queue_lock = threading.Lock()
 
 # Background writer for bulk inserts: use a queue + batch executemany to improve throughput
 from queue import Queue as _LocalQueue, Empty as _LocalEmpty
-bulk_write_queue = _LocalQueue()
-_BULK_WRITE_BATCH = 5000
+# Limit the in-memory bulk write queue to avoid unbounded memory growth
+bulk_write_queue = _LocalQueue(maxsize=2000)
+# Reduce batch size to limit memory used when batching large messages
+_BULK_WRITE_BATCH = 1000
 
 # bulk write statistics
 
 # simple in-memory template cache
 bulk_template_cache = {}
+_BULK_TEMPLATE_CACHE_MAX = 1000
 def get_template(tid):
     try:
         if tid in bulk_template_cache:
             return bulk_template_cache[tid]
         with get_db() as conn:
             row = conn.execute("SELECT id, subject, body, meta FROM bulk_templates WHERE id=?", (tid,)).fetchone()
-            if row:
-                tpl = { 'id': row['id'], 'subject': row['subject'], 'body': row['body'], 'meta': row['meta'] }
-                bulk_template_cache[tid] = tpl
-                return tpl
+                if row:
+                    tpl = { 'id': row['id'], 'subject': row['subject'], 'body': row['body'], 'meta': row['meta'] }
+                    # Simple cache with size limit: evict arbitrary oldest entries when over limit
+                    bulk_template_cache[tid] = tpl
+                    try:
+                        if len(bulk_template_cache) > _BULK_TEMPLATE_CACHE_MAX:
+                            # pop an arbitrary item
+                            k = next(iter(bulk_template_cache))
+                            bulk_template_cache.pop(k, None)
+                    except Exception:
+                        pass
+                    return tpl
     except Exception:
         return None
     return None
@@ -982,14 +1066,35 @@ def node_sender(node_name, task_queue):
                     except Exception:
                         pass
                 
-                # Header rewrite
+                # 如果 content 是轻量 JSON 字符串（导入阶段为节省内存而存储），在此处生成完整 MIME
+                if isinstance(msg_content, str):
+                    try:
+                        parsed = json.loads(msg_content)
+                        if isinstance(parsed, dict) and ('html' in parsed or 'plain' in parsed):
+                            recipient = rcpt_tos[0] if isinstance(rcpt_tos, (list, tuple)) and len(rcpt_tos) > 0 else ''
+                            m = MIMEMultipart('alternative')
+                            m['Subject'] = task.get('subject') or ''
+                            m['To'] = recipient
+                            m['From'] = sender
+                            p1 = MIMEText(parsed.get('plain', ''), 'plain', 'utf-8')
+                            p2 = MIMEText(parsed.get('html', parsed.get('plain', '')), 'html', 'utf-8')
+                            m.attach(p1)
+                            m.attach(p2)
+                            msg_content = m.as_bytes()
+                    except Exception:
+                        # not JSON or failed to build -> leave as-is
+                        pass
+
+                # Header rewrite for raw bytes message
                 if sender and (node.get('sender_domain') or node.get('sender_email')):
                     try:
-                        msg = message_from_bytes(msg_content)
-                        if 'From' in msg: del msg['From']
-                        msg['From'] = sender
-                        msg_content = msg.as_bytes()
-                    except: pass
+                        if isinstance(msg_content, (bytes, bytearray)):
+                            msg = message_from_bytes(msg_content)
+                            if 'From' in msg: del msg['From']
+                            msg['From'] = sender
+                            msg_content = msg.as_bytes()
+                    except:
+                        pass
                 
                 # 群发严格间隔控制：在发送前确保距离上次发送已达到节点/用户设置的间隔
                 if is_bulk:
@@ -2018,37 +2123,14 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 import re
                 plain_text = re.sub(r'<[^>]+>', '', plain_text)
                 
-                msg = MIMEMultipart('alternative')
-                msg['Subject'] = final_subject
-                msg['From'] = '' # Placeholder, worker will fill
-                msg['To'] = rcpt
-                
-                # Randomize date slightly (within last few minutes)
-                date_offset = random.randint(0, 180)  # 0-3 minutes ago
-                msg['Date'] = formatdate(localtime=True, timeval=time.time() - date_offset)
-                
-                # More natural Message-ID format
-                msg_domain = rcpt.split('@')[-1] if '@' in rcpt else 'mail.local'
-                msg['Message-ID'] = f"<{uuid.uuid4().hex[:16]}.{int(time.time())}.{random.randint(1000,9999)}@{msg_domain}>"
-                
-                # Add common headers that normal emails have
-                msg['MIME-Version'] = '1.0'
-                user_agents = [
-                    'Mozilla/5.0', 
-                    'Microsoft Outlook 16.0', 
-                    'Apple Mail (2.3654)',
-                    'Thunderbird/102.0',
-                    None  # Sometimes no User-Agent
-                ]
-                ua = random.choice(user_agents)
-                if ua:
-                    msg['X-Mailer'] = ua
-                
-                # Attach plain text first, then HTML (standard order)
-                part1 = MIMEText(plain_text, 'plain', 'utf-8')
-                part2 = MIMEText(final_body, 'html', 'utf-8')
-                msg.attach(part1)
-                msg.attach(part2)
+                # 为了避免在导入阶段生成大量内存占用的 MIME 对象，
+                # 这里只保存轻量的序列化内容（HTML 与 plain 文本），
+                # 真正生成完整 MIME 在发送阶段再完成。
+                try:
+                    content_json = json.dumps({'html': final_body, 'plain': plain_text}, ensure_ascii=False)
+                except Exception:
+                    # Fallback to plain string storage if JSON fails
+                    content_json = final_body
 
                 node = select_node_for_recipient(pool, rcpt, limit_cfg, source='bulk')
                 if not node:
@@ -2067,8 +2149,8 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                     # smtp_user unknown for bulk imports initiated by UI; leave as NULL
                     record = ('', json.dumps([rcpt]), None, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, chosen_tid)
                 else:
-                    # smtp_user unknown for bulk imports initiated by UI; leave as NULL
-                    record = ('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, None)
+                    # 存储轻量 JSON (或 HTML 字符串) 到 content 字段，发送时再生成 MIME
+                    record = ('', json.dumps([rcpt]), content_json, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, None)
                 count += 1
                 # increment expected total and set start_time if first
                 try:
@@ -2080,10 +2162,11 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                     pass
                 # Push to bulk writer queue. If queue is full, fallback to direct DB write to avoid blocking forever.
                 try:
-                    bulk_write_queue.put(record, block=False)
-                except Exception:
-                    # fallback: write immediately in small transaction
+                    # Try to enqueue with a short timeout; if queue is full, fallback to direct DB write
                     try:
+                        bulk_write_queue.put(record, block=True, timeout=2)
+                    except Exception:
+                        # fallback: write immediately in small transaction to avoid unbounded memory growth
                         with get_db() as conn:
                             conn.execute(
                                 "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -2091,8 +2174,8 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                             )
                         with bulk_stats_lock:
                             bulk_stats['inserted'] += 1
-                    except Exception as e:
-                        logger.error(f"Direct write fallback failed for {rcpt}: {e}")
+                except Exception as e:
+                    logger.error(f"Direct write fallback failed for {rcpt}: {e}")
             except Exception as e:
                 logger.error(f"准备邮件失败 {rcpt}: {e}")
                 continue
