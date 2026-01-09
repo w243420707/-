@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260108123535.4"
+SCRIPT_VERSION="20260108123535.3"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -2365,6 +2365,12 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 # If we have pre-generated templates, only write recipient + template_id to DB
                 if template_ids:
                     chosen_tid = random.choice(template_ids)
+                    # Resolve subject from template cache to populate subject column without DB hit every time
+                    try:
+                        tpl = get_template(chosen_tid)
+                        final_subject = tpl.get('subject') if tpl and tpl.get('subject') else (random.choice(subjects) if subjects else '(No Subject)')
+                    except Exception:
+                        final_subject = (random.choice(subjects) if subjects else '(No Subject)')
                     # smtp_user unknown for bulk imports initiated by UI; leave as NULL
                     record = ('', json.dumps([rcpt]), None, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, chosen_tid)
                 else:
