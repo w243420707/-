@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260108123535.7"
+SCRIPT_VERSION="20260108123535.9"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -2114,18 +2114,67 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
             bulk_stats['last_update'] = 0.0
             bulk_stats['last_rate'] = 0.0
 
-        # Process recipients in a streaming manner to avoid building huge lists in memory
+        # Process recipients in a streaming manner to avoid building huge lists in memory.
+        # If the raw input is large, persist it to a temp file and iterate the file lines.
         from io import StringIO
         import re
+        tmp_recipients_path = None
+        def write_recipients_temp(raw):
+            try:
+                tf = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, dir=TMP_DIR, prefix='recips_', suffix='.txt')
+                tf.write(raw)
+                tf.flush()
+                tf.close()
+                return tf.name
+            except Exception:
+                return None
+
         def recipient_iterator(raw):
-            # If input looks like a single comma/semicolon-separated line, split on those
+            # Heuristic: if very large string or many lines, write to disk first
+            try:
+                est_lines = raw.count('\n') + (1 if raw.strip() else 0)
+            except Exception:
+                est_lines = 0
+            # Thresholds: >5000 lines or >200KB raw size
+            try:
+                raw_size = len(raw) if raw is not None else 0
+            except Exception:
+                raw_size = 0
+            if (est_lines > 5000) or (raw_size > 200 * 1024):
+                fp = write_recipients_temp(raw)
+                if fp:
+                    # iterate file lines to avoid holding raw in memory
+                    try:
+                        f = open(fp, 'r', encoding='utf-8')
+                        for line in f:
+                            p = line.strip()
+                            if p:
+                                yield p
+                        f.close()
+                    except Exception:
+                        try:
+                            # fallback to splitting in memory
+                            for part in re.split(r'[;,\n]+', raw):
+                                p = part.strip()
+                                if p:
+                                    yield p
+                        except Exception:
+                            return
+                else:
+                    # if temp write failed, fallback to in-memory split
+                    for part in re.split(r'[;,\n]+', raw):
+                        p = part.strip()
+                        if p:
+                            yield p
+                return
+            # Small input: handle common comma/semicolon single-line case
             if raw and '\n' not in raw and (',' in raw or ';' in raw):
                 for part in re.split(r'[;,\n]+', raw):
                     p = part.strip()
                     if p:
                         yield p
                 return
-            # Otherwise iterate line-by-line (StringIO avoids creating a giant list)
+            # Otherwise iterate line-by-line using StringIO
             f = StringIO(raw)
             for line in f:
                 p = line.strip()
@@ -2611,6 +2660,16 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                             pass
 
         logger.info(f"群发导入完成: 共 {count} 封邮件, 等待后台写入完成...")
+        # Cleanup temporary recipients file if we created one
+        try:
+            if 'fp' in locals() and fp and os.path.exists(fp):
+                try:
+                    os.remove(fp)
+                    logger.info(f"Removed temporary recipients file: {fp}")
+                except Exception:
+                    pass
+        except Exception:
+            pass
         # Wait for background writer to finish inserting expected records (with timeout)
         wait_start = time.time()
         timeout = 60 * 30  # 30 minutes max wait
