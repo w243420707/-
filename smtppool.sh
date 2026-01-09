@@ -6349,7 +6349,7 @@ uninstall_smtp() {
 show_menu() {
     clear
     echo -e "============================================"
-    echo -e "   🚀 SMTP Relay Manager 管理脚本 "
+    echo -e "   🚀 SMTP Relay Manager 管理脚本 ${SCRIPT_VERSION}"
     echo -e "============================================"
     echo -e "${GREEN}1.${PLAIN} 安装 / 更新 "
     echo -e "${GREEN}2.${PLAIN} 启动服务"
