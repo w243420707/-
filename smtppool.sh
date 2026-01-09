@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="3.58"
+SCRIPT_VERSION="4.01"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -87,6 +87,8 @@ import uuid
 import functools
 from datetime import datetime, timedelta
 from email import message_from_bytes
+from flask import Flask, request, jsonify, send_from_directory
+from werkzeug.utils import secure_filename
 
 # --- Global paths and defaults ---
 APP_DIR = "/opt/smtp-relay"
