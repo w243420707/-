@@ -60,7 +60,7 @@ install_smtp() {
     "server_config": { "host": "0.0.0.0", "port": 587, "username": "myapp", "password": "123" },
     "web_config": { "admin_password": "admin", "public_domain": "" },
     "telegram_config": { "bot_token": "", "admin_id": "" },
-    "log_config": { "max_mb": 50, "backups": 3, "retention_days": 7 },
+    "log_config": { "max_mb": 50, "backups": 3, "retention_days": 1 },
     "limit_config": { "max_per_hour": 0, "min_interval": 1, "max_interval": 5 },
     "bulk_control": { "status": "running" },
     "downstream_pool": [],
@@ -816,6 +816,48 @@ worker_stats = {
 }
 worker_stop_event = threading.Event()
 
+# Batch update queue for DB status updates to avoid spawning per-task threads
+update_batch = []
+update_batch_lock = threading.Lock()
+UPDATE_BATCH_SIZE = 50
+
+def update_flusher_thread():
+    while True:
+        try:
+            time.sleep(1)
+            with update_batch_lock:
+                items = list(update_batch)
+                update_batch.clear()
+            if not items:
+                continue
+            # Separate success and failure updates
+            successes = [(item[0],) for item in items if item[1]]
+            failures = [(item[2][:200], item[0]) for item in items if not item[1]]
+            # Apply in a transaction
+            tries = 3
+            for attempt in range(tries):
+                try:
+                    with get_db() as conn:
+                        if successes:
+                            conn.executemany("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", successes)
+                        if failures:
+                            conn.executemany("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", failures)
+                    break
+                except sqlite3.OperationalError as e:
+                    if 'locked' in str(e) and attempt < tries - 1:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    # on failure, push items back (best-effort)
+                    with update_batch_lock:
+                        for it in items:
+                            update_batch.append(it)
+                    break
+        except Exception:
+            time.sleep(1)
+
+# start update flusher
+threading.Thread(target=update_flusher_thread, daemon=True).start()
+
 # Per-smtp-user last sent timestamps to enforce per-user intervals (in-memory)
 smtp_user_last_sent = {}
 smtp_user_last_lock = threading.Lock()
@@ -1260,35 +1302,20 @@ def node_sender(node_name, task_queue):
             
             # 批量更新数据库（使用单独线程，不阻塞发送）
             # 使用默认参数捕获当前值，避免闭包问题
-            def update_db(rid=row_id, ok=success, err=error_msg):
-                retries = 3
-                for attempt in range(retries):
-                    try:
-                        with get_db() as conn:
-                            if ok:
-                                conn.execute("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", (rid,))
-                            else:
-                                conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", (err[:200], rid))
-                        return
-                    except sqlite3.OperationalError as e:
-                        if 'locked' in str(e) and attempt < retries - 1:
-                            time.sleep(0.5 * (attempt + 1))
-                            continue
-                        # 最终失败：将任务重置为 pending，并增加重试计数，避免永久卡住
-                        try:
-                            with get_db() as conn2:
-                                conn2.execute(
-                                    "UPDATE queue SET status='pending', retry_count = COALESCE(retry_count,0)+1, last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?",
-                                    (str(e)[:200], rid)
-                                )
-                        except:
-                            pass
-                        logger.error(f"[{node_name}] 更新数据库失败，已重置为 pending: {e}")
-                        return
-                    except Exception as e:
-                        logger.error(f"[{node_name}] 更新数据库异常: {e}")
-                        return
-            threading.Thread(target=update_db, daemon=True).start()
+            # Append the result to the global update batch (flushed by background thread)
+            try:
+                with update_batch_lock:
+                    update_batch.append((row_id, success, error_msg))
+            except Exception:
+                # Fallback: try immediate small update to avoid losing status
+                try:
+                    with get_db() as conn:
+                        if success:
+                            conn.execute("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", (row_id,))
+                        else:
+                            conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", (error_msg[:200], row_id))
+                except Exception:
+                    logger.error(f"[{node_name}] 无法追加或写入更新状态: {row_id}")
             
             # 日志汇总（每10封输出一次）
             if local_success >= 10 or local_fail >= 10:
@@ -1446,8 +1473,14 @@ def manager_thread():
                     if days > 0:
                         cutoff = (datetime.utcnow() + timedelta(hours=8) - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
                         with get_db() as conn:
-                            conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed') AND updated_at < ?", (cutoff,))
-                        logger.info(f"🧹 自动清理了 {days} 天前的旧记录")
+                            deleted = conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed') AND updated_at < ?", (cutoff,)).rowcount
+                            try:
+                                # compress DB to reclaim space after deleting many rows
+                                if deleted > 0:
+                                    conn.execute('VACUUM')
+                            except Exception:
+                                pass
+                        logger.info(f"🧹 自动清理了 {deleted} 条 {days} 天前的旧记录")
                 except Exception as e:
                     logger.error(f"自动清理失败: {e}")
                 last_cleanup_time = now
@@ -2111,6 +2144,43 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
             "今天想去打羽毛球，觉得生活很美好。", "周末准备去跑步，希望能遇到有趣的人。", "最近要去健身房锻炼，感觉很放松。",
 ]  # Empty placeholder, using CHAT_CORPUS module constant
         
+        # If no templates exist, pre-generate a pool of templates and use template-only records
+        try:
+            if not template_ids:
+                # estimate count from input; cap generation to avoid excessive DB work
+                gen_count = min(max(1, est), 1000)
+                rows = []
+                now_iso = datetime.utcnow().isoformat() + 'Z'
+                for i in range(gen_count):
+                    try:
+                        suffix = '-' + uuid.uuid4().hex[:6]
+                    except Exception:
+                        suffix = '-' + str(i)
+                    try:
+                        chosen_subj = random.choice(subjects) if subjects else '(No Subject)'
+                    except Exception:
+                        chosen_subj = '(No Subject)'
+                    try:
+                        chosen_body = random.choice(bodies) if bodies else ''
+                    except Exception:
+                        chosen_body = ''
+                    rows.append((chosen_subj + suffix, chosen_body, json.dumps({'gen': now_iso, 'idx': i})))
+                try:
+                    with get_db() as conn:
+                        conn.executemany("INSERT INTO bulk_templates (subject, body, meta) VALUES (?, ?, ?)", rows)
+                        # fetch newly inserted ids (may include older ones, but sufficient)
+                        fetched = conn.execute("SELECT id FROM bulk_templates ORDER BY id DESC LIMIT ?", (gen_count,)).fetchall()
+                        template_ids = [r[0] for r in fetched]
+                        try:
+                            bulk_template_cache.clear()
+                        except Exception:
+                            pass
+                except Exception:
+                    # if generation fails, fall back to no-template mode
+                    template_ids = []
+        except Exception:
+            pass
+
         tasks = []
         count = 0
         # Batch size for streaming writes to limit memory usage
@@ -2134,47 +2204,51 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                     tracking_url = f"{tracking_base}/track/{tracking_id}"
                     tracking_html = f"<img src='{tracking_url}' width='1' height='1' alt='' style='display:none;border:0;'>"
 
-                # === Enhanced Subject Randomization ===
-                # Randomly choose subject format
-                subject_formats = [
-                    f"{current_subject} {rand_sub}",
-                    f"{current_subject} - {rand_sub}",
-                    f"Re: {current_subject}",
-                    f"Fwd: {current_subject}",
-                    f"{current_subject}",
-                    f"{current_subject} #{rand_sub[:4]}",
-                ]
-                final_subject = random.choice(subject_formats)
-                
-                # === Build More Natural Email ===
-                # Extract recipient name from email for personalization
-                rcpt_name = rcpt.split('@')[0].replace('.', ' ').replace('_', ' ').replace('-', ' ').title()[:20]
-                
-                # Random greetings and closings
-                greetings = ['', f'Hi,', f'Hello,', f'Hey,', f'{rcpt_name},', f'Hi {rcpt_name},', f'Dear {rcpt_name},', '你好，', '您好，', '']
-                closings = ['', 'Best,', 'Thanks,', 'Cheers,', 'Regards,', '祝好', '谢谢', '']
-                
-                greeting = random.choice(greetings)
-                closing = random.choice(closings)
-                
-                # Build HTML with more natural structure
-                # Hidden content placed more naturally throughout
-                hidden_style = 'color:transparent;font-size:1px;line-height:1px;max-height:0;opacity:0;overflow:hidden;mso-hide:all;'
-                hidden_words = rand_chat.split()
-                hidden_chunks = [' '.join(hidden_words[i:i+3]) for i in range(0, len(hidden_words), 3)]
-                
-                # Interleave hidden content with visible content
-                body_parts = current_body.split('</p>')
-                enhanced_body = ""
-                for i, part in enumerate(body_parts):
-                    enhanced_body += part
-                    if part.strip() and i < len(hidden_chunks):
-                        enhanced_body += f'<span style="{hidden_style}">{hidden_chunks[i]}</span>'
-                    if part.strip() and '<p' in part.lower():
-                        enhanced_body += '</p>'
-                
-                # Build final body with natural wrapping
-                final_body = f'''<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;">
+                # If templates are present, we only store template_id and avoid building per-recipient content
+                if template_ids:
+                    chosen_tid = random.choice(template_ids)
+                else:
+                    # === Enhanced Subject Randomization ===
+                    # Randomly choose subject format
+                    subject_formats = [
+                        f"{current_subject} {rand_sub}",
+                        f"{current_subject} - {rand_sub}",
+                        f"Re: {current_subject}",
+                        f"Fwd: {current_subject}",
+                        f"{current_subject}",
+                        f"{current_subject} #{rand_sub[:4]}",
+                    ]
+                    final_subject = random.choice(subject_formats)
+
+                    # === Build More Natural Email ===
+                    # Extract recipient name from email for personalization
+                    rcpt_name = rcpt.split('@')[0].replace('.', ' ').replace('_', ' ').replace('-', ' ').title()[:20]
+
+                    # Random greetings and closings
+                    greetings = ['', f'Hi,', f'Hello,', f'Hey,', f'{rcpt_name},', f'Hi {rcpt_name},', f'Dear {rcpt_name},', '你好，', '您好，', '']
+                    closings = ['', 'Best,', 'Thanks,', 'Cheers,', 'Regards,', '祝好', '谢谢', '']
+
+                    greeting = random.choice(greetings)
+                    closing = random.choice(closings)
+
+                    # Build HTML with more natural structure
+                    # Hidden content placed more naturally throughout
+                    hidden_style = 'color:transparent;font-size:1px;line-height:1px;max-height:0;opacity:0;overflow:hidden;mso-hide:all;'
+                    hidden_words = rand_chat.split()
+                    hidden_chunks = [' '.join(hidden_words[i:i+3]) for i in range(0, len(hidden_words), 3)]
+
+                    # Interleave hidden content with visible content
+                    body_parts = current_body.split('</p>')
+                    enhanced_body = ""
+                    for i, part in enumerate(body_parts):
+                        enhanced_body += part
+                        if part.strip() and i < len(hidden_chunks):
+                            enhanced_body += f'<span style="{hidden_style}">{hidden_chunks[i]}</span>'
+                        if part.strip() and '<p' in part.lower():
+                            enhanced_body += '</p>'
+
+                    # Build final body with natural wrapping
+                    final_body = f'''<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;">
 {f"<p>{greeting}</p>" if greeting else ""}
 {enhanced_body if enhanced_body else current_body}
 <span style="{hidden_style}">{random.choice(hidden_chunks) if hidden_chunks else rand_chat[:50]}</span>
@@ -2182,21 +2256,15 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
 {tracking_html}
 </div>'''
 
-                # === Create Multipart Email (HTML + Plain Text) ===
-                # Plain text version makes it look more like a normal email
-                plain_text = f"{greeting}\n\n{current_body.replace('<br>', chr(10)).replace('<br/>', chr(10)).replace('</p>', chr(10))}\n\n{closing}".strip()
-                # Remove HTML tags from plain text
-                import re
-                plain_text = re.sub(r'<[^>]+>', '', plain_text)
-                
-                # 为了避免在导入阶段生成大量内存占用的 MIME 对象，
-                # 这里只保存轻量的序列化内容（HTML 与 plain 文本），
-                # 真正生成完整 MIME 在发送阶段再完成。
-                try:
-                    content_json = json.dumps({'html': final_body, 'plain': plain_text}, ensure_ascii=False)
-                except Exception:
-                    # Fallback to plain string storage if JSON fails
-                    content_json = final_body
+                    # === Create Multipart Email (HTML + Plain Text) ===
+                    plain_text = f"{greeting}\n\n{current_body.replace('<br>', chr(10)).replace('<br/>', chr(10)).replace('</p>', chr(10))}\n\n{closing}".strip()
+                    import re
+                    plain_text = re.sub(r'<[^>]+>', '', plain_text)
+
+                    try:
+                        content_json = json.dumps({'html': final_body, 'plain': plain_text}, ensure_ascii=False)
+                    except Exception:
+                        content_json = final_body
 
                 # Persist large per-recipient content to disk to avoid keeping many large strings in memory
                 try:
@@ -5771,7 +5839,11 @@ EOF
                     const confirmMsg = this.bulk.enableSchedule && this.bulk.scheduledAt 
                         ? `确认定时发送给 ${this.recipientCount} 人?\n发送时间: ${this.bulk.scheduledAt.replace('T', ' ')}`
                         : `确认发送给 ${this.recipientCount} 人?`;
-                    if(!confirm(confirmMsg)) return;
+                        // Limit single import size and warn user
+                        if (this.recipientCount > 5000) {
+                            if(!confirm('建议分批导入，每批不超过 5000 人。是否继续发送当前批次？')) return;
+                        }
+                        if(!confirm(confirmMsg)) return;
                     
                     this.sending = true;
                     try {
