@@ -703,23 +703,17 @@ def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=
             if max_int < min_int: max_int = min_int
             chosen_delay = random.uniform(min_int, max_int) if max_int > min_int else min_int
 
-            # Reserve a per-user slot atomically to serialize sends for this user
-            try:
-                while True:
-                    now_ts = time.time()
-                    with smtp_user_last_lock:
-                        last_ts = smtp_user_last_sent.get(smtp_user, 0)
-                        elapsed = now_ts - last_ts if last_ts else now_ts
-                        if elapsed >= chosen_delay:
-                            # reserve slot
-                            smtp_user_last_sent[smtp_user] = now_ts
-                            break
-                        else:
-                            to_sleep = chosen_delay - elapsed
-                    time.sleep(to_sleep)
-            except Exception:
-                # fallback
-                time.sleep(chosen_delay)
+            # 基于内存时间戳计算需要等待的时间
+            need_sleep = 0
+            with smtp_user_last_lock:
+                last = smtp_user_last_sent.get(smtp_user, 0)
+            elapsed_user = time.time() - last if last else None
+            if elapsed_user is None:
+                elapsed_user = 0
+            if elapsed_user < chosen_delay:
+                need_sleep = chosen_delay - elapsed_user
+            if need_sleep > 0:
+                time.sleep(need_sleep)
 
         if encryption == 'ssl':
             with smtplib.SMTP_SSL(host, port, timeout=30) as s:
@@ -735,7 +729,13 @@ def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=
                 s.sendmail(sender, rcpt_tos, msg_bytes)
 
         logger.info(f"🔁 直接转发成功 -> {node.get('name')} | 收件: {rcpt_tos[0] if rcpt_tos else '?'} | 主题: {subject or ''}")
-        # for forward_to_node we reserved the per-user slot before sending
+        # 更新内存中的 per-user 发送时间戳
+        if smtp_user:
+            try:
+                with smtp_user_last_lock:
+                    smtp_user_last_sent[smtp_user] = time.time()
+            except Exception:
+                pass
         return True
     except Exception as e:
         logger.error(f"🔁 直接转发到节点 {node.get('name')} 失败: {e}")
@@ -1094,32 +1094,16 @@ def node_sender(node_name, task_queue):
                         need_sleep = chosen_delay - elapsed_node
 
                     if smtp_user:
-                        # First ensure node-level spacing
-                        if need_sleep > 0:
-                            time.sleep(need_sleep)
+                        with smtp_user_last_lock:
+                            last = smtp_user_last_sent.get(smtp_user, 0)
+                        elapsed_user = time.time() - last if last else None
+                        if elapsed_user is None:
+                            elapsed_user = 0
+                        if elapsed_user < chosen_delay:
+                            need_sleep = max(need_sleep, chosen_delay - elapsed_user)
 
-                        # Then try to reserve a per-user slot atomically to avoid race.
-                        # We compute a chosen_delay for this send and then loop attempting
-                        # to reserve by updating smtp_user_last_sent under lock. If not
-                        # enough time passed since last, sleep the remaining and retry.
-                        try:
-                            # chosen_delay already computed above
-                            while True:
-                                now_ts = time.time()
-                                with smtp_user_last_lock:
-                                    last_ts = smtp_user_last_sent.get(smtp_user, 0)
-                                    elapsed = now_ts - last_ts if last_ts else now_ts
-                                    if elapsed >= chosen_delay:
-                                        # Reserve this slot by setting last_sent to now
-                                        smtp_user_last_sent[smtp_user] = now_ts
-                                        break
-                                    else:
-                                        to_sleep = chosen_delay - elapsed
-                                # sleep outside lock
-                                time.sleep(to_sleep)
-                        except Exception:
-                            # Fallback: if reservation fails, fall back to simple sleep
-                            time.sleep(chosen_delay)
+                    if need_sleep > 0:
+                        time.sleep(need_sleep)
 
                 # 发送邮件
                 encryption = node.get('encryption', 'none')
@@ -1143,8 +1127,13 @@ def node_sender(node_name, task_queue):
                 local_success += 1
                 node_hourly_count['count'] += 1
                 node_last_sent = time.time()
-                # Note: for node_sender we reserved the per-user slot before send,
-                # so no need to update again here. But ensure we set node_last_sent.
+                # update per-smtp-user last sent timestamp
+                if smtp_user:
+                    try:
+                        with smtp_user_last_lock:
+                            smtp_user_last_sent[smtp_user] = time.time()
+                    except Exception:
+                        pass
                 
                 with worker_stats['lock']:
                     worker_stats['success'] += 1
