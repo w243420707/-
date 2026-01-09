@@ -673,6 +673,48 @@ def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=
         except Exception:
             msg_bytes = content
 
+        # 如果是认证用户（smtp_user），在直接转发前尊重该用户的发送间隔设置
+        if smtp_user:
+            try:
+                with get_db() as c:
+                    row = c.execute("SELECT min_interval, max_interval FROM smtp_users WHERE username=?", (smtp_user,)).fetchone()
+                    user_min = row['min_interval'] if row and 'min_interval' in row.keys() else None
+                    user_max = row['max_interval'] if row and 'max_interval' in row.keys() else None
+            except Exception:
+                user_min = None
+                user_max = None
+
+            try:
+                if user_min is not None and user_max is not None:
+                    min_int = float(user_min)
+                    max_int = float(user_max)
+                elif user_min is not None:
+                    min_int = float(user_min)
+                    max_int = float(user_min)
+                else:
+                    # fallback to small delay
+                    min_int = 0.0
+                    max_int = 0.0
+            except Exception:
+                min_int = 0.0
+                max_int = 0.0
+
+            if min_int < 0: min_int = 0.0
+            if max_int < min_int: max_int = min_int
+            chosen_delay = random.uniform(min_int, max_int) if max_int > min_int else min_int
+
+            # 基于内存时间戳计算需要等待的时间
+            need_sleep = 0
+            with smtp_user_last_lock:
+                last = smtp_user_last_sent.get(smtp_user, 0)
+            elapsed_user = time.time() - last if last else None
+            if elapsed_user is None:
+                elapsed_user = 0
+            if elapsed_user < chosen_delay:
+                need_sleep = chosen_delay - elapsed_user
+            if need_sleep > 0:
+                time.sleep(need_sleep)
+
         if encryption == 'ssl':
             with smtplib.SMTP_SSL(host, port, timeout=30) as s:
                 if username and password:
@@ -687,6 +729,13 @@ def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=
                 s.sendmail(sender, rcpt_tos, msg_bytes)
 
         logger.info(f"🔁 直接转发成功 -> {node.get('name')} | 收件: {rcpt_tos[0] if rcpt_tos else '?'} | 主题: {subject or ''}")
+        # 更新内存中的 per-user 发送时间戳
+        if smtp_user:
+            try:
+                with smtp_user_last_lock:
+                    smtp_user_last_sent[smtp_user] = time.time()
+            except Exception:
+                pass
         return True
     except Exception as e:
         logger.error(f"🔁 直接转发到节点 {node.get('name')} 失败: {e}")
@@ -718,23 +767,34 @@ node_queue_lock = threading.Lock()
 
 # Background writer for bulk inserts: use a queue + batch executemany to improve throughput
 from queue import Queue as _LocalQueue, Empty as _LocalEmpty
-bulk_write_queue = _LocalQueue()
-_BULK_WRITE_BATCH = 5000
+# Limit the in-memory bulk write queue to avoid unbounded memory growth
+bulk_write_queue = _LocalQueue(maxsize=2000)
+# Reduce batch size to limit memory used when batching large messages
+_BULK_WRITE_BATCH = 1000
 
 # bulk write statistics
 
 # simple in-memory template cache
 bulk_template_cache = {}
+_BULK_TEMPLATE_CACHE_MAX = 1000
 def get_template(tid):
     try:
         if tid in bulk_template_cache:
             return bulk_template_cache[tid]
         with get_db() as conn:
             row = conn.execute("SELECT id, subject, body, meta FROM bulk_templates WHERE id=?", (tid,)).fetchone()
-            if row:
-                tpl = { 'id': row['id'], 'subject': row['subject'], 'body': row['body'], 'meta': row['meta'] }
-                bulk_template_cache[tid] = tpl
-                return tpl
+                if row:
+                    tpl = { 'id': row['id'], 'subject': row['subject'], 'body': row['body'], 'meta': row['meta'] }
+                    # Simple cache with size limit: evict arbitrary oldest entries when over limit
+                    bulk_template_cache[tid] = tpl
+                    try:
+                        if len(bulk_template_cache) > _BULK_TEMPLATE_CACHE_MAX:
+                            # pop an arbitrary item
+                            k = next(iter(bulk_template_cache))
+                            bulk_template_cache.pop(k, None)
+                    except Exception:
+                        pass
+                    return tpl
     except Exception:
         return None
     return None
@@ -2080,10 +2140,11 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                     pass
                 # Push to bulk writer queue. If queue is full, fallback to direct DB write to avoid blocking forever.
                 try:
-                    bulk_write_queue.put(record, block=False)
-                except Exception:
-                    # fallback: write immediately in small transaction
+                    # Try to enqueue with a short timeout; if queue is full, fallback to direct DB write
                     try:
+                        bulk_write_queue.put(record, block=True, timeout=2)
+                    except Exception:
+                        # fallback: write immediately in small transaction to avoid unbounded memory growth
                         with get_db() as conn:
                             conn.execute(
                                 "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -2091,8 +2152,8 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                             )
                         with bulk_stats_lock:
                             bulk_stats['inserted'] += 1
-                    except Exception as e:
-                        logger.error(f"Direct write fallback failed for {rcpt}: {e}")
+                except Exception as e:
+                    logger.error(f"Direct write fallback failed for {rcpt}: {e}")
             except Exception as e:
                 logger.error(f"准备邮件失败 {rcpt}: {e}")
                 continue
