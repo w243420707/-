@@ -86,6 +86,8 @@ import functools
 from datetime import datetime, timedelta
 from email import message_from_bytes
 from io import StringIO
+import tempfile
+import os
 from email.header import decode_header
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -100,6 +102,22 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
 DB_FILE = os.path.join(BASE_DIR, 'queue.db')
 LOG_FILE = '/var/log/smtp-relay/app.log'
+TMP_DIR = os.path.join(BASE_DIR, 'tmp')
+try:
+    os.makedirs(TMP_DIR, exist_ok=True)
+except Exception:
+    pass
+
+def write_temp_content(content_str):
+    try:
+        # create a named temp file in TMP_DIR and return its path
+        tf = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, dir=TMP_DIR, prefix='bulk_', suffix='.json')
+        tf.write(content_str)
+        tf.flush()
+        tf.close()
+        return tf.name
+    except Exception:
+        return None
 
 # --- Database ---
 def db_retry(max_retries=3, delay=0.5):
@@ -652,7 +670,18 @@ def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=
             # 如果 content 是导入时保存的轻量 JSON 字符串，先把它构建成完整 MIME
             if isinstance(content, str):
                 try:
-                    parsed = json.loads(content)
+                    # If content points to temp file, read it first
+                    if content.startswith('FILE:'):
+                        fp = content[5:]
+                        try:
+                            with open(fp, 'r', encoding='utf-8') as fh:
+                                txt = fh.read()
+                            parsed = json.loads(txt)
+                        except Exception:
+                            parsed = None
+                    else:
+                        parsed = json.loads(content)
+
                     if isinstance(parsed, dict) and ('html' in parsed or 'plain' in parsed):
                         m = MIMEMultipart('alternative')
                         m['Subject'] = subject or ''
@@ -663,6 +692,12 @@ def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=
                         m.attach(p1)
                         m.attach(p2)
                         msg = m
+                        # try to remove temp file after building
+                        try:
+                            if 'fp' in locals() and fp and os.path.exists(fp):
+                                os.remove(fp)
+                        except Exception:
+                            pass
                     else:
                         msg = message_from_bytes(content.encode('utf-8'))
                 except Exception:
@@ -1070,7 +1105,18 @@ def node_sender(node_name, task_queue):
                 # 如果 content 是轻量 JSON 字符串（导入阶段为节省内存而存储），在此处生成完整 MIME
                 if isinstance(msg_content, str):
                     try:
-                        parsed = json.loads(msg_content)
+                        # If content is a pointer to a temp file, load it
+                        if msg_content.startswith('FILE:'):
+                            fp = msg_content[5:]
+                            try:
+                                with open(fp, 'r', encoding='utf-8') as fh:
+                                    txt = fh.read()
+                                parsed = json.loads(txt)
+                            except Exception:
+                                parsed = None
+                        else:
+                            parsed = json.loads(msg_content)
+
                         if isinstance(parsed, dict) and ('html' in parsed or 'plain' in parsed):
                             recipient = rcpt_tos[0] if isinstance(rcpt_tos, (list, tuple)) and len(rcpt_tos) > 0 else ''
                             m = MIMEMultipart('alternative')
@@ -1082,6 +1128,12 @@ def node_sender(node_name, task_queue):
                             m.attach(p1)
                             m.attach(p2)
                             msg_content = m.as_bytes()
+                            # try to remove temp file after building
+                            try:
+                                if msg_content and isinstance(msg_content, (bytes, bytearray)) and 'fp' in locals() and fp and os.path.exists(fp):
+                                    os.remove(fp)
+                            except Exception:
+                                pass
                     except Exception:
                         # not JSON or failed to build -> leave as-is
                         pass
@@ -2146,6 +2198,16 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                     # Fallback to plain string storage if JSON fails
                     content_json = final_body
 
+                # Persist large per-recipient content to disk to avoid keeping many large strings in memory
+                try:
+                    fp = write_temp_content(content_json)
+                    if fp:
+                        content_field = 'FILE:' + fp
+                    else:
+                        content_field = content_json
+                except Exception:
+                    content_field = content_json
+
                 node = select_node_for_recipient(pool, rcpt, limit_cfg, source='bulk')
                 if not node:
                     # No node available for this domain (all nodes exclude it)
@@ -2163,8 +2225,8 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                     # smtp_user unknown for bulk imports initiated by UI; leave as NULL
                     record = ('', json.dumps([rcpt]), None, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, chosen_tid)
                 else:
-                    # 存储轻量 JSON (或 HTML 字符串) 到 content 字段，发送时再生成 MIME
-                    record = ('', json.dumps([rcpt]), content_json, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, None)
+                    # 存储内容为临时文件路径的标记或直接文本
+                    record = ('', json.dumps([rcpt]), content_field, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, None)
                 count += 1
                 # increment expected total and set start_time if first
                 try:
