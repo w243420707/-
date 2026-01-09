@@ -2227,8 +2227,28 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                         except Exception:
                             pass
                 except Exception:
-                    # if generation fails, fall back to no-template mode
-                    template_ids = []
+                    # if generation fails, attempt to insert a single fallback template
+                    try:
+                        try:
+                            fallback_subj = subjects[0] if subjects else '(No Subject)'
+                        except Exception:
+                            fallback_subj = '(No Subject)'
+                        try:
+                            fallback_body = bodies[0] if bodies else ''
+                        except Exception:
+                            fallback_body = ''
+                        with get_db() as conn:
+                            conn.execute("INSERT INTO bulk_templates (subject, body, meta) VALUES (?, ?, ?)", (fallback_subj, fallback_body, json.dumps({'gen':'fallback'})))
+                            row = conn.execute("SELECT id FROM bulk_templates ORDER BY id DESC LIMIT 1").fetchone()
+                            template_ids = [row[0]] if row else []
+                            try:
+                                bulk_template_cache.clear()
+                            except Exception:
+                                pass
+                        logger.warning('Template generation failed; created single fallback template to enforce template-only import')
+                    except Exception:
+                        # As a last resort keep template_ids empty (should be rare)
+                        template_ids = []
         except Exception:
             pass
 
@@ -2362,55 +2382,47 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 # Accumulate into in-memory chunk; flush when chunk full
                 batch_records.append(record)
                 if len(batch_records) >= CHUNK_SIZE:
-                    # Try to enqueue each record; if queue is full, do a single executemany DB write for the whole chunk
+                    # Directly write batches to the DB to avoid queuing thousands of in-memory records
                     try:
-                        enqueued = 0
+                        with get_db() as conn:
+                            conn.executemany(
+                                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                batch_records
+                            )
+                        with bulk_stats_lock:
+                            bulk_stats['inserted'] += len(batch_records)
+                    except Exception as e:
+                        logger.error(f"Bulk import executemany failed: {e}; attempting per-item enqueue fallback")
+                        # Fallback: try best-effort enqueue to bulk_write_queue for existing writer compatibility
                         for rec in batch_records:
                             try:
-                                bulk_write_queue.put(rec, block=True, timeout=1)
-                                enqueued += 1
+                                bulk_write_queue.put(rec, block=False)
                             except Exception:
-                                # queue full -> break to fallback
-                                raise
-                        # all enqueued
-                        batch_records = []
-                    except Exception:
-                        # fallback: write the whole chunk in one DB transaction to avoid creating many small writes
-                        try:
-                            with get_db() as conn:
-                                conn.executemany(
-                                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                    batch_records
-                                )
-                            with bulk_stats_lock:
-                                bulk_stats['inserted'] += len(batch_records)
-                        except Exception as e:
-                            logger.error(f"Bulk import direct executemany failed: {e}")
-                        batch_records = []
+                                # if even fallback fails, skip to avoid memory blowup
+                                pass
+                    batch_records = []
             except Exception as e:
                 logger.error(f"准备邮件失败 {rcpt}: {e}")
                 continue
 
         # Flush any remaining batch_records
         if batch_records:
+            # Prefer direct DB write for remaining records to avoid keeping them in memory
             try:
+                with get_db() as conn:
+                    conn.executemany(
+                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        batch_records
+                    )
+                with bulk_stats_lock:
+                    bulk_stats['inserted'] += len(batch_records)
+            except Exception as e:
+                logger.error(f"Bulk import final executemany failed: {e}; attempting per-item enqueue fallback")
                 for rec in batch_records:
                     try:
-                        bulk_write_queue.put(rec, block=True, timeout=1)
+                        bulk_write_queue.put(rec, block=False)
                     except Exception:
-                        raise
-                batch_records = []
-            except Exception:
-                try:
-                    with get_db() as conn:
-                        conn.executemany(
-                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            batch_records
-                        )
-                    with bulk_stats_lock:
-                        bulk_stats['inserted'] += len(batch_records)
-                except Exception as e:
-                    logger.error(f"Bulk import final direct executemany failed: {e}")
+                        pass
 
         logger.info(f"群发导入完成: 共 {count} 封邮件, 等待后台写入完成...")
         # Wait for background writer to finish inserting expected records (with timeout)
