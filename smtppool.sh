@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260108123535.13"
+SCRIPT_VERSION="3.57"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -87,7 +87,37 @@ import uuid
 import functools
 from datetime import datetime, timedelta
 from email import message_from_bytes
-        # module imports complete
+
+# --- Global paths and defaults ---
+APP_DIR = "/opt/smtp-relay"
+CONFIG_FILE = os.path.join(APP_DIR, 'config.json')
+DB_FILE = os.path.join(APP_DIR, 'queue.db')
+LOG_DIR = '/var/log/smtp-relay'
+LOG_FILE = os.path.join(LOG_DIR, 'app.log')
+TMP_DIR = os.path.join(APP_DIR, 'tmp')
+
+# Redis defaults (may be overridden from config)
+REDIS_HOST = '127.0.0.1'
+REDIS_PORT = 6379
+REDIS_DB = 0
+REDIS_STREAM = 'bulk_stream'
+REDIS_GROUP = 'bulk_group'
+REDIS_CONSUMER = f"consumer-{uuid.uuid4().hex[:8]}"
+redis_client = None
+
+# Additional imports needed by later code
+from logging.handlers import RotatingFileHandler
+from email.header import decode_header
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+try:
+    from aiosmtpd.smtp import AuthResult, LoginPassword
+except Exception:
+    class AuthResult:
+        def __init__(self, success=False, handled=False):
+            self.success = success
+            self.handled = handled
+    LoginPassword = tuple
 
 
 def redis_to_sql_writer_thread():
