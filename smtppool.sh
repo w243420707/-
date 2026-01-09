@@ -220,7 +220,13 @@ def redis_to_sql_writer_thread():
     global redis_client, REDIS_STREAM, REDIS_GROUP, REDIS_CONSUMER
     if not redis_client:
         return
-    BATCH = 200
+    # batch size for reading from Redis stream; make configurable via config.redis.batch
+    try:
+        cfg = load_config()
+        rcfg = cfg.get('redis', {}) if isinstance(cfg, dict) else {}
+        BATCH = int(rcfg.get('batch', 1000))
+    except Exception:
+        BATCH = 1000
     while True:
         try:
             # Read pending first to recover unacked messages
@@ -3613,6 +3619,8 @@ def start_services():
     try:
         init_redis_client()
         if redis_client:
+            # start two consumer threads to improve Redis->SQLite drain throughput
+            threading.Thread(target=redis_to_sql_writer_thread, daemon=True).start()
             threading.Thread(target=redis_to_sql_writer_thread, daemon=True).start()
     except Exception:
         logger.warning('Redis writer thread failed to start')
