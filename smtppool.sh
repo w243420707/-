@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="4.01"
+SCRIPT_VERSION="20260108123535.3"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -48,7 +48,7 @@ install_smtp() {
         python3 -m venv venv
     fi
     "$VENV_DIR/bin/pip" install --upgrade pip
-    "$VENV_DIR/bin/pip" install flask requests aiosmtpd psutil redis
+    "$VENV_DIR/bin/pip" install flask requests aiosmtpd psutil
 
     if [ -f "/tmp/smtp_config_backup.json" ]; then
         mv "/tmp/smtp_config_backup.json" "$CONFIG_FILE"
@@ -60,11 +60,9 @@ install_smtp() {
     "server_config": { "host": "0.0.0.0", "port": 587, "username": "myapp", "password": "123" },
     "web_config": { "admin_password": "admin", "public_domain": "" },
     "telegram_config": { "bot_token": "", "admin_id": "" },
-    "log_config": { "max_mb": 50, "backups": 3, "retention_days": 1 },
+    "log_config": { "max_mb": 50, "backups": 3, "retention_days": 7 },
     "limit_config": { "max_per_hour": 0, "min_interval": 1, "max_interval": 5 },
     "bulk_control": { "status": "running" },
-    "tmp_cleanup": { "enabled": true, "ttl_hours": 24, "interval_minutes": 60 },
-    "redis": { "host": "127.0.0.1", "port": 6379, "db": 0, "stream": "bulk_stream", "group": "bulk_group" },
     "downstream_pool": [],
     "node_groups": []
 }
@@ -87,103 +85,20 @@ import uuid
 import functools
 from datetime import datetime, timedelta
 from email import message_from_bytes
-from flask import Flask, request, jsonify, send_from_directory
-from werkzeug.utils import secure_filename
-
-# --- Global paths and defaults ---
-APP_DIR = "/opt/smtp-relay"
-CONFIG_FILE = os.path.join(APP_DIR, 'config.json')
-DB_FILE = os.path.join(APP_DIR, 'queue.db')
-LOG_DIR = '/var/log/smtp-relay'
-LOG_FILE = os.path.join(LOG_DIR, 'app.log')
-TMP_DIR = os.path.join(APP_DIR, 'tmp')
-
-# Redis defaults (may be overridden from config)
-REDIS_HOST = '127.0.0.1'
-REDIS_PORT = 6379
-REDIS_DB = 0
-REDIS_STREAM = 'bulk_stream'
-REDIS_GROUP = 'bulk_group'
-REDIS_CONSUMER = f"consumer-{uuid.uuid4().hex[:8]}"
-redis_client = None
-
-# Additional imports needed by later code
-from logging.handlers import RotatingFileHandler
 from email.header import decode_header
-from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-try:
-    from aiosmtpd.smtp import AuthResult, LoginPassword
-except Exception:
-    class AuthResult:
-        def __init__(self, success=False, handled=False):
-            self.success = success
-            self.handled = handled
-    LoginPassword = tuple
+from email.mime.multipart import MIMEMultipart
+from email.utils import formatdate, make_msgid, formataddr
+from logging.handlers import RotatingFileHandler
+from aiosmtpd.controller import Controller
+from aiosmtpd.smtp import SMTP as SMTPServer, AuthResult, LoginPassword
+from flask import Flask, render_template, request, jsonify, redirect, url_for, session
+from functools import wraps
 
-
-def redis_to_sql_writer_thread():
-    """Consume messages from Redis stream and write them into SQLite queue in batches.
-    This decouples fast producers (imports) from DB writes and prevents Python memory spikes.
-    """
-    global redis_client, REDIS_STREAM, REDIS_GROUP, REDIS_CONSUMER
-    if not redis_client:
-        return
-    # batch size for reading from Redis stream; make configurable via config.redis.batch
-    try:
-        cfg = load_config()
-        rcfg = cfg.get('redis', {}) if isinstance(cfg, dict) else {}
-        BATCH = int(rcfg.get('batch', 1000))
-    except Exception:
-        BATCH = 1000
-    while True:
-        try:
-            # Read pending first to recover unacked messages
-            try:
-                entries = redis_client.xreadgroup(REDIS_GROUP, REDIS_CONSUMER, {REDIS_STREAM: '>'}, count=BATCH, block=2000)
-            except Exception:
-                entries = None
-            if not entries:
-                time.sleep(0.5)
-                continue
-            # entries is list of (stream, [(id, {fields})])
-            to_write = []
-            ids = []
-            for stream_name, msgs in entries:
-                for mid, fields in msgs:
-                    try:
-                        rcpt = fields.get('rcpt')
-                        content = fields.get('content')  # could be FILE:... or empty
-                        template_id = fields.get('template_id')
-                        node_name = fields.get('node')
-                        subj = fields.get('subject')
-                        tracking = fields.get('tracking_id')
-                        scheduled = fields.get('scheduled_at')
-                        mail_from = fields.get('mail_from') or ''
-                        # Store as same tuple used by sqlite queue
-                        record = (mail_from, json.dumps([rcpt]), content, node_name, 'pending', 'bulk', tracking, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled, subj, None, int(template_id) if template_id else None)
-                        to_write.append(record)
-                        ids.append(mid)
-                    except Exception:
-                        # skip malformed
-                        continue
-            if to_write:
-                try:
-                    with get_db() as conn:
-                        conn.executemany("INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", to_write)
-                    # ACK and optionally delete
-                    for mid in ids:
-                        try:
-                            redis_client.xack(REDIS_STREAM, REDIS_GROUP, mid)
-                            redis_client.xdel(REDIS_STREAM, mid)
-                        except Exception:
-                            pass
-                except Exception as e:
-                    logger.error(f"Redis->SQL writer failed to write batch: {e}")
-                    # do not ack so messages will be retried
-                    time.sleep(1)
-        except Exception:
-            time.sleep(1)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
+DB_FILE = os.path.join(BASE_DIR, 'queue.db')
+LOG_FILE = '/var/log/smtp-relay/app.log'
 
 # --- Database ---
 def db_retry(max_retries=3, delay=0.5):
@@ -204,40 +119,13 @@ def db_retry(max_retries=3, delay=0.5):
     return decorator
 
 def get_db():
-    # Return a context manager that yields a sqlite3 connection and ensures it is closed
-    # after use. Using a short-lived connection per operation reduces resource leakage.
-    class _DBCtx:
-        def __init__(self, db_path):
-            self._db_path = db_path
-            self._conn = None
-        def __enter__(self):
-            self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=60)
-            self._conn.row_factory = sqlite3.Row
-            try:
-                self._conn.execute('PRAGMA journal_mode=WAL')
-                self._conn.execute('PRAGMA busy_timeout=60000')
-                self._conn.execute('PRAGMA synchronous=NORMAL')
-            except Exception:
-                pass
-            return self._conn
-        def __exit__(self, exc_type, exc, exc_tb):
-            try:
-                if exc_type:
-                    try:
-                        self._conn.rollback()
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        self._conn.commit()
-                    except Exception:
-                        pass
-            finally:
-                try:
-                    self._conn.close()
-                except Exception:
-                    pass
-    return _DBCtx(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=60)
+    conn.row_factory = sqlite3.Row
+    # 启用WAL模式提高并发性能
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=60000')  # 60秒超时
+    conn.execute('PRAGMA synchronous=NORMAL')  # 平衡性能和安全
+    return conn
 
 def init_db():
     with get_db() as conn:
@@ -760,113 +648,30 @@ def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=
         # 解析并重写消息头：保留所有原始头部，仅覆盖 From 和 Sender，并添加 X-Original-* 供追踪
         msg_bytes = content
         try:
-            # 如果 content 是导入时保存的轻量 JSON 字符串，先把它构建成完整 MIME
-            if isinstance(content, str):
-                try:
-                    # If content points to temp file, read it first
-                    if content.startswith('FILE:'):
-                        fp = content[5:]
-                        try:
-                            with open(fp, 'r', encoding='utf-8') as fh:
-                                txt = fh.read()
-                            parsed = json.loads(txt)
-                        except Exception:
-                            parsed = None
-                    else:
-                        parsed = json.loads(content)
-
-                    if isinstance(parsed, dict) and ('html' in parsed or 'plain' in parsed):
-                        m = MIMEMultipart('alternative')
-                        m['Subject'] = subject or ''
-                        m['To'] = rcpt_tos[0] if isinstance(rcpt_tos, (list, tuple)) and rcpt_tos else ''
-                        m['From'] = sender
-                        p1 = MIMEText(parsed.get('plain', ''), 'plain', 'utf-8')
-                        p2 = MIMEText(parsed.get('html', parsed.get('plain', '')), 'html', 'utf-8')
-                        m.attach(p1)
-                        m.attach(p2)
-                        msg = m
-                        # try to remove temp file after building
-                        try:
-                            if 'fp' in locals() and fp and os.path.exists(fp):
-                                os.remove(fp)
-                        except Exception:
-                            pass
-                    else:
-                        msg = message_from_bytes(content.encode('utf-8'))
-                except Exception:
-                    # fallback: try to parse as raw bytes string
-                    try:
-                        msg = message_from_bytes(content.encode('utf-8'))
-                    except Exception:
-                        msg = None
-            elif isinstance(content, (bytes, bytearray)):
+            if isinstance(content, (bytes, bytearray)):
                 msg = message_from_bytes(content)
             else:
-                msg = None
+                msg = message_from_bytes(content.encode('utf-8'))
 
-            if msg:
-                original_from = msg.get('From')
-                original_sender = msg.get('Sender')
-                if original_from:
-                    msg['X-Original-From'] = original_from
-                if original_sender:
-                    msg['X-Original-Sender'] = original_sender
+            original_from = msg.get('From')
+            original_sender = msg.get('Sender')
+            if original_from:
+                # 添加原始 From 作为附加头，保留供追溯
+                msg['X-Original-From'] = original_from
+            if original_sender:
+                msg['X-Original-Sender'] = original_sender
 
-                # 覆盖 From/Sender
-                if 'From' in msg:
-                    del msg['From']
-                msg['From'] = sender
-                if 'Sender' in msg:
-                    del msg['Sender']
-                msg['Sender'] = sender
+            # 覆盖 From/Sender
+            if 'From' in msg:
+                del msg['From']
+            msg['From'] = sender
+            if 'Sender' in msg:
+                del msg['Sender']
+            msg['Sender'] = sender
 
-                msg_bytes = msg.as_bytes()
-            else:
-                msg_bytes = content
+            msg_bytes = msg.as_bytes()
         except Exception:
             msg_bytes = content
-
-        # 如果是认证用户（smtp_user），在直接转发前尊重该用户的发送间隔设置
-        if smtp_user:
-            try:
-                with get_db() as c:
-                    row = c.execute("SELECT min_interval, max_interval FROM smtp_users WHERE username=?", (smtp_user,)).fetchone()
-                    user_min = row['min_interval'] if row and 'min_interval' in row.keys() else None
-                    user_max = row['max_interval'] if row and 'max_interval' in row.keys() else None
-            except Exception:
-                user_min = None
-                user_max = None
-
-            try:
-                if user_min is not None and user_max is not None:
-                    min_int = float(user_min)
-                    max_int = float(user_max)
-                elif user_min is not None:
-                    min_int = float(user_min)
-                    max_int = float(user_min)
-                else:
-                    # fallback to small delay
-                    min_int = 0.0
-                    max_int = 0.0
-            except Exception:
-                min_int = 0.0
-                max_int = 0.0
-
-            if min_int < 0: min_int = 0.0
-            if max_int < min_int: max_int = min_int
-            chosen_delay = random.uniform(min_int, max_int) if max_int > min_int else min_int
-
-            # 基于内存时间戳计算需要等待的时间
-            need_sleep = 0
-            with smtp_user_last_lock:
-                last = smtp_user_last_sent.get(smtp_user, 0)
-            elapsed_user = time.time() - last if last else None
-            if elapsed_user is None:
-                elapsed_user = 0
-            if elapsed_user < chosen_delay:
-                need_sleep = chosen_delay - elapsed_user
-            if need_sleep > 0:
-                time.sleep(need_sleep)
 
         if encryption == 'ssl':
             with smtplib.SMTP_SSL(host, port, timeout=30) as s:
@@ -882,13 +687,6 @@ def forward_to_node(node, mail_from, rcpt_tos, content, subject=None, smtp_user=
                 s.sendmail(sender, rcpt_tos, msg_bytes)
 
         logger.info(f"🔁 直接转发成功 -> {node.get('name')} | 收件: {rcpt_tos[0] if rcpt_tos else '?'} | 主题: {subject or ''}")
-        # 更新内存中的 per-user 发送时间戳
-        if smtp_user:
-            try:
-                with smtp_user_last_lock:
-                    smtp_user_last_sent[smtp_user] = time.time()
-            except Exception:
-                pass
         return True
     except Exception as e:
         logger.error(f"🔁 直接转发到节点 {node.get('name')} 失败: {e}")
@@ -909,48 +707,6 @@ worker_stats = {
 }
 worker_stop_event = threading.Event()
 
-# Batch update queue for DB status updates to avoid spawning per-task threads
-update_batch = []
-update_batch_lock = threading.Lock()
-UPDATE_BATCH_SIZE = 50
-
-def update_flusher_thread():
-    while True:
-        try:
-            time.sleep(1)
-            with update_batch_lock:
-                items = list(update_batch)
-                update_batch.clear()
-            if not items:
-                continue
-            # Separate success and failure updates
-            successes = [(item[0],) for item in items if item[1]]
-            failures = [(item[2][:200], item[0]) for item in items if not item[1]]
-            # Apply in a transaction
-            tries = 3
-            for attempt in range(tries):
-                try:
-                    with get_db() as conn:
-                        if successes:
-                            conn.executemany("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", successes)
-                        if failures:
-                            conn.executemany("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", failures)
-                    break
-                except sqlite3.OperationalError as e:
-                    if 'locked' in str(e) and attempt < tries - 1:
-                        time.sleep(0.5 * (attempt + 1))
-                        continue
-                    # on failure, push items back (best-effort)
-                    with update_batch_lock:
-                        for it in items:
-                            update_batch.append(it)
-                    break
-        except Exception:
-            time.sleep(1)
-
-# start update flusher
-threading.Thread(target=update_flusher_thread, daemon=True).start()
-
 # Per-smtp-user last sent timestamps to enforce per-user intervals (in-memory)
 smtp_user_last_sent = {}
 smtp_user_last_lock = threading.Lock()
@@ -962,16 +718,13 @@ node_queue_lock = threading.Lock()
 
 # Background writer for bulk inserts: use a queue + batch executemany to improve throughput
 from queue import Queue as _LocalQueue, Empty as _LocalEmpty
-# Limit the in-memory bulk write queue to avoid unbounded memory growth
-bulk_write_queue = _LocalQueue(maxsize=500)
-# Reduce batch size to limit memory used when batching large messages
-_BULK_WRITE_BATCH = 200
+bulk_write_queue = _LocalQueue()
+_BULK_WRITE_BATCH = 5000
 
 # bulk write statistics
 
 # simple in-memory template cache
 bulk_template_cache = {}
-_BULK_TEMPLATE_CACHE_MAX = 200
 def get_template(tid):
     try:
         if tid in bulk_template_cache:
@@ -980,15 +733,7 @@ def get_template(tid):
             row = conn.execute("SELECT id, subject, body, meta FROM bulk_templates WHERE id=?", (tid,)).fetchone()
             if row:
                 tpl = { 'id': row['id'], 'subject': row['subject'], 'body': row['body'], 'meta': row['meta'] }
-                # Simple cache with size limit: evict arbitrary oldest entries when over limit
                 bulk_template_cache[tid] = tpl
-                try:
-                    if len(bulk_template_cache) > _BULK_TEMPLATE_CACHE_MAX:
-                        # pop an arbitrary item
-                        k = next(iter(bulk_template_cache))
-                        bulk_template_cache.pop(k, None)
-                except Exception:
-                    pass
                 return tpl
     except Exception:
         return None
@@ -1237,52 +982,14 @@ def node_sender(node_name, task_queue):
                     except Exception:
                         pass
                 
-                # 如果 content 是轻量 JSON 字符串（导入阶段为节省内存而存储），在此处生成完整 MIME
-                if isinstance(msg_content, str):
-                    try:
-                        # If content is a pointer to a temp file, load it
-                        if msg_content.startswith('FILE:'):
-                            fp = msg_content[5:]
-                            try:
-                                with open(fp, 'r', encoding='utf-8') as fh:
-                                    txt = fh.read()
-                                parsed = json.loads(txt)
-                            except Exception:
-                                parsed = None
-                        else:
-                            parsed = json.loads(msg_content)
-
-                        if isinstance(parsed, dict) and ('html' in parsed or 'plain' in parsed):
-                            recipient = rcpt_tos[0] if isinstance(rcpt_tos, (list, tuple)) and len(rcpt_tos) > 0 else ''
-                            m = MIMEMultipart('alternative')
-                            m['Subject'] = task.get('subject') or ''
-                            m['To'] = recipient
-                            m['From'] = sender
-                            p1 = MIMEText(parsed.get('plain', ''), 'plain', 'utf-8')
-                            p2 = MIMEText(parsed.get('html', parsed.get('plain', '')), 'html', 'utf-8')
-                            m.attach(p1)
-                            m.attach(p2)
-                            msg_content = m.as_bytes()
-                            # try to remove temp file after building
-                            try:
-                                if msg_content and isinstance(msg_content, (bytes, bytearray)) and 'fp' in locals() and fp and os.path.exists(fp):
-                                    os.remove(fp)
-                            except Exception:
-                                pass
-                    except Exception:
-                        # not JSON or failed to build -> leave as-is
-                        pass
-
-                # Header rewrite for raw bytes message
+                # Header rewrite
                 if sender and (node.get('sender_domain') or node.get('sender_email')):
                     try:
-                        if isinstance(msg_content, (bytes, bytearray)):
-                            msg = message_from_bytes(msg_content)
-                            if 'From' in msg: del msg['From']
-                            msg['From'] = sender
-                            msg_content = msg.as_bytes()
-                    except:
-                        pass
+                        msg = message_from_bytes(msg_content)
+                        if 'From' in msg: del msg['From']
+                        msg['From'] = sender
+                        msg_content = msg.as_bytes()
+                    except: pass
                 
                 # 群发严格间隔控制：在发送前确保距离上次发送已达到节点/用户设置的间隔
                 if is_bulk:
@@ -1395,20 +1102,35 @@ def node_sender(node_name, task_queue):
             
             # 批量更新数据库（使用单独线程，不阻塞发送）
             # 使用默认参数捕获当前值，避免闭包问题
-            # Append the result to the global update batch (flushed by background thread)
-            try:
-                with update_batch_lock:
-                    update_batch.append((row_id, success, error_msg))
-            except Exception:
-                # Fallback: try immediate small update to avoid losing status
-                try:
-                    with get_db() as conn:
-                        if success:
-                            conn.execute("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", (row_id,))
-                        else:
-                            conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", (error_msg[:200], row_id))
-                except Exception:
-                    logger.error(f"[{node_name}] 无法追加或写入更新状态: {row_id}")
+            def update_db(rid=row_id, ok=success, err=error_msg):
+                retries = 3
+                for attempt in range(retries):
+                    try:
+                        with get_db() as conn:
+                            if ok:
+                                conn.execute("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", (rid,))
+                            else:
+                                conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", (err[:200], rid))
+                        return
+                    except sqlite3.OperationalError as e:
+                        if 'locked' in str(e) and attempt < retries - 1:
+                            time.sleep(0.5 * (attempt + 1))
+                            continue
+                        # 最终失败：将任务重置为 pending，并增加重试计数，避免永久卡住
+                        try:
+                            with get_db() as conn2:
+                                conn2.execute(
+                                    "UPDATE queue SET status='pending', retry_count = COALESCE(retry_count,0)+1, last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?",
+                                    (str(e)[:200], rid)
+                                )
+                        except:
+                            pass
+                        logger.error(f"[{node_name}] 更新数据库失败，已重置为 pending: {e}")
+                        return
+                    except Exception as e:
+                        logger.error(f"[{node_name}] 更新数据库异常: {e}")
+                        return
+            threading.Thread(target=update_db, daemon=True).start()
             
             # 日志汇总（每10封输出一次）
             if local_success >= 10 or local_fail >= 10:
@@ -1566,14 +1288,8 @@ def manager_thread():
                     if days > 0:
                         cutoff = (datetime.utcnow() + timedelta(hours=8) - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
                         with get_db() as conn:
-                            deleted = conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed') AND updated_at < ?", (cutoff,)).rowcount
-                            try:
-                                # compress DB to reclaim space after deleting many rows
-                                if deleted > 0:
-                                    conn.execute('VACUUM')
-                            except Exception:
-                                pass
-                        logger.info(f"🧹 自动清理了 {deleted} 条 {days} 天前的旧记录")
+                            conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed') AND updated_at < ?", (cutoff,))
+                        logger.info(f"🧹 自动清理了 {days} 天前的旧记录")
                 except Exception as e:
                     logger.error(f"自动清理失败: {e}")
                 last_cleanup_time = now
@@ -2056,82 +1772,23 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
             bulk_stats['last_update'] = 0.0
             bulk_stats['last_rate'] = 0.0
 
-        # Process recipients in a streaming manner to avoid building huge lists in memory.
-        # If the raw input is large, persist it to a temp file and iterate the file lines.
-        from io import StringIO
-        import re
-        tmp_recipients_path = None
-        def write_recipients_temp(raw):
+        # Process recipients in background to avoid blocking
+        recipients = [r.strip() for r in raw_recipients.split('\n') if r.strip()]
+        # If user pasted as a single line with commas/semicolons, handle that too
+        if len(recipients) == 1 and (',' in raw_recipients or ';' in raw_recipients):
             try:
-                tf = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, dir=TMP_DIR, prefix='recips_', suffix='.txt')
-                tf.write(raw)
-                tf.flush()
-                tf.close()
-                return tf.name
+                import re
+                parts = re.split(r'[;,\n]+', raw_recipients)
+                recipients = [r.strip() for r in parts if r.strip()]
             except Exception:
-                return None
+                pass
 
-        def recipient_iterator(raw):
-            # Heuristic: if very large string or many lines, write to disk first
-            try:
-                est_lines = raw.count('\n') + (1 if raw.strip() else 0)
-            except Exception:
-                est_lines = 0
-            # Thresholds: >5000 lines or >200KB raw size
-            try:
-                raw_size = len(raw) if raw is not None else 0
-            except Exception:
-                raw_size = 0
-            if (est_lines > 5000) or (raw_size > 200 * 1024):
-                fp = write_recipients_temp(raw)
-                if fp:
-                    # iterate file lines to avoid holding raw in memory
-                    try:
-                        f = open(fp, 'r', encoding='utf-8')
-                        for line in f:
-                            p = line.strip()
-                            if p:
-                                yield p
-                        f.close()
-                    except Exception:
-                        try:
-                            # fallback to splitting in memory
-                            for part in re.split(r'[;,\n]+', raw):
-                                p = part.strip()
-                                if p:
-                                    yield p
-                        except Exception:
-                            return
-                else:
-                    # if temp write failed, fallback to in-memory split
-                    for part in re.split(r'[;,\n]+', raw):
-                        p = part.strip()
-                        if p:
-                            yield p
-                return
-            # Small input: handle common comma/semicolon single-line case
-            if raw and '\n' not in raw and (',' in raw or ';' in raw):
-                for part in re.split(r'[;,\n]+', raw):
-                    p = part.strip()
-                    if p:
-                        yield p
-                return
-            # Otherwise iterate line-by-line using StringIO
-            f = StringIO(raw)
-            for line in f:
-                p = line.strip()
-                if p:
-                    yield p
-
-        recipients_iter = recipient_iterator(raw_recipients)
-
-        # Log raw size and an estimated count for troubleshooting large imports
+        # Log raw size and parsed count for troubleshooting large imports
         try:
-            est = raw_recipients.count('\n') + (1 if raw_recipients.strip() else 0)
-            logger.info(f"开始群发导入: 原始大小 {len(raw_recipients)} 字节, 估计收件数 {est} (流式处理)")
+            logger.info(f"开始群发导入: 原始大小 {len(raw_recipients)} 字节, 解析后收件数 {len(recipients)}")
         except Exception:
             pass
-        # For streaming iterator we can't shuffle easily; rely on templates or caller to randomize input.
+        random.shuffle(recipients) # Shuffle for better distribution
 
         # Load available template ids (if any)
         template_ids = []
@@ -2286,70 +1943,10 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
             "今天想去打羽毛球，觉得生活很美好。", "周末准备去跑步，希望能遇到有趣的人。", "最近要去健身房锻炼，感觉很放松。",
 ]  # Empty placeholder, using CHAT_CORPUS module constant
         
-        # If no templates exist, pre-generate a pool of templates and use template-only records
-        try:
-            if not template_ids:
-                # estimate count from input; cap generation to avoid excessive DB work
-                gen_count = min(max(1, est), 1000)
-                rows = []
-                now_iso = datetime.utcnow().isoformat() + 'Z'
-                for i in range(gen_count):
-                    try:
-                        suffix = '-' + uuid.uuid4().hex[:6]
-                    except Exception:
-                        suffix = '-' + str(i)
-                    try:
-                        chosen_subj = random.choice(subjects) if subjects else '(No Subject)'
-                    except Exception:
-                        chosen_subj = '(No Subject)'
-                    try:
-                        chosen_body = random.choice(bodies) if bodies else ''
-                    except Exception:
-                        chosen_body = ''
-                    rows.append((chosen_subj + suffix, chosen_body, json.dumps({'gen': now_iso, 'idx': i})))
-                try:
-                    with get_db() as conn:
-                        conn.executemany("INSERT INTO bulk_templates (subject, body, meta) VALUES (?, ?, ?)", rows)
-                        # fetch newly inserted ids (may include older ones, but sufficient)
-                        fetched = conn.execute("SELECT id FROM bulk_templates ORDER BY id DESC LIMIT ?", (gen_count,)).fetchall()
-                        template_ids = [r[0] for r in fetched]
-                        try:
-                            bulk_template_cache.clear()
-                        except Exception:
-                            pass
-                except Exception:
-                    # if generation fails, attempt to insert a single fallback template
-                    try:
-                        try:
-                            fallback_subj = subjects[0] if subjects else '(No Subject)'
-                        except Exception:
-                            fallback_subj = '(No Subject)'
-                        try:
-                            fallback_body = bodies[0] if bodies else ''
-                        except Exception:
-                            fallback_body = ''
-                        with get_db() as conn:
-                            conn.execute("INSERT INTO bulk_templates (subject, body, meta) VALUES (?, ?, ?)", (fallback_subj, fallback_body, json.dumps({'gen':'fallback'})))
-                            row = conn.execute("SELECT id FROM bulk_templates ORDER BY id DESC LIMIT 1").fetchone()
-                            template_ids = [row[0]] if row else []
-                            try:
-                                bulk_template_cache.clear()
-                            except Exception:
-                                pass
-                        logger.warning('Template generation failed; created single fallback template to enforce template-only import')
-                    except Exception:
-                        # As a last resort keep template_ids empty (should be rare)
-                        template_ids = []
-        except Exception:
-            pass
-
         tasks = []
         count = 0
-        # Batch size for streaming writes to limit memory usage
-        CHUNK_SIZE = 500
-        batch_records = []
-
-        for rcpt in recipients_iter:
+        
+        for rcpt in recipients:
             try:
                 # === Anti-Spam Randomization ===
                 rand_sub = ''.join(random.choices(charset, k=random.randint(4, 8)))
@@ -2366,51 +1963,47 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                     tracking_url = f"{tracking_base}/track/{tracking_id}"
                     tracking_html = f"<img src='{tracking_url}' width='1' height='1' alt='' style='display:none;border:0;'>"
 
-                # If templates are present, we only store template_id and avoid building per-recipient content
-                if template_ids:
-                    chosen_tid = random.choice(template_ids)
-                else:
-                    # === Enhanced Subject Randomization ===
-                    # Randomly choose subject format
-                    subject_formats = [
-                        f"{current_subject} {rand_sub}",
-                        f"{current_subject} - {rand_sub}",
-                        f"Re: {current_subject}",
-                        f"Fwd: {current_subject}",
-                        f"{current_subject}",
-                        f"{current_subject} #{rand_sub[:4]}",
-                    ]
-                    final_subject = random.choice(subject_formats)
-
-                    # === Build More Natural Email ===
-                    # Extract recipient name from email for personalization
-                    rcpt_name = rcpt.split('@')[0].replace('.', ' ').replace('_', ' ').replace('-', ' ').title()[:20]
-
-                    # Random greetings and closings
-                    greetings = ['', f'Hi,', f'Hello,', f'Hey,', f'{rcpt_name},', f'Hi {rcpt_name},', f'Dear {rcpt_name},', '你好，', '您好，', '']
-                    closings = ['', 'Best,', 'Thanks,', 'Cheers,', 'Regards,', '祝好', '谢谢', '']
-
-                    greeting = random.choice(greetings)
-                    closing = random.choice(closings)
-
-                    # Build HTML with more natural structure
-                    # Hidden content placed more naturally throughout
-                    hidden_style = 'color:transparent;font-size:1px;line-height:1px;max-height:0;opacity:0;overflow:hidden;mso-hide:all;'
-                    hidden_words = rand_chat.split()
-                    hidden_chunks = [' '.join(hidden_words[i:i+3]) for i in range(0, len(hidden_words), 3)]
-
-                    # Interleave hidden content with visible content
-                    body_parts = current_body.split('</p>')
-                    enhanced_body = ""
-                    for i, part in enumerate(body_parts):
-                        enhanced_body += part
-                        if part.strip() and i < len(hidden_chunks):
-                            enhanced_body += f'<span style="{hidden_style}">{hidden_chunks[i]}</span>'
-                        if part.strip() and '<p' in part.lower():
-                            enhanced_body += '</p>'
-
-                    # Build final body with natural wrapping
-                    final_body = f'''<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;">
+                # === Enhanced Subject Randomization ===
+                # Randomly choose subject format
+                subject_formats = [
+                    f"{current_subject} {rand_sub}",
+                    f"{current_subject} - {rand_sub}",
+                    f"Re: {current_subject}",
+                    f"Fwd: {current_subject}",
+                    f"{current_subject}",
+                    f"{current_subject} #{rand_sub[:4]}",
+                ]
+                final_subject = random.choice(subject_formats)
+                
+                # === Build More Natural Email ===
+                # Extract recipient name from email for personalization
+                rcpt_name = rcpt.split('@')[0].replace('.', ' ').replace('_', ' ').replace('-', ' ').title()[:20]
+                
+                # Random greetings and closings
+                greetings = ['', f'Hi,', f'Hello,', f'Hey,', f'{rcpt_name},', f'Hi {rcpt_name},', f'Dear {rcpt_name},', '你好，', '您好，', '']
+                closings = ['', 'Best,', 'Thanks,', 'Cheers,', 'Regards,', '祝好', '谢谢', '']
+                
+                greeting = random.choice(greetings)
+                closing = random.choice(closings)
+                
+                # Build HTML with more natural structure
+                # Hidden content placed more naturally throughout
+                hidden_style = 'color:transparent;font-size:1px;line-height:1px;max-height:0;opacity:0;overflow:hidden;mso-hide:all;'
+                hidden_words = rand_chat.split()
+                hidden_chunks = [' '.join(hidden_words[i:i+3]) for i in range(0, len(hidden_words), 3)]
+                
+                # Interleave hidden content with visible content
+                body_parts = current_body.split('</p>')
+                enhanced_body = ""
+                for i, part in enumerate(body_parts):
+                    enhanced_body += part
+                    if part.strip() and i < len(hidden_chunks):
+                        enhanced_body += f'<span style="{hidden_style}">{hidden_chunks[i]}</span>'
+                    if part.strip() and '<p' in part.lower():
+                        enhanced_body += '</p>'
+                
+                # Build final body with natural wrapping
+                final_body = f'''<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;">
 {f"<p>{greeting}</p>" if greeting else ""}
 {enhanced_body if enhanced_body else current_body}
 <span style="{hidden_style}">{random.choice(hidden_chunks) if hidden_chunks else rand_chat[:50]}</span>
@@ -2418,29 +2011,44 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
 {tracking_html}
 </div>'''
 
-                    # === Create Multipart Email (HTML + Plain Text) ===
-                    plain_text = f"{greeting}\n\n{current_body.replace('<br>', chr(10)).replace('<br/>', chr(10)).replace('</p>', chr(10))}\n\n{closing}".strip()
-                    import re
-                    plain_text = re.sub(r'<[^>]+>', '', plain_text)
-
-                    try:
-                        content_json = json.dumps({'html': final_body, 'plain': plain_text}, ensure_ascii=False)
-                    except Exception:
-                        content_json = final_body
-
-                # Ensure we only attempt to write per-recipient content when it exists
-                if template_ids:
-                    content_field = None
-                else:
-                    # Persist large per-recipient content to disk to avoid keeping many large strings in memory
-                    try:
-                        fp = write_temp_content(content_json)
-                        if fp:
-                            content_field = 'FILE:' + fp
-                        else:
-                            content_field = content_json
-                    except Exception:
-                        content_field = content_json
+                # === Create Multipart Email (HTML + Plain Text) ===
+                # Plain text version makes it look more like a normal email
+                plain_text = f"{greeting}\n\n{current_body.replace('<br>', chr(10)).replace('<br/>', chr(10)).replace('</p>', chr(10))}\n\n{closing}".strip()
+                # Remove HTML tags from plain text
+                import re
+                plain_text = re.sub(r'<[^>]+>', '', plain_text)
+                
+                msg = MIMEMultipart('alternative')
+                msg['Subject'] = final_subject
+                msg['From'] = '' # Placeholder, worker will fill
+                msg['To'] = rcpt
+                
+                # Randomize date slightly (within last few minutes)
+                date_offset = random.randint(0, 180)  # 0-3 minutes ago
+                msg['Date'] = formatdate(localtime=True, timeval=time.time() - date_offset)
+                
+                # More natural Message-ID format
+                msg_domain = rcpt.split('@')[-1] if '@' in rcpt else 'mail.local'
+                msg['Message-ID'] = f"<{uuid.uuid4().hex[:16]}.{int(time.time())}.{random.randint(1000,9999)}@{msg_domain}>"
+                
+                # Add common headers that normal emails have
+                msg['MIME-Version'] = '1.0'
+                user_agents = [
+                    'Mozilla/5.0', 
+                    'Microsoft Outlook 16.0', 
+                    'Apple Mail (2.3654)',
+                    'Thunderbird/102.0',
+                    None  # Sometimes no User-Agent
+                ]
+                ua = random.choice(user_agents)
+                if ua:
+                    msg['X-Mailer'] = ua
+                
+                # Attach plain text first, then HTML (standard order)
+                part1 = MIMEText(plain_text, 'plain', 'utf-8')
+                part2 = MIMEText(final_body, 'html', 'utf-8')
+                msg.attach(part1)
+                msg.attach(part2)
 
                 node = select_node_for_recipient(pool, rcpt, limit_cfg, source='bulk')
                 if not node:
@@ -2456,17 +2064,11 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                 # If we have pre-generated templates, only write recipient + template_id to DB
                 if template_ids:
                     chosen_tid = random.choice(template_ids)
-                    # Resolve subject from template cache to populate subject column without DB hit every time
-                    try:
-                        tpl = get_template(chosen_tid)
-                        final_subject = tpl.get('subject') if tpl and tpl.get('subject') else (random.choice(subjects) if subjects else '(No Subject)')
-                    except Exception:
-                        final_subject = (random.choice(subjects) if subjects else '(No Subject)')
                     # smtp_user unknown for bulk imports initiated by UI; leave as NULL
                     record = ('', json.dumps([rcpt]), None, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, chosen_tid)
                 else:
-                    # 存储内容为临时文件路径的标记或直接文本
-                    record = ('', json.dumps([rcpt]), content_field, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, None)
+                    # smtp_user unknown for bulk imports initiated by UI; leave as NULL
+                    record = ('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, None)
                 count += 1
                 # increment expected total and set start_time if first
                 try:
@@ -2476,142 +2078,27 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                             bulk_stats['start_time'] = time.time()
                 except Exception:
                     pass
-                # Accumulate into in-memory chunk; flush when chunk full
-                batch_records.append(record)
-                if len(batch_records) >= CHUNK_SIZE:
-                    # Primary path: push lightweight messages to Redis stream to decouple import from DB writes
-                    if redis_client:
-                        try:
-                            pipe = redis_client.pipeline()
-                            for rec in batch_records:
-                                try:
-                                    mail_from, rcpt_tos, content_field, node_name, status_field, source_field, tracking_id_field, created_at_field, updated_at_field, scheduled_at_field, subject_field, smtp_user_field, template_id_field = rec
-                                    # rcpt_tos is JSON list; extract single rcpt for stream message
-                                    try:
-                                        rcpts = json.loads(rcpt_tos)
-                                        rcpt_single = rcpts[0] if rcpts else ''
-                                    except Exception:
-                                        rcpt_single = ''
-                                    msg = {
-                                        'mail_from': mail_from or '',
-                                        'rcpt': rcpt_single or '',
-                                        'content': content_field or '',
-                                        'node': node_name or '',
-                                        'subject': subject_field or '',
-                                        'tracking_id': tracking_id_field or '',
-                                        'scheduled_at': scheduled_at_field or '',
-                                        'template_id': str(template_id_field) if template_id_field else ''
-                                    }
-                                    pipe.xadd(REDIS_STREAM, msg)
-                                except Exception:
-                                    continue
-                            pipe.execute()
-                            with bulk_stats_lock:
-                                bulk_stats['inserted'] += len(batch_records)
-                        except Exception as e:
-                            logger.error(f"Redis XADD failed during bulk import: {e}; falling back to DB write")
-                            try:
-                                with get_db() as conn:
-                                    conn.executemany(
-                                        "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                        batch_records
-                                    )
-                                with bulk_stats_lock:
-                                    bulk_stats['inserted'] += len(batch_records)
-                            except Exception as e:
-                                logger.error(f"Bulk import DB fallback failed: {e}")
-                    else:
-                        # No redis configured: write directly to DB
-                        try:
-                            with get_db() as conn:
-                                conn.executemany(
-                                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                    batch_records
-                                )
-                            with bulk_stats_lock:
-                                bulk_stats['inserted'] += len(batch_records)
-                        except Exception as e:
-                            logger.error(f"Bulk import executemany failed: {e}; attempting per-item enqueue fallback")
-                            for rec in batch_records:
-                                try:
-                                    bulk_write_queue.put(rec, block=False)
-                                except Exception:
-                                    pass
-                    batch_records = []
+                # Push to bulk writer queue. If queue is full, fallback to direct DB write to avoid blocking forever.
+                try:
+                    bulk_write_queue.put(record, block=False)
+                except Exception:
+                    # fallback: write immediately in small transaction
+                    try:
+                        with get_db() as conn:
+                            conn.execute(
+                                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                    record
+                            )
+                        with bulk_stats_lock:
+                            bulk_stats['inserted'] += 1
+                    except Exception as e:
+                        logger.error(f"Direct write fallback failed for {rcpt}: {e}")
             except Exception as e:
                 logger.error(f"准备邮件失败 {rcpt}: {e}")
                 continue
 
-        # Flush any remaining batch_records
-        if batch_records:
-            # Flush remaining records: prefer Redis stream for decoupling, otherwise DB
-            if redis_client:
-                try:
-                    pipe = redis_client.pipeline()
-                    for rec in batch_records:
-                        try:
-                            mail_from, rcpt_tos, content_field, node_name, status_field, source_field, tracking_id_field, created_at_field, updated_at_field, scheduled_at_field, subject_field, smtp_user_field, template_id_field = rec
-                            try:
-                                rcpts = json.loads(rcpt_tos)
-                                rcpt_single = rcpts[0] if rcpts else ''
-                            except Exception:
-                                rcpt_single = ''
-                            msg = {
-                                'mail_from': mail_from or '',
-                                'rcpt': rcpt_single or '',
-                                'content': content_field or '',
-                                'node': node_name or '',
-                                'subject': subject_field or '',
-                                'tracking_id': tracking_id_field or '',
-                                'scheduled_at': scheduled_at_field or '',
-                                'template_id': str(template_id_field) if template_id_field else ''
-                            }
-                            pipe.xadd(REDIS_STREAM, msg)
-                        except Exception:
-                            continue
-                    pipe.execute()
-                    with bulk_stats_lock:
-                        bulk_stats['inserted'] += len(batch_records)
-                except Exception as e:
-                    logger.error(f"Redis XADD final flush failed: {e}; falling back to DB")
-                    try:
-                        with get_db() as conn:
-                            conn.executemany(
-                                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                batch_records
-                            )
-                        with bulk_stats_lock:
-                            bulk_stats['inserted'] += len(batch_records)
-                    except Exception as e:
-                        logger.error(f"Bulk import final DB fallback failed: {e}")
-            else:
-                try:
-                    with get_db() as conn:
-                        conn.executemany(
-                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            batch_records
-                        )
-                    with bulk_stats_lock:
-                        bulk_stats['inserted'] += len(batch_records)
-                except Exception as e:
-                    logger.error(f"Bulk import final executemany failed: {e}; attempting per-item enqueue fallback")
-                    for rec in batch_records:
-                        try:
-                            bulk_write_queue.put(rec, block=False)
-                        except Exception:
-                            pass
-
+        # No local DB writes here; remaining records (if any) already pushed to bulk_write_queue.
         logger.info(f"群发导入完成: 共 {count} 封邮件, 等待后台写入完成...")
-        # Cleanup temporary recipients file if we created one
-        try:
-            if 'fp' in locals() and fp and os.path.exists(fp):
-                try:
-                    os.remove(fp)
-                    logger.info(f"Removed temporary recipients file: {fp}")
-                except Exception:
-                    pass
-        except Exception:
-            pass
         # Wait for background writer to finish inserting expected records (with timeout)
         wait_start = time.time()
         timeout = 60 * 30  # 30 minutes max wait
@@ -3545,22 +3032,6 @@ def start_services():
     )
     controller.start()
     
-    # Start Temp-file GC thread
-    try:
-        start_temp_gc_thread()
-    except Exception:
-        logger.warning('Failed to start temp-file GC thread')
-
-    # Init Redis and start Redis->SQLite writer thread (if configured)
-    try:
-        init_redis_client()
-        if redis_client:
-            # start two consumer threads to improve Redis->SQLite drain throughput
-            threading.Thread(target=redis_to_sql_writer_thread, daemon=True).start()
-            threading.Thread(target=redis_to_sql_writer_thread, daemon=True).start()
-    except Exception:
-        logger.warning('Redis writer thread failed to start')
-
     # Start Worker
     t = threading.Thread(target=worker_thread, daemon=True)
     t.start()
@@ -6109,11 +5580,7 @@ EOF
                     const confirmMsg = this.bulk.enableSchedule && this.bulk.scheduledAt 
                         ? `确认定时发送给 ${this.recipientCount} 人?\n发送时间: ${this.bulk.scheduledAt.replace('T', ' ')}`
                         : `确认发送给 ${this.recipientCount} 人?`;
-                        // Limit single import size and warn user
-                        if (this.recipientCount > 5000) {
-                            if(!confirm('建议分批导入，每批不超过 5000 人。是否继续发送当前批次？')) return;
-                        }
-                        if(!confirm(confirmMsg)) return;
+                    if(!confirm(confirmMsg)) return;
                     
                     this.sending = true;
                     try {
@@ -6381,7 +5848,7 @@ uninstall_smtp() {
 show_menu() {
     clear
     echo -e "============================================"
-    echo -e "   🚀 SMTP Relay Manager 管理脚本 ${SCRIPT_VERSION}"
+    echo -e "   🚀 SMTP Relay Manager 管理脚本 "
     echo -e "============================================"
     echo -e "${GREEN}1.${PLAIN} 安装 / 更新 "
     echo -e "${GREEN}2.${PLAIN} 启动服务"
