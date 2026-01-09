@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260108123535.10"
+SCRIPT_VERSION="20260108123535.12"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -87,121 +87,7 @@ import uuid
 import functools
 from datetime import datetime, timedelta
 from email import message_from_bytes
-from io import StringIO
-import tempfile
-import os
-from email.header import decode_header
-import redis
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.utils import formatdate, make_msgid, formataddr
-from logging.handlers import RotatingFileHandler
-from aiosmtpd.controller import Controller
-from aiosmtpd.smtp import SMTP as SMTPServer, AuthResult, LoginPassword
-from flask import Flask, render_template, request, jsonify, redirect, url_for, session
-from functools import wraps
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
-DB_FILE = os.path.join(BASE_DIR, 'queue.db')
-LOG_FILE = '/var/log/smtp-relay/app.log'
-TMP_DIR = os.path.join(BASE_DIR, 'tmp')
-try:
-    os.makedirs(TMP_DIR, exist_ok=True)
-except Exception:
-    pass
-
-# Redis client (optional). Initialized in start_services via config.
-redis_client = None
-REDIS_STREAM = 'bulk_stream'
-REDIS_GROUP = 'bulk_group'
-REDIS_CONSUMER = f'consumer-{uuid.uuid4().hex[:8]}'
-
-def write_temp_content(content_str):
-    try:
-        # create a named temp file in TMP_DIR and return its path
-        tf = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', delete=False, dir=TMP_DIR, prefix='bulk_', suffix='.json')
-        tf.write(content_str)
-        tf.flush()
-        tf.close()
-        return tf.name
-    except Exception:
-        return None
-
-def temp_file_gc_loop():
-    """Background loop to delete old temp files in TMP_DIR.
-    Reads settings from config 'tmp_cleanup' with keys:
-      - enabled (bool, default True)
-      - ttl_hours (int, default 24)
-      - interval_minutes (int, default 60)
-    Only deletes files starting with 'bulk_' to avoid collateral removal.
-    """
-    while True:
-        try:
-            cfg = load_config()
-            tcfg = cfg.get('tmp_cleanup', {}) if isinstance(cfg, dict) else {}
-            enabled = tcfg.get('enabled', True)
-            ttl_hours = int(tcfg.get('ttl_hours', 24))
-            interval_minutes = int(tcfg.get('interval_minutes', 60))
-            if enabled:
-                now = time.time()
-                cutoff = now - (ttl_hours * 3600)
-                removed = 0
-                for fn in os.listdir(TMP_DIR):
-                    try:
-                        if not fn.startswith('bulk_'):
-                            continue
-                        fp = os.path.join(TMP_DIR, fn)
-                        if not os.path.isfile(fp):
-                            continue
-                        mtime = os.path.getmtime(fp)
-                        if mtime < cutoff:
-                            try:
-                                os.remove(fp)
-                                removed += 1
-                            except Exception:
-                                # ignore single-file removal errors
-                                pass
-                    except Exception:
-                        continue
-                if removed:
-                    logger.info(f"Temp GC: removed {removed} files from {TMP_DIR}")
-            sleep_secs = max(30, interval_minutes * 60)
-        except Exception:
-            sleep_secs = 60
-        try:
-            time.sleep(sleep_secs)
-        except Exception:
-            time.sleep(60)
-
-def start_temp_gc_thread():
-    t = threading.Thread(target=temp_file_gc_loop, daemon=True)
-    t.start()
-
-
-def init_redis_client():
-    global redis_client, REDIS_STREAM, REDIS_GROUP, REDIS_CONSUMER
-    try:
-        cfg = load_config()
-        rcfg = cfg.get('redis', {}) if isinstance(cfg, dict) else {}
-        host = rcfg.get('host', '127.0.0.1')
-        port = int(rcfg.get('port', 6379))
-        db = int(rcfg.get('db', 0))
-        stream = rcfg.get('stream', 'bulk_stream')
-        group = rcfg.get('group', 'bulk_group')
-        consumer = rcfg.get('consumer', REDIS_CONSUMER)
-        redis_client = redis.Redis(host=host, port=port, db=db, decode_responses=True)
-        REDIS_STREAM = stream
-        REDIS_GROUP = group
-        REDIS_CONSUMER = consumer
-        # verify connection
-        try:
-            redis_client.ping()
-        except Exception as e:
-            redis_client = None
-            logger.warning(f"Redis ping failed: {e}; disabling Redis integration")
-            return
-        # ensure group exists
+        # Removed large inline chat corpus to reduce memory usage.
         try:
             redis_client.xgroup_create(REDIS_STREAM, REDIS_GROUP, id='0', mkstream=True)
         except Exception:
@@ -295,13 +181,40 @@ def db_retry(max_retries=3, delay=0.5):
     return decorator
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=60)
-    conn.row_factory = sqlite3.Row
-    # 启用WAL模式提高并发性能
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA busy_timeout=60000')  # 60秒超时
-    conn.execute('PRAGMA synchronous=NORMAL')  # 平衡性能和安全
-    return conn
+    # Return a context manager that yields a sqlite3 connection and ensures it is closed
+    # after use. Using a short-lived connection per operation reduces resource leakage.
+    class _DBCtx:
+        def __init__(self, db_path):
+            self._db_path = db_path
+            self._conn = None
+        def __enter__(self):
+            self._conn = sqlite3.connect(self._db_path, check_same_thread=False, timeout=60)
+            self._conn.row_factory = sqlite3.Row
+            try:
+                self._conn.execute('PRAGMA journal_mode=WAL')
+                self._conn.execute('PRAGMA busy_timeout=60000')
+                self._conn.execute('PRAGMA synchronous=NORMAL')
+            except Exception:
+                pass
+            return self._conn
+        def __exit__(self, exc_type, exc, exc_tb):
+            try:
+                if exc_type:
+                    try:
+                        self._conn.rollback()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self._conn.commit()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+    return _DBCtx(DB_FILE)
 
 def init_db():
     with get_db() as conn:
@@ -1035,7 +948,7 @@ _BULK_WRITE_BATCH = 200
 
 # simple in-memory template cache
 bulk_template_cache = {}
-_BULK_TEMPLATE_CACHE_MAX = 1000
+_BULK_TEMPLATE_CACHE_MAX = 200
 def get_template(tid):
     try:
         if tid in bulk_template_cache:
