@@ -85,6 +85,7 @@ import uuid
 import functools
 from datetime import datetime, timedelta
 from email import message_from_bytes
+from io import StringIO
 from email.header import decode_header
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -792,9 +793,9 @@ node_queue_lock = threading.Lock()
 # Background writer for bulk inserts: use a queue + batch executemany to improve throughput
 from queue import Queue as _LocalQueue, Empty as _LocalEmpty
 # Limit the in-memory bulk write queue to avoid unbounded memory growth
-bulk_write_queue = _LocalQueue(maxsize=2000)
+bulk_write_queue = _LocalQueue(maxsize=500)
 # Reduce batch size to limit memory used when batching large messages
-_BULK_WRITE_BATCH = 1000
+_BULK_WRITE_BATCH = 200
 
 # bulk write statistics
 
@@ -1877,23 +1878,33 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
             bulk_stats['last_update'] = 0.0
             bulk_stats['last_rate'] = 0.0
 
-        # Process recipients in background to avoid blocking
-        recipients = [r.strip() for r in raw_recipients.split('\n') if r.strip()]
-        # If user pasted as a single line with commas/semicolons, handle that too
-        if len(recipients) == 1 and (',' in raw_recipients or ';' in raw_recipients):
-            try:
-                import re
-                parts = re.split(r'[;,\n]+', raw_recipients)
-                recipients = [r.strip() for r in parts if r.strip()]
-            except Exception:
-                pass
+        # Process recipients in a streaming manner to avoid building huge lists in memory
+        from io import StringIO
+        import re
+        def recipient_iterator(raw):
+            # If input looks like a single comma/semicolon-separated line, split on those
+            if raw and '\n' not in raw and (',' in raw or ';' in raw):
+                for part in re.split(r'[;,\n]+', raw):
+                    p = part.strip()
+                    if p:
+                        yield p
+                return
+            # Otherwise iterate line-by-line (StringIO avoids creating a giant list)
+            f = StringIO(raw)
+            for line in f:
+                p = line.strip()
+                if p:
+                    yield p
 
-        # Log raw size and parsed count for troubleshooting large imports
+        recipients_iter = recipient_iterator(raw_recipients)
+
+        # Log raw size and an estimated count for troubleshooting large imports
         try:
-            logger.info(f"开始群发导入: 原始大小 {len(raw_recipients)} 字节, 解析后收件数 {len(recipients)}")
+            est = raw_recipients.count('\n') + (1 if raw_recipients.strip() else 0)
+            logger.info(f"开始群发导入: 原始大小 {len(raw_recipients)} 字节, 估计收件数 {est} (流式处理)")
         except Exception:
             pass
-        random.shuffle(recipients) # Shuffle for better distribution
+        # For streaming iterator we can't shuffle easily; rely on templates or caller to randomize input.
 
         # Load available template ids (if any)
         template_ids = []
@@ -2050,8 +2061,11 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
         
         tasks = []
         count = 0
-        
-        for rcpt in recipients:
+        # Batch size for streaming writes to limit memory usage
+        CHUNK_SIZE = 200
+        batch_records = []
+
+        for rcpt in recipients_iter:
             try:
                 # === Anti-Spam Randomization ===
                 rand_sub = ''.join(random.choices(charset, k=random.randint(4, 8)))
@@ -2160,27 +2174,59 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
                             bulk_stats['start_time'] = time.time()
                 except Exception:
                     pass
-                # Push to bulk writer queue. If queue is full, fallback to direct DB write to avoid blocking forever.
-                try:
-                    # Try to enqueue with a short timeout; if queue is full, fallback to direct DB write
+                # Accumulate into in-memory chunk; flush when chunk full
+                batch_records.append(record)
+                if len(batch_records) >= CHUNK_SIZE:
+                    # Try to enqueue each record; if queue is full, do a single executemany DB write for the whole chunk
                     try:
-                        bulk_write_queue.put(record, block=True, timeout=2)
+                        enqueued = 0
+                        for rec in batch_records:
+                            try:
+                                bulk_write_queue.put(rec, block=True, timeout=1)
+                                enqueued += 1
+                            except Exception:
+                                # queue full -> break to fallback
+                                raise
+                        # all enqueued
+                        batch_records = []
                     except Exception:
-                        # fallback: write immediately in small transaction to avoid unbounded memory growth
-                        with get_db() as conn:
-                            conn.execute(
-                                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                    record
-                            )
-                        with bulk_stats_lock:
-                            bulk_stats['inserted'] += 1
-                except Exception as e:
-                    logger.error(f"Direct write fallback failed for {rcpt}: {e}")
+                        # fallback: write the whole chunk in one DB transaction to avoid creating many small writes
+                        try:
+                            with get_db() as conn:
+                                conn.executemany(
+                                    "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                                    batch_records
+                                )
+                            with bulk_stats_lock:
+                                bulk_stats['inserted'] += len(batch_records)
+                        except Exception as e:
+                            logger.error(f"Bulk import direct executemany failed: {e}")
+                        batch_records = []
             except Exception as e:
                 logger.error(f"准备邮件失败 {rcpt}: {e}")
                 continue
 
-        # No local DB writes here; remaining records (if any) already pushed to bulk_write_queue.
+        # Flush any remaining batch_records
+        if batch_records:
+            try:
+                for rec in batch_records:
+                    try:
+                        bulk_write_queue.put(rec, block=True, timeout=1)
+                    except Exception:
+                        raise
+                batch_records = []
+            except Exception:
+                try:
+                    with get_db() as conn:
+                        conn.executemany(
+                            "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            batch_records
+                        )
+                    with bulk_stats_lock:
+                        bulk_stats['inserted'] += len(batch_records)
+                except Exception as e:
+                    logger.error(f"Bulk import final direct executemany failed: {e}")
+
         logger.info(f"群发导入完成: 共 {count} 封邮件, 等待后台写入完成...")
         # Wait for background writer to finish inserting expected records (with timeout)
         wait_start = time.time()
