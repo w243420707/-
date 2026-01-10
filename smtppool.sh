@@ -1108,7 +1108,8 @@ def node_sender(node_name, task_queue):
                     try:
                         with get_db() as conn:
                             if ok:
-                                conn.execute("UPDATE queue SET status='sent', updated_at=datetime('now', '+08:00') WHERE id=?", (rid,))
+                                # 发送成功直接删除记录，不保留历史
+                                conn.execute("DELETE FROM queue WHERE id=?", (rid,))
                             else:
                                 conn.execute("UPDATE queue SET status='failed', last_error=?, updated_at=datetime('now', '+08:00') WHERE id=?", (err[:200], rid))
                         return
@@ -1284,12 +1285,12 @@ def manager_thread():
             # --- Auto Cleanup (Once per hour) ---
             if now - last_cleanup_time > 3600:
                 try:
-                    days = int(cfg.get('log_config', {}).get('retention_days', 7))
-                    if days > 0:
-                        cutoff = (datetime.utcnow() + timedelta(hours=8) - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
-                        with get_db() as conn:
-                            conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed') AND updated_at < ?", (cutoff,))
-                        logger.info(f"🧹 自动清理了 {days} 天前的旧记录")
+                    # 清理1小时前的失败记录（成功的已经被删除）
+                    cutoff = (datetime.utcnow() + timedelta(hours=8) - timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+                    with get_db() as conn:
+                        deleted = conn.execute("DELETE FROM queue WHERE status='failed' AND updated_at < ?", (cutoff,)).rowcount
+                        if deleted > 0:
+                            logger.info(f"🧹 自动清理了 {deleted} 条失败记录（1小时前）")
                 except Exception as e:
                     logger.error(f"自动清理失败: {e}")
                 last_cleanup_time = now
@@ -1513,20 +1514,23 @@ def api_queue_stats():
         rows = conn.execute("SELECT status, COUNT(*) as c FROM queue GROUP BY status").fetchall()
         total = {r['status']: r['c'] for r in rows}
         
-        # Open stats
+        # 设置sent为0（因为发送成功后会被删除）
+        total['sent'] = 0
+        
+        # Open stats (仅统计待发送中被打开的)
         try:
             opened = conn.execute("SELECT COUNT(*) FROM queue WHERE open_count > 0").fetchone()[0]
             total['opened'] = opened
         except: total['opened'] = 0
 
-        # Speed stats (Sent in last hour)
+        # Speed stats (使用用户表的累计发送数)
         try:
-            speed = conn.execute("SELECT COUNT(*) FROM queue WHERE status='sent' AND updated_at > datetime('now', '+08:00', '-1 hour')").fetchone()[0]
+            speed = conn.execute("SELECT SUM(hourly_sent) FROM smtp_users WHERE hourly_reset_at = datetime('now', '+08:00', 'start of hour')").fetchone()[0] or 0
             total['speed_ph'] = speed
         except: total['speed_ph'] = 0
 
-        # Node stats
-        rows = conn.execute("SELECT assigned_node, status, COUNT(*) as c FROM queue GROUP BY assigned_node, status").fetchall()
+        # Node stats (只统计未完成的任务)
+        rows = conn.execute("SELECT assigned_node, status, COUNT(*) as c FROM queue WHERE status != 'sent' GROUP BY assigned_node, status").fetchall()
         nodes = {}
         for r in rows:
             n = r['assigned_node']
@@ -2698,8 +2702,53 @@ def api_draft():
 @login_required
 def api_queue_clear():
     with get_db() as conn:
-        conn.execute("DELETE FROM queue WHERE status IN ('sent', 'failed', 'processing')")
+        # 只清理失败和卡住的任务（sent已经自动删除）
+        conn.execute("DELETE FROM queue WHERE status IN ('failed', 'processing')")
     return jsonify({"status": "ok"})
+
+@app.route('/api/database/cleanup', methods=['POST'])
+@login_required
+def api_database_cleanup():
+    """一键清理所有旧数据并回收空间"""
+    try:
+        with get_db() as conn:
+            # 统计清理前的数据
+            before_sent = conn.execute("SELECT COUNT(*) FROM queue WHERE status='sent'").fetchone()[0]
+            before_failed = conn.execute("SELECT COUNT(*) FROM queue WHERE status='failed'").fetchone()[0]
+            before_templates = conn.execute("SELECT COUNT(*) FROM bulk_templates").fetchone()[0]
+            
+            # 清理所有sent记录（旧版本遗留）
+            conn.execute("DELETE FROM queue WHERE status='sent'")
+            
+            # 清理所有failed记录
+            conn.execute("DELETE FROM queue WHERE status='failed'")
+            
+            # 清理bulk模板（可选）
+            if request.json and request.json.get('clear_templates'):
+                conn.execute("DELETE FROM bulk_templates")
+        
+        # 回收数据库空间
+        import subprocess
+        db_path = DB_FILE
+        try:
+            # 执行VACUUM回收空间
+            subprocess.run(['sqlite3', db_path, 'VACUUM'], timeout=60, check=True)
+            vacuumed = True
+        except:
+            vacuumed = False
+        
+        return jsonify({
+            "status": "ok",
+            "cleared": {
+                "sent": before_sent,
+                "failed": before_failed,
+                "templates": before_templates if request.json and request.json.get('clear_templates') else 0
+            },
+            "vacuumed": vacuumed
+        })
+    except Exception as e:
+        logger.error(f"数据库清理失败: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
 
 def rebalance_queue_internal():
     cfg = load_config(use_cache=False)  # Force fresh config
@@ -3128,6 +3177,7 @@ EOF
         /* Status Colors */
         .text-pending { color: #f59e0b; } .bg-pending-subtle { background: #fffbeb; }
         .text-processing { color: #3b82f6; } .bg-processing-subtle { background: #eff6ff; }
+        .text-scheduled { color: #8b5cf6; } .bg-scheduled-subtle { background: #f5f3ff; }
         .text-sent { color: #10b981; } .bg-sent-subtle { background: #ecfdf5; }
         .text-failed { color: #ef4444; } .bg-failed-subtle { background: #fef2f2; }
         
@@ -3336,8 +3386,8 @@ EOF
                                 <div>
                                     <h6 class="fw-bold mb-0">群发任务 [[ statusText ]]</h6>
                                     <div class="small text-muted">
-                                        进度: [[ progressPercent ]]% ([[ qStats.total.sent || 0 ]] / [[ totalMails ]])
-                                        <span class="ms-2 badge bg-theme-light text-theme-main border border-theme">[[ qStats.total.speed_ph || 0 ]] 封/小时</span>
+                                        剩余: [[ totalMails ]] 封 | 当前速度: [[ qStats.total.speed_ph || 0 ]] 封/小时
+                                        <span class="ms-2 badge bg-info-subtle text-info">成功后自动删除，不占空间</span>
                                     </div>
                                 </div>
                             </div>
@@ -3371,14 +3421,14 @@ EOF
                         </div>
                     </div>
                     <!-- System summary card removed (moved to top charts) -->
-                    <div class="col-md-2 col-6" v-for="(label, key) in {'pending': '待发送', 'processing': '发送中', 'sent': '已成功', 'failed': '已失败'}" :key="key">
+                    <div class="col-md-2 col-6" v-for="(label, key) in {'pending': '待发送', 'processing': '发送中', 'scheduled': '定时发送', 'failed': '已失败'}" :key="key">
                         <div class="card stat-card h-100">
                             <div class="card-body">
                                 <div class="d-flex justify-content-between align-items-start mb-2">
                                     <div class="p-2 rounded" :class="'bg-'+key+'-subtle text-'+key">
                                         <i class="bi" :class="getStatusIcon(key)"></i>
                                     </div>
-                                    <span class="badge rounded-pill border text-muted">Total</span>
+                                    <span class="badge rounded-pill border text-muted">Current</span>
                                 </div>
                                 <h2 class="fw-bold mb-0">[[ qStats.total[key] || 0 ]]</h2>
                                 <div class="small text-muted">[[ label ]]</div>
@@ -3386,14 +3436,14 @@ EOF
                         </div>
                     </div>
                     <div class="col-md-2 col-6">
-                        <div class="card stat-card h-100">
+                        <div class="card stat-card h-100 bg-success-subtle">
                             <div class="card-body">
                                 <div class="d-flex justify-content-between align-items-start mb-2">
-                                    <div class="p-2 rounded bg-primary-subtle text-primary"><i class="bi bi-cursor-fill"></i></div>
-                                    <span class="badge rounded-pill border text-muted">Rate</span>
+                                    <div class="p-2 rounded bg-success text-white"><i class="bi bi-speedometer"></i></div>
+                                    <span class="badge rounded-pill bg-white text-success">Speed</span>
                                 </div>
-                                <h2 class="fw-bold mb-0">[[ clickRate ]]</h2>
-                                <div class="small text-muted">点击率</div>
+                                <h2 class="fw-bold mb-0 text-success">[[ qStats.total.speed_ph || 0 ]]</h2>
+                                <div class="small text-success">封/小时</div>
                             </div>
                         </div>
                     </div>
@@ -3865,13 +3915,44 @@ EOF
                         <div class="card h-100">
                             <div class="card-header">数据与日志 (Storage)</div>
                             <div class="card-body">
+                                <div class="alert alert-success mb-3">
+                                    <i class="bi bi-check-circle-fill me-2"></i>
+                                    <strong>智能清理已启用：</strong>发送成功的邮件会立即删除，不占用数据库空间。失败记录1小时后自动清理。
+                                </div>
                                 <div class="mb-3">
-                                    <label class="form-label">历史记录保留天数</label>
-                                    <div class="input-group">
-                                        <input type="number" v-model.number="config.log_config.retention_days" class="form-control" placeholder="7">
-                                        <span class="input-group-text">天</span>
+                                    <label class="form-label">数据库维护说明</label>
+                                    <div class="form-text text-muted">
+                                        ✅ 成功发送：立即删除<br>
+                                        ❌ 发送失败：1小时后删除<br>
+                                        ⏳ 待发送/发送中：保留直到完成<br>
+                                        📊 数据库会自动维护，无需手动清理
                                     </div>
-                                    <div class="form-text">超过此时间的成功/失败记录将被自动删除 (0=不删除)</div>
+                                </div>
+                                <div class="mb-3">
+                                    <label class="form-label d-flex justify-content-between align-items-center">
+                                        <span>一键清理旧数据</span>
+                                        <span class="badge bg-warning text-dark">首次更新后使用</span>
+                                    </label>
+                                    <div class="alert alert-warning mb-2">
+                                        <i class="bi bi-exclamation-triangle me-2"></i>
+                                        <strong>首次更新脚本后，</strong>如果有旧版本遗留的已发送/失败记录，可以点击下方按钮一键清理并回收空间。
+                                    </div>
+                                    <div class="d-flex gap-2">
+                                        <button class="btn btn-outline-danger" @click="cleanupDatabase(false)" :disabled="cleaningDb">
+                                            <span v-if="cleaningDb" class="spinner-border spinner-border-sm me-1"></span>
+                                            <i v-else class="bi bi-trash me-1"></i>
+                                            清理旧记录
+                                        </button>
+                                        <button class="btn btn-danger" @click="cleanupDatabase(true)" :disabled="cleaningDb">
+                                            <span v-if="cleaningDb" class="spinner-border spinner-border-sm me-1"></span>
+                                            <i v-else class="bi bi-trash3 me-1"></i>
+                                            深度清理（含模板）
+                                        </button>
+                                    </div>
+                                    <div class="form-text mt-2">
+                                        清理内容：sent状态记录 + failed状态记录 + VACUUM回收空间<br>
+                                        深度清理：额外清理所有预生成的邮件模板
+                                    </div>
                                 </div>
                                 <div class="row g-3">
                                     <div class="col-6">
@@ -4479,6 +4560,7 @@ EOF
                     showBatchUserModal: false,
                     batchUserForm: { type: 'monthly', count: 10, prefix: '' },
                     batchGenerating: false,
+                    cleaningDb: false,
                     nodeGroupFilter: '',
                     showGroupModal: false,
                     newGroupName: '',
@@ -4509,13 +4591,13 @@ EOF
                     return Object.values(this.qStats.nodes).some(n => (n.pending || 0) > 0);
                 },
                 clickRate() {
-                    const sent = (this.qStats.total.sent || 0) + (this.qStats.total.failed || 0); // Use sent+failed or just sent? Usually sent.
-                    // Actually, click rate is usually Opens / Delivered.
-                    // But here 'sent' means delivered (or at least accepted by relay).
-                    // Let's use sent.
-                    const s = this.qStats.total.sent || 0;
-                    if(s === 0) return '0.00%';
-                    return (((this.qStats.total.opened || 0) / s) * 100).toFixed(2) + '%';
+                    // 注意：由于发送成功的邮件会被直接删除，无法统计总发送数
+                    // 只能通过用户表的累计数或当前打开数来估算
+                    const opened = this.qStats.total.opened || 0;
+                    const speed = this.qStats.total.speed_ph || 0;
+                    if(speed === 0) return '-';
+                    // 近似计算：打开数 / 当前小时发送数
+                    return ((opened / Math.max(speed, 1)) * 100).toFixed(2) + '%';
                 },
                 recipientCount() { return this.bulk.recipients ? this.bulk.recipients.split('\n').filter(r => r.trim()).length : 0; },
                 recipientDomainStats() {
@@ -4539,11 +4621,15 @@ EOF
                 },
                 totalMails() {
                     const t = this.qStats.total;
-                    return (t.pending||0) + (t.processing||0) + (t.sent||0) + (t.failed||0) + (t.scheduled||0);
+                    // sent会被直接删除，所以总数只计算剩余的
+                    return (t.pending||0) + (t.processing||0) + (t.failed||0) + (t.scheduled||0);
                 },
                 progressPercent() {
-                    if(this.totalMails === 0) return 0;
-                    return Math.round(((this.qStats.total.sent||0) / this.totalMails) * 100);
+                    // 由于sent被删除，无法计算真实进度，只显示当前小时发送速度
+                    const speed = this.qStats.total.speed_ph || 0;
+                    if(speed === 0) return 0;
+                    // 这里无法准确计算百分比，只能显示当前状态
+                    return this.isFinished ? 100 : (this.totalMails === 0 ? 100 : 0);
                 },
                 isFinished() {
                     const t = this.qStats.total;
@@ -4762,6 +4848,33 @@ EOF
                     }
                     this.config.node_groups.splice(idx, 1);
                     if (this.nodeGroupFilter === groupName) this.nodeGroupFilter = '';
+                },
+                async cleanupDatabase(includeTemplates) {
+                    if (!confirm(`确定要清理数据库中的旧记录吗？\n${includeTemplates ? '(包括批量模板)' : ''}\n此操作不可撤销！`)) return;
+                    this.cleaningDb = true;
+                    try {
+                        const res = await fetch('/api/database/cleanup', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ clear_templates: includeTemplates })
+                        });
+                        const data = await res.json();
+                        if (res.ok) {
+                            const cleared = data.cleared || {};
+                            let msg = `清理完成！\n已发送记录: ${cleared.sent || 0} 条\n失败记录: ${cleared.failed || 0} 条`;
+                            if (includeTemplates) {
+                                msg += `\n批量模板: ${cleared.templates || 0} 条`;
+                            }
+                            msg += `\n数据库已优化`;
+                            alert(msg);
+                        } else {
+                            alert('清理失败: ' + (data.error || '未知错误'));
+                        }
+                    } catch (err) {
+                        alert('清理失败: ' + err.message);
+                    } finally {
+                        this.cleaningDb = false;
+                    }
                 },
                 nodeExists(name) {
                     const nodeNames = new Set(this.config.downstream_pool.map(n => n.name));
@@ -4985,7 +5098,7 @@ EOF
                     return map[key] || 'secondary';
                 },
                 getStatusIcon(key) {
-                    const map = { 'pending': 'bi-hourglass-split', 'processing': 'bi-send', 'sent': 'bi-check-circle', 'failed': 'bi-x-circle' };
+                    const map = { 'pending': 'bi-hourglass-split', 'processing': 'bi-send', 'scheduled': 'bi-clock', 'sent': 'bi-check-circle', 'failed': 'bi-x-circle' };
                     return map[key] || 'bi-question-circle';
                 },
                 async fetchContactCount() {
@@ -5848,7 +5961,7 @@ uninstall_smtp() {
 show_menu() {
     clear
     echo -e "============================================"
-    echo -e "   🚀 SMTP Relay Manager 管理脚本 "
+    echo -e "   🚀 SMTP Relay Manager 管理脚本 ${SCRIPT_VERSION}"
     echo -e "============================================"
     echo -e "${GREEN}1.${PLAIN} 安装 / 更新 "
     echo -e "${GREEN}2.${PLAIN} 启动服务"
