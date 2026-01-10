@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260110145504"
+SCRIPT_VERSION="20260110150033"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -48,7 +48,26 @@ install_smtp() {
         python3 -m venv venv
     fi
     "$VENV_DIR/bin/pip" install --upgrade pip
-    "$VENV_DIR/bin/pip" install flask requests aiosmtpd psutil
+    "$VENV_DIR/bin/pip" install flask requests aiosmtpd psutil redis
+
+    # Install and start Redis for high-performance queue
+    if ! command -v redis-server &> /dev/null; then
+        echo -e "${YELLOW}📦 安装 Redis...${PLAIN}"
+        apt-get install -y redis-server > /dev/null 2>&1 || yum install -y redis > /dev/null 2>&1
+    fi
+    
+    # Enable and start Redis
+    if command -v systemctl &> /dev/null; then
+        systemctl enable redis-server 2>/dev/null || systemctl enable redis 2>/dev/null
+        systemctl start redis-server 2>/dev/null || systemctl start redis 2>/dev/null
+    fi
+    
+    # Verify Redis is running
+    if redis-cli ping 2>/dev/null | grep -q PONG; then
+        echo -e "${GREEN}✅ Redis 已启动${PLAIN}"
+    else
+        echo -e "${YELLOW}⚠️ Redis 未运行，将使用 SQLite 模式${PLAIN}"
+    fi
 
     if [ -f "/tmp/smtp_config_backup.json" ]; then
         mv "/tmp/smtp_config_backup.json" "$CONFIG_FILE"
@@ -83,6 +102,8 @@ import time
 import base64
 import uuid
 import functools
+import re  # 在顶部导入，避免循环内重复导入
+import psutil  # 系统监控
 from datetime import datetime, timedelta
 from email import message_from_bytes
 from email.header import decode_header
@@ -95,10 +116,61 @@ from aiosmtpd.smtp import SMTP as SMTPServer, AuthResult, LoginPassword
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
 from functools import wraps
 
+# Redis for high-performance queue (optional, falls back to SQLite if unavailable)
+try:
+    import redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+    redis = None
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, 'config.json')
 DB_FILE = os.path.join(BASE_DIR, 'queue.db')
 LOG_FILE = '/var/log/smtp-relay/app.log'
+
+# Redis configuration
+REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')
+REDIS_PORT = int(os.environ.get('REDIS_PORT', 6379))
+REDIS_DB = int(os.environ.get('REDIS_DB', 0))
+REDIS_QUEUE_KEY = 'smtp:bulk:queue'
+REDIS_STATS_KEY = 'smtp:bulk:stats'
+
+# Global Redis connection
+_redis_client = None
+_redis_enabled = False
+
+def get_redis():
+    """Get Redis connection with auto-reconnect"""
+    global _redis_client, _redis_enabled
+    if not REDIS_AVAILABLE:
+        return None
+    if _redis_client is None:
+        try:
+            _redis_client = redis.Redis(
+                host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB,
+                decode_responses=False,  # We'll handle encoding
+                socket_timeout=5,
+                socket_connect_timeout=5,
+                retry_on_timeout=True
+            )
+            _redis_client.ping()
+            _redis_enabled = True
+            print(f"✅ Redis connected: {REDIS_HOST}:{REDIS_PORT}")
+        except Exception as e:
+            print(f"⚠️ Redis unavailable ({e}), using SQLite fallback")
+            _redis_client = None
+            _redis_enabled = False
+    return _redis_client
+
+def is_redis_enabled():
+    """Check if Redis is available and enabled"""
+    global _redis_enabled
+    if not REDIS_AVAILABLE:
+        return False
+    if _redis_client is None:
+        get_redis()  # Try to connect
+    return _redis_enabled
 
 # --- Database ---
 def db_retry(max_retries=3, delay=0.5):
@@ -170,6 +242,12 @@ def init_db():
                     conn.execute("ALTER TABLE queue ADD COLUMN template_id INTEGER")
                 except Exception:
                     pass
+            # Add body column for non-template bulk sends (stores HTML body, not full MIME)
+            if 'body' not in cols:
+                try:
+                    conn.execute("ALTER TABLE queue ADD COLUMN body TEXT")
+                except Exception:
+                    pass
         except Exception as e:
             print(f"DB Init Warning: {e}")
 
@@ -189,6 +267,7 @@ def init_db():
             email TEXT UNIQUE,
             created_at TIMESTAMP DEFAULT (datetime('now', '+08:00'))
         )''')
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_contacts_id ON contacts (id DESC)")
 
         conn.execute('''CREATE TABLE IF NOT EXISTS drafts (
             id INTEGER PRIMARY KEY,
@@ -328,6 +407,7 @@ def send_telegram(msg):
 
 # --- SMTP Authenticator ---
 limit_notify_cache = {}  # 限额通知缓存，避免重复通知
+limit_notify_cache_hour = -1  # 用于清理旧缓存
 
 class SMTPAuthenticator:
     def __call__(self, server, session, envelope, mechanism, auth_data):
@@ -398,6 +478,11 @@ class SMTPAuthenticator:
                         return fail_result
                     # 80%限额警告（每小时只提醒一次）
                     elif percent >= 80:
+                        # 清理过期的缓存（每小时清理一次）
+                        global limit_notify_cache, limit_notify_cache_hour
+                        if limit_notify_cache_hour != current_hour:
+                            limit_notify_cache = {}
+                            limit_notify_cache_hour = current_hour
                         notify_key = f"limit_{username}_{current_hour}"
                         if notify_key not in limit_notify_cache:
                             limit_notify_cache[notify_key] = True
@@ -707,8 +792,12 @@ worker_stats = {
 }
 worker_stop_event = threading.Event()
 
+# 节点健康统计 (用于显示每个节点的成功/失败数)
+node_health_stats = {'lock': threading.Lock()}
+
 # Per-smtp-user last sent timestamps to enforce per-user intervals (in-memory)
 smtp_user_last_sent = {}
+smtp_user_last_sent_max = 1000  # 最多跟踪1000个用户
 smtp_user_last_lock = threading.Lock()
 
 # 每个节点的内存任务队列
@@ -723,8 +812,10 @@ _BULK_WRITE_BATCH = 5000
 
 # bulk write statistics
 
-# simple in-memory template cache
+# simple in-memory template cache (with LRU-like cleanup)
 bulk_template_cache = {}
+bulk_template_cache_max = 100  # 最多缓存100个模板
+
 def get_template(tid):
     try:
         if tid in bulk_template_cache:
@@ -733,6 +824,12 @@ def get_template(tid):
             row = conn.execute("SELECT id, subject, body, meta FROM bulk_templates WHERE id=?", (tid,)).fetchone()
             if row:
                 tpl = { 'id': row['id'], 'subject': row['subject'], 'body': row['body'], 'meta': row['meta'] }
+                # 限制缓存大小
+                if len(bulk_template_cache) >= bulk_template_cache_max:
+                    # 清除一半旧缓存
+                    keys = list(bulk_template_cache.keys())[:bulk_template_cache_max // 2]
+                    for k in keys:
+                        bulk_template_cache.pop(k, None)
                 bulk_template_cache[tid] = tpl
                 return tpl
     except Exception:
@@ -749,8 +846,8 @@ bulk_stats = {
 
 def bulk_writer_thread():
     batch = []
-    # include smtp_user in bulk insert for per-user interval enforcement
-    insert_sql = "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    # include smtp_user and body in bulk insert for per-user interval enforcement
+    insert_sql = "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id, body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     while True:
         try:
             item = bulk_write_queue.get(timeout=1)
@@ -809,6 +906,371 @@ def bulk_writer_thread():
 
 # start writer thread daemon
 threading.Thread(target=bulk_writer_thread, daemon=True).start()
+
+# Redis consumer for high-performance bulk sending
+_redis_consumer_started = False
+_redis_consumer_lock = threading.Lock()
+_redis_node_queues = {}  # 每个节点的本地队列
+_redis_node_workers = {}  # 每个节点的工作线程
+
+def redis_dispatcher_thread():
+    """Redis 调度器：从 Redis 队列读取任务，分发到各节点的本地队列"""
+    try:
+        logger.info("🚀 Redis 调度器线程启动!")
+        logger.info(f"🚀 Redis 节点队列数: {len(_redis_node_queues)}")
+    except Exception as e:
+        print(f"Redis调度器启动日志失败: {e}")
+    
+    dispatched_count = 0
+    last_log_time = time.time()
+    
+    last_config_check = 0
+    config_check_interval = 2
+    cached_cfg = None
+    last_status_log = 0
+    
+    while True:
+        try:
+            r = get_redis()
+            if not r:
+                logger.warning("⚠️ Redis 调度器: 无法连接 Redis，等待重试...")
+                time.sleep(5)
+                continue
+            
+            now = time.time()
+            if cached_cfg is None or (now - last_config_check) > config_check_interval:
+                cached_cfg = load_config(use_cache=False)
+                last_config_check = now
+                
+                # 确保每个启用的节点都有队列和工作线程
+                enabled_nodes = [n for n in cached_cfg.get('downstream_pool', []) if n.get('enabled', True)]
+                for node in enabled_nodes:
+                    node_name = node.get('name')
+                    if node_name and node_name not in _redis_node_queues:
+                        from queue import Queue
+                        _redis_node_queues[node_name] = Queue(maxsize=100)
+                        t = threading.Thread(
+                            target=redis_node_sender,
+                            args=(node_name, _redis_node_queues[node_name]),
+                            daemon=True,
+                            name=f"redis-node-{node_name}"
+                        )
+                        t.start()
+                        _redis_node_workers[node_name] = t
+                        logger.info(f"🆕 启动 Redis 节点发送线程: {node_name}")
+            
+            bulk_ctrl = cached_cfg.get('bulk_control', {}).get('status', 'running')
+            if bulk_ctrl == 'paused':
+                if now - last_status_log > 30:
+                    logger.info(f"⏸️ [Redis调度器] 群发暂停中，等待恢复...")
+                    last_status_log = now
+                time.sleep(1)
+                continue
+            elif bulk_ctrl == 'stopped':
+                if now - last_status_log > 30:
+                    logger.info(f"⏹️ [Redis调度器] 群发已停止")
+                    last_status_log = now
+                time.sleep(2)
+                continue
+            
+            # 每 60 秒打印一次状态信息
+            if now - last_status_log > 60:
+                queue_len = r.llen(REDIS_QUEUE_KEY) or 0
+                logger.info(f"📊 [Redis调度器] 状态: 已分发 {dispatched_count}, 队列剩余 {queue_len}, 节点数 {len(_redis_node_queues)}")
+                last_status_log = now
+            
+            # 从 Redis 获取任务
+            result = r.brpop(REDIS_QUEUE_KEY, timeout=1)
+            if not result:
+                continue
+            
+            _, task_data = result
+            task = json.loads(task_data)
+            node_name = task.get('n')
+            
+            if not node_name:
+                continue
+            
+            # 构建启用节点映射
+            enabled_node_names = set()
+            for n in cached_cfg.get('downstream_pool', []):
+                if n.get('enabled', True) and n.get('allow_bulk', True):
+                    enabled_node_names.add(n.get('name'))
+            
+            # 检查目标节点是否启用且有队列
+            if node_name not in _redis_node_queues or node_name not in enabled_node_names:
+                # 节点不存在或已禁用，重新分配到其他启用的节点
+                available = [n for n in _redis_node_queues.keys() if n in enabled_node_names]
+                if available:
+                    node_name = random.choice(available)
+                    task['n'] = node_name
+                else:
+                    # 没有可用节点，放回队列稍后重试
+                    r.lpush(REDIS_QUEUE_KEY, json.dumps(task))
+                    time.sleep(0.5)
+                    continue
+            
+            # 放入节点队列（非阻塞，如果满了就等待）
+            try:
+                _redis_node_queues[node_name].put(task, timeout=5)
+                dispatched_count += 1
+                # 每 1000 个任务或每 30 秒打印一次日志
+                now = time.time()
+                if dispatched_count % 1000 == 0 or (now - last_log_time > 30 and dispatched_count > 0):
+                    queue_len = r.llen(REDIS_QUEUE_KEY) or 0
+                    logger.info(f"📤 [Redis调度器] 已分发 {dispatched_count} 个任务，队列剩余: {queue_len}")
+                    last_log_time = now
+            except:
+                # 队列满了，放回 Redis 稍后重试
+                r.lpush(REDIS_QUEUE_KEY, json.dumps(task))
+                time.sleep(0.1)
+                
+        except Exception as e:
+            logger.error(f"Redis 调度器错误: {e}")
+            time.sleep(1)
+
+def redis_node_sender(node_name, task_queue):
+    """Redis 节点发送线程：专门处理某个节点的邮件发送"""
+    logger.info(f"🚀 Redis 节点发送线程启动: {node_name}")
+    
+    last_config_check = 0
+    config_check_interval = 5
+    cached_cfg = None
+    local_success = 0
+    local_fail = 0
+    
+    while True:
+        try:
+            # 获取任务
+            try:
+                task = task_queue.get(timeout=2)
+            except:
+                continue
+            
+            # 检查配置
+            now = time.time()
+            if cached_cfg is None or (now - last_config_check) > config_check_interval:
+                cached_cfg = load_config(use_cache=False)
+                last_config_check = now
+            
+            # 检查暂停或停止状态
+            bulk_ctrl = cached_cfg.get('bulk_control', {}).get('status', 'running')
+            if bulk_ctrl == 'paused':
+                # 放回队列
+                task_queue.put(task)
+                time.sleep(1)
+                continue
+            elif bulk_ctrl == 'stopped':
+                # 已停止，丢弃任务
+                continue
+            
+            # 解析任务
+            rcpt = task.get('r')
+            subject = task.get('s')
+            body = task.get('b')
+            tracking_id = task.get('t')
+            template_id = task.get('tid')
+            
+            if not rcpt:
+                continue
+            
+            # 获取节点配置
+            cfg = cached_cfg
+            pool_cfg = {n['name']: n for n in cfg.get('downstream_pool', [])}
+            node = pool_cfg.get(node_name)
+            
+            if not node or not node.get('enabled', True):
+                # 节点不存在或已禁用，尝试重新分配到其他可用节点
+                available_nodes = [n for n in cfg.get('downstream_pool', []) 
+                                   if n.get('enabled', True) and n.get('allow_bulk', True) and n.get('name') in _redis_node_queues]
+                if available_nodes:
+                    # 随机选一个可用节点，把任务放到它的队列
+                    alt_node = available_nodes[hash(rcpt) % len(available_nodes)]
+                    alt_name = alt_node.get('name')
+                    if alt_name and alt_name in _redis_node_queues and alt_name != node_name:
+                        try:
+                            _redis_node_queues[alt_name].put_nowait(task)
+                        except:
+                            # 队列满，放回自己的队列稍后重试
+                            task_queue.put(task)
+                            time.sleep(0.5)
+                else:
+                    # 没有可用节点，放回队列等待
+                    task_queue.put(task)
+                    time.sleep(1)
+                continue
+            
+            # 构建发件人
+            sender = None
+            if node.get('sender_domain'):
+                domain = node['sender_domain']
+                prefix = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=6)) if node.get('sender_random') else node.get('sender_prefix', 'mail')
+                sender = f"{prefix}@{domain}"
+            elif node.get('sender_email'):
+                sender = node['sender_email']
+            else:
+                sender = node.get('username', 'noreply@localhost')
+            
+            # 构建 MIME 消息
+            try:
+                if template_id:
+                    tpl = get_template(template_id)
+                    if tpl:
+                        m = MIMEMultipart('alternative')
+                        m['Subject'] = tpl.get('subject', subject)
+                        m['To'] = rcpt
+                        m['From'] = sender
+                        m['Date'] = formatdate(localtime=True)
+                        m['Message-ID'] = f"<{uuid.uuid4().hex[:16]}.{int(time.time())}@{rcpt.split('@')[-1] if '@' in rcpt else 'mail.local'}>"
+                        
+                        tpl_body = tpl.get('body', '')
+                        plain = tpl_body.replace('<br>', '\n').replace('</p>', '\n')
+                        plain = re.sub(r'<[^>]+>', '', plain)
+                        
+                        tracking_base = cfg.get('web_config', {}).get('public_domain', '').rstrip('/')
+                        tracking_html = f"<img src='{tracking_base}/track/{tracking_id}' width='1' height='1' style='display:none;'>" if tracking_base else ''
+                        
+                        final_body = f"<div>{tpl_body}{tracking_html}</div>"
+                        
+                        m.attach(MIMEText(plain, 'plain', 'utf-8'))
+                        m.attach(MIMEText(final_body, 'html', 'utf-8'))
+                        msg_content = m.as_bytes()
+                    else:
+                        continue
+                else:
+                    m = MIMEMultipart('alternative')
+                    m['Subject'] = subject or '(No Subject)'
+                    m['To'] = rcpt
+                    m['From'] = sender
+                    m['Date'] = formatdate(localtime=True)
+                    m['Message-ID'] = f"<{uuid.uuid4().hex[:16]}.{int(time.time())}@{rcpt.split('@')[-1] if '@' in rcpt else 'mail.local'}>"
+                    
+                    plain = body.replace('<br>', '\n').replace('</p>', '\n') if body else ''
+                    plain = re.sub(r'<[^>]+>', '', plain)
+                    
+                    m.attach(MIMEText(plain, 'plain', 'utf-8'))
+                    m.attach(MIMEText(body or '', 'html', 'utf-8'))
+                    msg_content = m.as_bytes()
+                
+                # 发送邮件
+                encryption = node.get('encryption', 'none')
+                host = node['host']
+                port = int(node['port'])
+                
+                if encryption == 'ssl':
+                    with smtplib.SMTP_SSL(host, port, timeout=30) as s:
+                        if node.get('username') and node.get('password'):
+                            s.login(node['username'], node['password'])
+                        s.sendmail(sender, [rcpt], msg_content)
+                else:
+                    with smtplib.SMTP(host, port, timeout=30) as s:
+                        if encryption == 'tls':
+                            s.starttls()
+                        if node.get('username') and node.get('password'):
+                            s.login(node['username'], node['password'])
+                        s.sendmail(sender, [rcpt], msg_content)
+                
+                local_success += 1
+                with worker_stats['lock']:
+                    worker_stats['success'] += 1
+                    worker_stats['minute_count'] += 1
+                    worker_stats['redis_success'] = worker_stats.get('redis_success', 0) + 1
+                
+                # 更新节点健康统计
+                with node_health_stats['lock']:
+                    if node_name not in node_health_stats:
+                        node_health_stats[node_name] = {'success': 0, 'fail': 0}
+                    node_health_stats[node_name]['success'] = node_health_stats.get(node_name, {}).get('success', 0) + 1
+                
+                # 记录到数据库供 UI 显示
+                try:
+                    tid = tracking_id or uuid.uuid4().hex
+                    with get_db() as conn:
+                        conn.execute("""
+                            INSERT INTO queue (uuid, mail_from, rcpt_tos, tracking_id, status, source, assigned_node, created_at, finished_at)
+                            VALUES (?, ?, ?, ?, 'sent', 'redis_bulk', ?, datetime('now', '+08:00'), datetime('now', '+08:00'))
+                        """, (tid, sender, json.dumps([rcpt]), tid, node_name))
+                except Exception as db_err:
+                    logger.debug(f"记录发送到数据库失败: {db_err}")  # 改为 debug 级别
+                
+                # 每 100 封打印本节点日志
+                if local_success % 100 == 0:
+                    logger.info(f"📧 [{node_name}] 已发送 {local_success} 封")
+                
+                # 应用发送间隔
+                limit_cfg = cfg.get('limit_config', {})
+                min_int = float(node.get('min_interval') or limit_cfg.get('min_interval', 1))
+                max_int = float(node.get('max_interval') or limit_cfg.get('max_interval', 5))
+                delay = random.uniform(min_int, max_int)
+                time.sleep(delay)
+                
+            except Exception as e:
+                local_fail += 1
+                logger.error(f"[{node_name}] 发送失败 {rcpt}: {e}")
+                with worker_stats['lock']:
+                    worker_stats['fail'] += 1
+                    worker_stats['redis_fail'] = worker_stats.get('redis_fail', 0) + 1
+                
+                # 更新节点健康统计
+                with node_health_stats['lock']:
+                    if node_name not in node_health_stats:
+                        node_health_stats[node_name] = {'success': 0, 'fail': 0}
+                    node_health_stats[node_name]['fail'] = node_health_stats.get(node_name, {}).get('fail', 0) + 1
+                
+                # 记录失败到数据库
+                try:
+                    tid = tracking_id or uuid.uuid4().hex
+                    with get_db() as conn:
+                        conn.execute("""
+                            INSERT INTO queue (uuid, mail_from, rcpt_tos, tracking_id, status, last_error, source, assigned_node, created_at, finished_at)
+                            VALUES (?, ?, ?, ?, 'failed', ?, 'redis_bulk', ?, datetime('now', '+08:00'), datetime('now', '+08:00'))
+                        """, (tid, sender, json.dumps([rcpt]), tid, str(e)[:500], node_name))
+                except Exception as db_err:
+                    logger.debug(f"记录失败到数据库失败: {db_err}")
+                
+        except Exception as e:
+            logger.error(f"[{node_name}] 线程错误: {e}")
+            time.sleep(1)
+
+def start_redis_consumer():
+    """启动 Redis 消费系统"""
+    global _redis_consumer_started
+    logger.info("📢 start_redis_consumer() 被调用")
+    with _redis_consumer_lock:
+        if _redis_consumer_started:
+            logger.info("ℹ️ Redis 消费系统已在运行中")
+            return
+        if not is_redis_enabled():
+            logger.warning("⚠️ Redis 未启用，无法启动消费者")
+            return
+        _redis_consumer_started = True
+        logger.info("📢 准备启动 Redis 消费系统...")
+        
+        # 启动调度器线程
+        t = threading.Thread(target=redis_dispatcher_thread, daemon=True, name="redis-dispatcher")
+        t.start()
+        logger.info("✅ Redis 调度器线程已创建")
+        
+        # 获取配置，预先启动所有节点的发送线程
+        cfg = load_config()
+        enabled_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
+        logger.info(f"📊 发现 {len(enabled_nodes)} 个启用的节点")
+        
+        from queue import Queue
+        for node in enabled_nodes:
+            node_name = node.get('name')
+            if node_name:
+                _redis_node_queues[node_name] = Queue(maxsize=100)
+                t = threading.Thread(
+                    target=redis_node_sender,
+                    args=(node_name, _redis_node_queues[node_name]),
+                    daemon=True,
+                    name=f"redis-node-{node_name}"
+                )
+                t.start()
+                _redis_node_workers[node_name] = t
+        
+        logger.info(f"🚀 启动 Redis 消费系统完成: 1 个调度器 + {len(enabled_nodes)} 个节点发送线程")
 
 def get_cached_config(max_age=2):
     """获取缓存的配置（直接使用 load_config 的缓存）"""
@@ -982,6 +1444,53 @@ def node_sender(node_name, task_queue):
                     except Exception:
                         pass
                 
+                # 非模板群发：当 content 为空、没有 template_id 但有 subject 和 body 时动态生成 MIME
+                if (not msg_content) and (not tpl_id) and is_bulk:
+                    try:
+                        task_subject = task.get('subject', '(No Subject)')
+                        task_body = task.get('body', '')
+                        recipient = rcpt_tos[0] if isinstance(rcpt_tos, (list, tuple)) and len(rcpt_tos) > 0 else ''
+                        tracking_id = task.get('tracking_id') or str(uuid.uuid4())
+                        
+                        if task_subject or task_body:
+                            # 获取追踪配置
+                            tracking_base = cfg.get('web_config', {}).get('public_domain', '').rstrip('/')
+                            tracking_html = f"<img src='{tracking_base}/track/{tracking_id}' width='1' height='1' alt='' style='display:none;border:0;'>" if tracking_base else ''
+                            
+                            # 构建最终 HTML 正文
+                            final_body = f'''<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;">
+{task_body}
+{tracking_html}
+</div>'''
+                            
+                            # 生成纯文本版本
+                            import re
+                            plain_text = task_body.replace('<br>', chr(10)).replace('<br/>', chr(10)).replace('</p>', chr(10)) if task_body else ''
+                            plain_text = re.sub(r'<[^>]+>', '', plain_text).strip()
+                            
+                            # 构建 MIME
+                            m = MIMEMultipart('alternative')
+                            m['Subject'] = task_subject
+                            m['To'] = recipient
+                            m['From'] = sender or ''
+                            
+                            # 添加自然的邮件头
+                            from email.utils import formatdate
+                            date_offset = random.randint(0, 180)
+                            m['Date'] = formatdate(localtime=True, timeval=time.time() - date_offset)
+                            msg_domain = recipient.split('@')[-1] if '@' in recipient else 'mail.local'
+                            m['Message-ID'] = f"<{uuid.uuid4().hex[:16]}.{int(time.time())}.{random.randint(1000,9999)}@{msg_domain}>"
+                            m['MIME-Version'] = '1.0'
+                            
+                            part1 = MIMEText(plain_text, 'plain', 'utf-8')
+                            part2 = MIMEText(final_body, 'html', 'utf-8')
+                            m.attach(part1)
+                            m.attach(part2)
+                            msg_content = m.as_bytes()
+                    except Exception as e:
+                        logger.error(f"非模板群发 MIME 生成失败: {e}")
+                        msg_content = None
+                
                 # Header rewrite
                 if sender and (node.get('sender_domain') or node.get('sender_email')):
                     try:
@@ -1082,6 +1591,12 @@ def node_sender(node_name, task_queue):
                 if smtp_user:
                     try:
                         with smtp_user_last_lock:
+                            # 限制字典大小，防止内存泄漏
+                            if len(smtp_user_last_sent) >= smtp_user_last_sent_max:
+                                # 删除最旧的一半记录
+                                sorted_items = sorted(smtp_user_last_sent.items(), key=lambda x: x[1])
+                                for k, _ in sorted_items[:smtp_user_last_sent_max // 2]:
+                                    smtp_user_last_sent.pop(k, None)
                             smtp_user_last_sent[smtp_user] = time.time()
                     except Exception:
                         pass
@@ -1191,12 +1706,12 @@ def dispatcher_thread():
                 for node_name in nodes_need_tasks:
                     if bulk_ctrl == 'paused':
                         rows = conn.execute(
-                                "SELECT id, mail_from, rcpt_tos, content, source, template_id, tracking_id, smtp_user FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
+                                "SELECT id, mail_from, rcpt_tos, content, source, template_id, tracking_id, smtp_user, subject, body FROM queue WHERE status='pending' AND assigned_node=? AND source != 'bulk' ORDER BY id ASC LIMIT 20",
                                 (node_name,)
                             ).fetchall()
                     else:
                         rows = conn.execute(
-                            "SELECT id, mail_from, rcpt_tos, content, source, template_id, tracking_id, smtp_user FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 20",
+                            "SELECT id, mail_from, rcpt_tos, content, source, template_id, tracking_id, smtp_user, subject, body FROM queue WHERE status='pending' AND assigned_node=? ORDER BY CASE WHEN source='relay' THEN 0 ELSE 1 END, id ASC LIMIT 20",
                             (node_name,)
                         ).fetchall()
                     
@@ -1218,6 +1733,8 @@ def dispatcher_thread():
                                     'template_id': row['template_id'] if 'template_id' in row.keys() else None,
                                     'tracking_id': row['tracking_id'] if 'tracking_id' in row.keys() else None,
                                     'smtp_user': row['smtp_user'] if 'smtp_user' in row.keys() else None,
+                                    'subject': row['subject'] if 'subject' in row.keys() else None,
+                                    'body': row['body'] if 'body' in row.keys() else None,
                                     'source': row['source']
                                 }
                                 node_queues[node_name].put(task, timeout=1)
@@ -1489,20 +2006,49 @@ def api_restart():
 @app.route('/api/logs')
 @login_required
 def api_logs():
-    """获取最近的日志"""
+    """获取最近的日志（使用高效的 tail 方式）"""
     lines = int(request.args.get('lines', 100))
     try:
         log_file = LOG_FILE
         if not os.path.exists(log_file):
             return jsonify({"logs": []})
         
-        # 读取最后 N 行
-        with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
-            all_lines = f.readlines()
-            recent = all_lines[-lines:] if len(all_lines) > lines else all_lines
-            # 反转顺序，最新的在前
-            recent.reverse()
-            return jsonify({"logs": [l.strip() for l in recent if l.strip()]})
+        # 使用高效的 tail 方式读取，不加载整个文件到内存
+        result_lines = []
+        avg_line_length = 150  # 估计平均每行字节数
+        buffer_size = lines * avg_line_length * 2  # 读取足够大的缓冲区
+        
+        with open(log_file, 'rb') as f:
+            # 移动到文件末尾
+            f.seek(0, 2)  # SEEK_END
+            file_size = f.tell()
+            
+            if file_size == 0:
+                return jsonify({"logs": []})
+            
+            # 从末尾读取
+            read_size = min(buffer_size, file_size)
+            f.seek(max(0, file_size - read_size), 0)
+            data = f.read()
+            
+            # 解码并分割行
+            try:
+                text = data.decode('utf-8', errors='ignore')
+            except:
+                text = data.decode('latin-1', errors='ignore')
+            
+            all_lines = text.split('\n')
+            # 取最后 N 行（排除可能不完整的第一行）
+            if len(all_lines) > lines + 1:
+                result_lines = all_lines[-(lines+1):-1] if all_lines[-1] == '' else all_lines[-lines:]
+            else:
+                result_lines = all_lines[1:] if len(all_lines) > 1 else all_lines
+            
+            # 过滤空行并反转
+            result_lines = [l.strip() for l in result_lines if l.strip()]
+            result_lines.reverse()
+            
+            return jsonify({"logs": result_lines[-lines:] if len(result_lines) > lines else result_lines})
     except Exception as e:
         return jsonify({"logs": [], "error": str(e)})
 
@@ -1517,25 +2063,75 @@ def api_queue_stats():
         # 设置sent为0（因为发送成功后会被删除）
         total['sent'] = 0
         
-        # Open stats (仅统计待发送中被打开的)
+        # Redis queue length
+        redis_queue_len = 0
+        redis_mode = False
         try:
-            opened = conn.execute("SELECT COUNT(*) FROM queue WHERE open_count > 0").fetchone()[0]
-            total['opened'] = opened
+            r = get_redis()
+            if r and is_redis_enabled():
+                redis_queue_len = r.llen(REDIS_QUEUE_KEY) or 0
+                redis_mode = True
+        except:
+            pass
+        total['redis_queue'] = redis_queue_len
+        total['redis_mode'] = redis_mode
+        
+        # Open stats (统计所有被打开的邮件总次数)
+        try:
+            opened = conn.execute("SELECT COALESCE(SUM(open_count), 0) FROM queue WHERE open_count > 0").fetchone()[0]
+            total['opened'] = opened or 0
         except: total['opened'] = 0
 
-        # Speed stats (使用用户表的累计发送数)
+        # Speed stats - 使用 worker_stats 获取实时速度
         try:
-            speed = conn.execute("SELECT SUM(hourly_sent) FROM smtp_users WHERE hourly_reset_at = datetime('now', '+08:00', 'start of hour')").fetchone()[0] or 0
-            total['speed_ph'] = speed
-        except: total['speed_ph'] = 0
+            with worker_stats['lock']:
+                total['speed_ph'] = worker_stats.get('success', 0)
+                total['redis_success'] = worker_stats.get('success', 0)
+                total['redis_fail'] = worker_stats.get('fail', 0)
+        except: 
+            total['speed_ph'] = 0
+            total['redis_success'] = 0
+            total['redis_fail'] = 0
 
         # Node stats (只统计未完成的任务)
-        rows = conn.execute("SELECT assigned_node, status, COUNT(*) as c FROM queue WHERE status != 'sent' GROUP BY assigned_node, status").fetchall()
+        rows = conn.execute("SELECT assigned_node, status, COUNT(*) as c FROM queue WHERE status NOT IN ('sent', 'failed') GROUP BY assigned_node, status").fetchall()
         nodes = {}
         for r in rows:
             n = r['assigned_node']
             if n not in nodes: nodes[n] = {}
             nodes[n][r['status']] = r['c']
+        
+        # 如果是 Redis 模式且有队列任务，显示 Redis 消费者状态
+        if redis_mode and redis_queue_len > 0:
+            # 获取配置中的节点列表来估算分布
+            cfg = load_config()
+            enabled_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True) and n.get('allow_bulk', True)]
+            if not enabled_nodes:
+                enabled_nodes = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
+            if enabled_nodes:
+                # Redis 队列中的任务平均分配给各节点
+                per_node = redis_queue_len // len(enabled_nodes)
+                remainder = redis_queue_len % len(enabled_nodes)
+                for i, node in enumerate(enabled_nodes):
+                    node_name = node.get('name', 'Unknown')
+                    count = per_node + (1 if i < remainder else 0)
+                    if node_name not in nodes:
+                        nodes[node_name] = {}
+                    nodes[node_name]['pending'] = nodes[node_name].get('pending', 0) + count
+                    nodes[node_name]['redis'] = True
+        
+        # 添加节点健康统计 (成功/失败数)
+        try:
+            with node_health_stats['lock']:
+                for node_name, stats in node_health_stats.items():
+                    if node_name == 'lock':
+                        continue
+                    if node_name not in nodes:
+                        nodes[node_name] = {'pending': 0}
+                    nodes[node_name]['sent'] = stats.get('success', 0)
+                    nodes[node_name]['failed'] = stats.get('fail', 0)
+        except Exception as e:
+            logger.warning(f"获取节点健康统计失败: {e}")
             
     return jsonify({"total": total, "nodes": nodes})
 
@@ -1545,40 +2141,29 @@ def api_queue_stats():
 def api_system_stats():
     """Return basic system metrics: CPU, memory, disk, net counters."""
     try:
-        try:
-            import psutil
-        except Exception:
-            psutil = None
-
-        if psutil:
-            cpu = psutil.cpu_percent(interval=None)
-            vm = psutil.virtual_memory()
-            mem_total = vm.total
-            mem_used = vm.used
-            mem_percent = vm.percent
-            swap = psutil.swap_memory()
-            swap_total = swap.total
-            swap_used = swap.used
-            swap_percent = swap.percent
-            disk = psutil.disk_usage('/')
-            disk_percent = disk.percent
-            net = psutil.net_io_counters()
-            net_sent = net.bytes_sent
-            net_recv = net.bytes_recv
-        else:
-            cpu = 0.0
-            mem_total = mem_used = mem_percent = 0
-            disk_percent = 0
-            net_sent = net_recv = 0
+        cpu = psutil.cpu_percent(interval=None)
+        vm = psutil.virtual_memory()
+        mem_total = vm.total
+        mem_used = vm.used
+        mem_percent = vm.percent
+        swap = psutil.swap_memory()
+        swap_total = swap.total
+        swap_used = swap.used
+        swap_percent = swap.percent
+        disk = psutil.disk_usage('/')
+        disk_percent = disk.percent
+        net = psutil.net_io_counters()
+        net_sent = net.bytes_sent
+        net_recv = net.bytes_recv
 
         return jsonify({
             'cpu_percent': float(cpu),
             'mem_total': int(mem_total),
             'mem_used': int(mem_used),
             'mem_percent': float(mem_percent),
-            'swap_total': int(swap_total) if psutil else 0,
-            'swap_used': int(swap_used) if psutil else 0,
-            'swap_percent': float(swap_percent) if psutil else 0.0,
+            'swap_total': int(swap_total),
+            'swap_used': int(swap_used),
+            'swap_percent': float(swap_percent),
             'disk_percent': float(disk_percent),
             'net_sent': int(net_sent),
             'net_recv': int(net_recv)
@@ -1634,20 +2219,46 @@ def api_queue_drain():
 @login_required
 def api_domain_stats():
     """Get top 9 recipient domains by count, rest as 'other'"""
-    with get_db() as conn:
-        # Only count pending emails for routing relevance
-        rows = conn.execute("SELECT rcpt_tos FROM queue WHERE status='pending'").fetchall()
-    
     domain_count = {}
-    for row in rows:
+    
+    # 方法1: 从 SQLite 队列统计
+    with get_db() as conn:
+        rows = conn.execute("SELECT rcpt_tos FROM queue WHERE status='pending'").fetchall()
+        for row in rows:
+            try:
+                rcpts = json.loads(row['rcpt_tos']) if row['rcpt_tos'] else []
+                for email in rcpts:
+                    if '@' in email:
+                        domain = email.split('@')[-1].lower().strip()
+                        if domain:
+                            domain_count[domain] = domain_count.get(domain, 0) + 1
+            except: pass
+    
+    # 方法2: 如果 SQLite 为空，尝试从 Redis 队列采样统计
+    if not domain_count:
         try:
-            rcpts = json.loads(row['rcpt_tos']) if row['rcpt_tos'] else []
-            for email in rcpts:
-                if '@' in email:
-                    domain = email.split('@')[-1].lower().strip()
-                    if domain:
-                        domain_count[domain] = domain_count.get(domain, 0) + 1
-        except: pass
+            r = get_redis()
+            if r and is_redis_enabled():
+                queue_len = r.llen(REDIS_QUEUE_KEY) or 0
+                if queue_len > 0:
+                    # 采样最多 5000 条来统计域名分布
+                    sample_size = min(queue_len, 5000)
+                    sample_data = r.lrange(REDIS_QUEUE_KEY, 0, sample_size - 1)
+                    for task_data in sample_data:
+                        try:
+                            task = json.loads(task_data)
+                            rcpt = task.get('r', '')
+                            if '@' in rcpt:
+                                domain = rcpt.split('@')[-1].lower().strip()
+                                if domain:
+                                    domain_count[domain] = domain_count.get(domain, 0) + 1
+                        except: pass
+                    # 如果是采样，按比例放大
+                    if sample_size < queue_len:
+                        scale = queue_len / sample_size
+                        domain_count = {d: int(c * scale) for d, c in domain_count.items()}
+        except Exception as e:
+            logger.warning(f"Redis 域名统计失败: {e}")
     
     # Sort by count descending, take top 9
     sorted_domains = sorted(domain_count.items(), key=lambda x: x[1], reverse=True)
@@ -1758,8 +2369,9 @@ def select_node_for_recipient(pool, recipient, global_limit, source='relay', for
     return None
 
 def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
+    """High-performance bulk import using Redis (if available) or SQLite fallback"""
     try:
-        # Pause bulk sending while we import and write to DB to prioritize writes
+        # Pause bulk sending while we import
         try:
             cfg = load_config()
             if 'bulk_control' not in cfg: cfg['bulk_control'] = {}
@@ -1768,341 +2380,229 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
         except Exception:
             pass
 
-        # Initialize bulk stats for this import
+        # Initialize bulk stats
         with bulk_stats_lock:
             bulk_stats['total_expected'] = 0
             bulk_stats['inserted'] = 0
-            bulk_stats['start_time'] = None
+            bulk_stats['start_time'] = time.time()
             bulk_stats['last_update'] = 0.0
             bulk_stats['last_rate'] = 0.0
 
-        # Process recipients in background to avoid blocking
+        # Parse recipients
         recipients = [r.strip() for r in raw_recipients.split('\n') if r.strip()]
-        # If user pasted as a single line with commas/semicolons, handle that too
         if len(recipients) == 1 and (',' in raw_recipients or ';' in raw_recipients):
+            import re
+            parts = re.split(r'[;,\n]+', raw_recipients)
+            recipients = [r.strip() for r in parts if r.strip()]
+
+        # 过滤无效收件人（含非ASCII字符或格式错误）
+        def is_valid_email(email):
             try:
-                import re
-                parts = re.split(r'[;,\n]+', raw_recipients)
-                recipients = [r.strip() for r in parts if r.strip()]
-            except Exception:
-                pass
+                email.encode('ascii')  # 检查是否全是ASCII
+                return '@' in email and '.' in email.split('@')[-1]
+            except UnicodeEncodeError:
+                return False
+        
+        invalid_count = len(recipients)
+        recipients = [r for r in recipients if is_valid_email(r)]
+        invalid_count = invalid_count - len(recipients)
+        if invalid_count > 0:
+            logger.warning(f"⚠️ 过滤了 {invalid_count} 个无效收件人（含非ASCII字符或格式错误）")
 
-        # Log raw size and parsed count for troubleshooting large imports
-        try:
-            logger.info(f"开始群发导入: 原始大小 {len(raw_recipients)} 字节, 解析后收件数 {len(recipients)}")
-        except Exception:
-            pass
-        random.shuffle(recipients) # Shuffle for better distribution
+        total_count = len(recipients)
+        logger.info(f"开始群发导入: {total_count} 封邮件")
 
-        # Load available template ids (if any)
+        # Pre-load data outside loop
         template_ids = []
         try:
             with get_db() as conn:
                 rows = conn.execute("SELECT id FROM bulk_templates").fetchall()
                 template_ids = [r[0] for r in rows]
         except Exception:
-            template_ids = []
+            pass
         
         cfg = load_config()
-        limit_cfg = cfg.get('limit_config', {})
         tracking_base = cfg.get('web_config', {}).get('public_domain', '').rstrip('/')
-
-        charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-        # Use module-level CHAT_CORPUS for memory efficiency
-        chat_corpus = CHAT_CORPUS
         
-        # Calculate scheduled time (default: now)
+        # Pre-compute node names for round-robin (avoid DB queries in loop)
+        node_names = [n.get('name', 'Unknown') for n in pool if n.get('enabled', True) and n.get('allow_bulk', True)]
+        if not node_names:
+            node_names = [n.get('name', 'Unknown') for n in pool if n.get('enabled', True)]
+        if not node_names:
+            logger.error("没有可用的发送节点")
+            return
+
+        # Schedule time
         schedule_time = None
+        scheduled_at_str = None
         if scheduled_at:
             try:
                 schedule_time = datetime.strptime(scheduled_at, '%Y-%m-%dT%H:%M')
+                scheduled_at_str = schedule_time.strftime('%Y-%m-%d %H:%M:%S')
             except:
-                schedule_time = None
-        
-        # Placeholder to remove old chat_corpus definition
-        _removed_chat_corpus = [
-            "晚安，愿你梦想成真。", "嘿，祝你每一天都精彩。", "想去打羽毛球，期待已久了。",
-            "下午好，愿你梦想成真。", "打算去公园散步，有点累但很开心。", "下午好，祝你工作顺利。",
-            "你好，祝你万事如意。", "嘿，愿你快乐。", "后天打算去露营，觉得很充实。",
-            "打算去逛街，觉得生活很美好。", "这时候要去学做饭，觉得很充实。", "约了朋友吃饭，觉得很充实。",
-            "下午好，祝你每一天都精彩。", "要去骑行，感觉很放松。", "打算去练瑜伽，觉得很充实。",
-            "今天准备去图书馆，希望能有好天气。", "想去看电影，有点累但很开心。", "晚上好，祝你心想事成。",
-            "要去博物馆，觉得很充实。", "要去骑行，有点累但很开心。", "最近要去健身房锻炼，期待已久了。",
-            "下周准备在家大扫除，希望能一切顺利。", "哈喽，祝你心想事成。", "晚安，祝你工作顺利。",
-            "嘿，愿你身体健康。", "明天想去看电影，希望能一切顺利。", "准备去图书馆，感觉很放松。",
-            "这时候想去听音乐会，心情特别好。", "哈喽，祝你万事如意。", "中午好，祝你开心。",
-            "后天准备在家大扫除，期待已久了。", "准备去图书馆，希望能一切顺利。", "晚安，祝你万事如意。",
-            "打算去看画展，有点累但很开心。", "这时候想去钓鱼，感觉充满了能量。", "明天想去看电影，心情特别好。",
-            "明天要去咖啡店坐坐，觉得很充实。", "准备在家看书，希望能遇到有趣的人。", "中午好，祝你工作顺利。",
-            "周末打算去爬山，希望能一切顺利。", "准备在家看书，期待已久了。", "下午好，愿你快乐。",
-            "中午好，愿你身体健康。", "下午好，祝你开心。", "这时候要去骑行，觉得生活很美好。",
-            "早安，祝你心想事成。", "想去打羽毛球，希望能有好天气。", "最近准备去野餐，感觉很放松。",
-            "明天打算去练瑜伽，希望能遇到有趣的人。", "假期要去博物馆，觉得生活很美好。", "早上好，愿你有个好梦。",
-            "嘿，祝你心想事成。", "你好，祝你工作顺利。", "今天想去海边走走，觉得生活很美好。",
-            "想去打羽毛球，觉得很充实。", "下午好，希望你天天好心情。", "打算去露营，感觉很放松。",
-            "下周准备去游泳，感觉很放松。", "要去博物馆，感觉很放松。", "下周准备在家大扫除，希望能有好天气。",
-            "下周打算去爬山，希望能一切顺利。", "下周想去听音乐会，觉得很充实。", "周末要去健身房锻炼，觉得很充实。",
-            "想去钓鱼，希望能有好天气。", "晚安，祝你开心。", "周末准备在家看书，心情特别好。",
-            "准备去野餐，期待已久了。", "晚上好，愿你快乐。", "想去海边走走，希望能一切顺利。",
-            "想去海边走走，觉得很充实。", "打算去爬山，期待已久了。", "准备去跑步，希望能有好天气。",
-            "下周打算去练瑜伽，觉得很充实。", "想去打羽毛球，感觉充满了能量。", "周末要去博物馆，心情特别好。",
-            "早安，愿你身体健康。", "最近打算去看画展，希望能遇到有趣的人。", "这时候约了朋友吃饭，觉得生活很美好。",
-            "晚安，愿你快乐。", "下周想去看电影，希望能一切顺利。", "打算去逛街，希望能一切顺利。",
-            "打算去练瑜伽，觉得生活很美好。", "准备在家看书，希望能有好天气。", "打算去练瑜伽，心情特别好。",
-            "后天准备在家大扫除，心情特别好。", "下周打算去露营，觉得很充实。", "想去打羽毛球，有点累但很开心。",
-            "最近打算去练瑜伽，心情特别好。", "打算去露营，希望能一切顺利。", "准备去野餐，希望能有好天气。",
-            "准备去游泳，希望能有好天气。", "你好，愿你有个好梦。", "早安，祝你每一天都精彩。",
-            "这时候要去超市买菜，有点累但很开心。", "下周想去听音乐会，期待已久了。", "你好，愿你快乐。",
-            "今天准备在家大扫除，有点累但很开心。", "假期打算去逛街，希望能遇到有趣的人。", "下周想去钓鱼，希望能遇到有趣的人。",
-            "明天要去超市买菜，希望能遇到有趣的人。", "嘿，愿你有个好梦。", "今天要去健身房锻炼，感觉充满了能量。",
-            "中午好，祝你每一天都精彩。", "你好，希望你天天好心情。", "这时候准备去游泳，希望能遇到有趣的人。",
-            "要去骑行，觉得生活很美好。", "最近想去听音乐会，希望能有好天气。", "想去听音乐会，觉得生活很美好。",
-            "后天打算去练瑜伽，感觉很放松。", "明天打算去公园散步，希望能有好天气。", "准备去图书馆，期待已久了。",
-            "要去学做饭，希望能一切顺利。", "周末打算去练瑜伽，期待已久了。", "早上好，祝你开心。",
-            "准备去野餐，希望能一切顺利。", "准备去游泳，期待已久了。", "下周要去健身房锻炼，感觉很放松。",
-            "准备去图书馆，感觉充满了能量。", "你好，愿你梦想成真。", "最近准备去图书馆，感觉充满了能量。",
-            "想去滑雪，觉得很充实。", "假期要去学做饭，希望能遇到有趣的人。", "打算去练瑜伽，希望能一切顺利。",
-            "嘿，祝你工作顺利。", "准备在家看书，心情特别好。", "打算去看画展，希望能一切顺利。",
-            "后天想去海边走走，感觉充满了能量。", "明天打算去爬山，希望能一切顺利。", "周末要去骑行，感觉很放松。",
-            "最近想去看电影，觉得很充实。", "后天要去咖啡店坐坐，希望能一切顺利。", "下周要去健身房锻炼，觉得生活很美好。",
-            "嘿，祝你开心。", "早上好，愿你梦想成真。", "后天想去看电影，有点累但很开心。",
-            "想去海边走走，有点累但很开心。", "准备去跑步，觉得生活很美好。", "这时候准备去跑步，感觉很放松。",
-            "这时候准备去跑步，希望能有好天气。", "后天打算去练瑜伽，觉得生活很美好。", "打算去看画展，期待已久了。",
-            "假期约了朋友吃饭，希望能一切顺利。", "周末要去咖啡店坐坐，觉得很充实。", "今天想去滑雪，希望能有好天气。",
-            "下周想去海边走走，感觉充满了能量。", "打算去公园散步，希望能遇到有趣的人。", "准备在家大扫除，感觉很放松。",
-            "准备在家大扫除，心情特别好。", "今天约了朋友吃饭，有点累但很开心。", "后天要去学做饭，希望能一切顺利。",
-            "下周打算去公园散步，期待已久了。", "今天打算去公园散步，觉得很充实。", "下午好，祝你心想事成。",
-            "哈喽，愿你梦想成真。", "你好，愿你身体健康。", "这时候约了朋友吃饭，希望能一切顺利。",
-            "准备在家大扫除，觉得很充实。", "想去看电影，希望能一切顺利。", "早安，愿你梦想成真。",
-            "准备去游泳，感觉充满了能量。", "要去学做饭，有点累但很开心。", "想去听音乐会，感觉很放松。",
-            "打算去露营，希望能有好天气。", "准备去游泳，有点累但很开心。", "准备去野餐，觉得很充实。",
-            "这时候打算去逛街，有点累但很开心。", "今天准备去跑步，觉得生活很美好。", "早安，愿你有个好梦。",
-            "想去看电影，感觉很放松。", "要去超市买菜，觉得很充实。", "准备去野餐，希望能遇到有趣的人。",
-            "打算去逛街，感觉很放松。", "这时候想去看电影，期待已久了。", "晚安，愿你身体健康。",
-            "后天想去钓鱼，期待已久了。", "要去学做饭，觉得很充实。", "假期想去钓鱼，感觉很放松。",
-            "最近想去滑雪，希望能有好天气。", "想去打羽毛球，感觉很放松。", "想去看电影，希望能遇到有趣的人。",
-            "打算去爬山，感觉充满了能量。", "下周打算去看画展，感觉很放松。", "要去咖啡店坐坐，觉得生活很美好。",
-            "今天想去钓鱼，觉得生活很美好。", "今天想去打羽毛球，感觉充满了能量。", "后天准备去野餐，希望能遇到有趣的人。",
-            "早安，希望你天天好心情。", "这时候要去骑行，希望能遇到有趣的人。", "中午好，愿你有个好梦。",
-            "周末想去看电影，希望能遇到有趣的人。", "哈喽，希望你天天好心情。", "这时候约了朋友吃饭，期待已久了。",
-            "打算去看画展，觉得很充实。", "最近准备去跑步，希望能一切顺利。", "打算去公园散步，期待已久了。",
-            "约了朋友吃饭，感觉充满了能量。", "你好，祝你开心。", "后天打算去逛街，觉得生活很美好。",
-            "哈喽，愿你身体健康。", "周末要去健身房锻炼，心情特别好。", "下午好，愿你身体健康。",
-            "中午好，愿你快乐。", "今天要去骑行，期待已久了。", "最近准备在家看书，感觉很放松。",
-            "今天想去滑雪，期待已久了。", "假期打算去露营，期待已久了。", "想去听音乐会，希望能有好天气。",
-            "早安，愿你快乐。", "下午好，愿你有个好梦。", "假期想去海边走走，期待已久了。",
-            "后天打算去看画展，感觉很放松。", "哈喽，祝你每一天都精彩。", "下周打算去逛街，希望能有好天气。",
-            "想去钓鱼，感觉充满了能量。", "周末准备在家大扫除，感觉很放松。", "中午好，希望你天天好心情。",
-            "明天要去骑行，希望能有好天气。", "这时候想去海边走走，感觉很放松。", "准备在家大扫除，希望能一切顺利。",
-            "后天打算去练瑜伽，期待已久了。", "明天想去听音乐会，感觉充满了能量。", "晚安，希望你天天好心情。",
-            "哈喽，祝你工作顺利。", "明天要去健身房锻炼，有点累但很开心。", "打算去练瑜伽，希望能遇到有趣的人。",
-            "明天要去咖啡店坐坐，心情特别好。", "后天想去看电影，觉得很充实。", "这时候要去超市买菜，觉得生活很美好。",
-            "这时候约了朋友吃饭，希望能遇到有趣的人。", "你好，祝你每一天都精彩。", "想去听音乐会，心情特别好。",
-            "今天要去咖啡店坐坐，希望能有好天气。", "早上好，希望你天天好心情。", "今天打算去露营，心情特别好。",
-            "后天打算去公园散步，感觉充满了能量。", "打算去看画展，希望能有好天气。", "早安，祝你万事如意。",
-            "想去打羽毛球，觉得生活很美好。", "晚上好，希望你天天好心情。", "早上好，祝你每一天都精彩。",
-            "这时候打算去露营，觉得很充实。", "周末要去学做饭，心情特别好。", "这时候要去骑行，希望能有好天气。",
-            "假期准备去图书馆，觉得很充实。", "打算去爬山，觉得生活很美好。", "后天准备去图书馆，希望能有好天气。",
-            "嘿，愿你梦想成真。", "约了朋友吃饭，希望能遇到有趣的人。", "假期准备去游泳，希望能一切顺利。",
-            "这时候准备在家大扫除，希望能有好天气。", "想去滑雪，希望能有好天气。", "下周打算去公园散步，希望能遇到有趣的人。",
-            "准备在家看书，感觉很放松。", "最近想去钓鱼，有点累但很开心。", "想去看电影，期待已久了。",
-            "想去钓鱼，希望能一切顺利。", "今天准备去野餐，有点累但很开心。", "要去博物馆，有点累但很开心。",
-            "晚上好，愿你有个好梦。", "晚上好，祝你万事如意。", "早上好，愿你身体健康。",
-            "后天想去滑雪，感觉很放松。", "最近想去听音乐会，感觉充满了能量。", "准备在家大扫除，感觉充满了能量。",
-            "准备去野餐，感觉很放松。", "打算去练瑜伽，期待已久了。", "准备在家看书，有点累但很开心。",
-            "打算去练瑜伽，感觉很放松。", "下周打算去露营，有点累但很开心。", "中午好，祝你心想事成。",
-            "今天准备在家大扫除，觉得很充实。", "要去学做饭，觉得生活很美好。", "这时候要去健身房锻炼，感觉充满了能量。",
-            "今天打算去看画展，觉得很充实。", "要去咖啡店坐坐，感觉充满了能量。", "今天想去海边走走，感觉充满了能量。",
-            "最近准备去跑步，希望能有好天气。", "明天要去咖啡店坐坐，感觉充满了能量。", "晚安，愿你有个好梦。",
-            "周末要去学做饭，觉得很充实。", "晚安，祝你心想事成。", "要去博物馆，感觉充满了能量。",
-            "要去健身房锻炼，希望能一切顺利。", "晚上好，愿你身体健康。", "明天准备去野餐，感觉很放松。",
-            "周末想去听音乐会，心情特别好。", "打算去露营，觉得生活很美好。", "周末要去超市买菜，希望能一切顺利。",
-            "明天准备去跑步，觉得生活很美好。", "后天要去超市买菜，觉得很充实。", "要去健身房锻炼，觉得很充实。",
-            "哈喽，祝你开心。", "准备去野餐，有点累但很开心。", "打算去爬山，希望能遇到有趣的人。",
-            "想去滑雪，有点累但很开心。", "下周想去听音乐会，心情特别好。", "要去骑行，希望能遇到有趣的人。",
-            "今天准备在家看书，感觉很放松。", "下周准备在家大扫除，感觉很放松。", "要去健身房锻炼，感觉很放松。",
-            "假期想去海边走走，觉得生活很美好。", "下周准备去野餐，觉得生活很美好。", "打算去看画展，心情特别好。",
-            "准备在家看书，感觉充满了能量。", "周末想去看电影，心情特别好。", "假期约了朋友吃饭，觉得很充实。",
-            "下周想去打羽毛球，心情特别好。", "假期准备去跑步，希望能有好天气。", "今天想去打羽毛球，期待已久了。",
-            "后天想去滑雪，希望能有好天气。", "准备去跑步，期待已久了。", "今天准备去游泳，希望能一切顺利。",
-            "后天要去博物馆，希望能遇到有趣的人。", "打算去逛街，希望能有好天气。", "明天准备去游泳，感觉充满了能量。",
-            "准备在家看书，觉得很充实。", "今天准备在家看书，感觉充满了能量。", "周末想去滑雪，希望能遇到有趣的人。",
-            "明天想去海边走走，期待已久了。", "早安，祝你开心。", "要去超市买菜，有点累但很开心。",
-            "准备在家看书，希望能一切顺利。", "要去咖啡店坐坐，有点累但很开心。", "下周打算去逛街，感觉充满了能量。",
-            "准备去游泳，希望能遇到有趣的人。", "下周准备在家大扫除，期待已久了。", "要去学做饭，希望能有好天气。",
-            "要去咖啡店坐坐，感觉很放松。", "假期打算去公园散步，觉得生活很美好。", "想去打羽毛球，希望能一切顺利。",
-            "今天打算去练瑜伽，感觉很放松。", "明天准备在家看书，感觉很放松。", "下周要去健身房锻炼，感觉充满了能量。",
-            "要去博物馆，希望能遇到有趣的人。", "周末要去学做饭，期待已久了。", "这时候想去打羽毛球，感觉很放松。",
-            "假期要去学做饭，期待已久了。", "要去咖啡店坐坐，希望能一切顺利。", "后天要去健身房锻炼，觉得生活很美好。",
-            "这时候准备在家大扫除，觉得生活很美好。", "后天准备在家大扫除，感觉充满了能量。", "今天要去博物馆，觉得很充实。",
-            "哈喽，愿你有个好梦。", "想去看电影，感觉充满了能量。", "准备去图书馆，希望能遇到有趣的人。",
-            "这时候准备在家看书，希望能遇到有趣的人。", "想去钓鱼，觉得生活很美好。", "早安，祝你工作顺利。",
-            "要去咖啡店坐坐，期待已久了。", "想去滑雪，感觉充满了能量。", "今天打算去露营，感觉充满了能量。",
-            "明天想去滑雪，有点累但很开心。", "想去海边走走，感觉很放松。", "晚上好，祝你开心。",
-            "周末要去博物馆，有点累但很开心。", "最近打算去练瑜伽，期待已久了。", "后天要去超市买菜，希望能遇到有趣的人。",
-            "今天想去滑雪，觉得生活很美好。", "打算去爬山，希望能有好天气。", "周末准备去跑步，期待已久了。",
-            "要去咖啡店坐坐，心情特别好。", "想去滑雪，期待已久了。", "打算去爬山，感觉很放松。",
-            "周末打算去露营，感觉很放松。", "最近想去看电影，感觉很放松。", "早上好，祝你工作顺利。",
-            "这时候准备去图书馆，有点累但很开心。", "明天准备去跑步，希望能有好天气。", "周末想去打羽毛球，希望能有好天气。",
-            "今天想去打羽毛球，觉得生活很美好。", "周末准备去跑步，希望能遇到有趣的人。", "最近要去健身房锻炼，感觉很放松。",
-]  # Empty placeholder, using CHAT_CORPUS module constant
-        
-        tasks = []
-        count = 0
-        
-        for rcpt in recipients:
+                pass
+        initial_status = 'scheduled' if schedule_time and schedule_time > datetime.now() else 'pending'
+
+        # Pre-defined randomization data
+        charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        greetings = ['', 'Hi,', 'Hello,', 'Hey,', '你好，', '您好，', '']
+        closings = ['', 'Best,', 'Thanks,', 'Cheers,', 'Regards,', '祝好', '谢谢', '']
+        subject_formats = ['{subj} {rand}', '{subj} - {rand}', 'Re: {subj}', 'Fwd: {subj}', '{subj}', '{subj} #{rand4}']
+        hidden_style = 'color:transparent;font-size:1px;line-height:1px;max-height:0;opacity:0;overflow:hidden;'
+
+        # === Redis Fast Path ===
+        r = get_redis()
+        if r and is_redis_enabled():
+            logger.info("🚀 使用 Redis 高速导入模式")
+            random.shuffle(recipients)
+            
+            # 构建带权重的节点列表（按权重展开）
+            weighted_nodes = []
+            for n in pool:
+                if n.get('enabled', True) and n.get('allow_bulk', True):
+                    weight = max(1, int(n.get('weight', 1)))
+                    weighted_nodes.extend([n.get('name', 'Unknown')] * weight)
+            if not weighted_nodes:
+                for n in pool:
+                    if n.get('enabled', True):
+                        weight = max(1, int(n.get('weight', 1)))
+                        weighted_nodes.extend([n.get('name', 'Unknown')] * weight)
+            if not weighted_nodes:
+                weighted_nodes = node_names
+            
+            logger.info(f"📊 节点权重分布: {len(weighted_nodes)} 个槽位 (节点: {set(weighted_nodes)})")
+            
+            BATCH_SIZE = 10000
+            inserted = 0
+            
+            for batch_start in range(0, total_count, BATCH_SIZE):
+                batch_end = min(batch_start + BATCH_SIZE, total_count)
+                batch = recipients[batch_start:batch_end]
+                
+                pipe = r.pipeline(transaction=False)
+                for idx, rcpt in enumerate(batch):
+                    # 使用带权重的节点列表进行分配
+                    node_name = weighted_nodes[(batch_start + idx) % len(weighted_nodes)]
+                    tracking_id = uuid.uuid4().hex
+                    rand_sub = ''.join(random.choices(charset, k=5))
+                    
+                    current_subject = random.choice(subjects) if subjects else "(No Subject)"
+                    
+                    fmt = random.choice(subject_formats)
+                    final_subject = fmt.format(subj=current_subject, rand=rand_sub, rand4=rand_sub[:4])
+                    
+                    # 选择模板或构建正文（只在需要时才构建，节省内存）
+                    template_id = random.choice(template_ids) if template_ids else None
+                    
+                    if template_id:
+                        # 使用模板时不需要构建 body
+                        final_body = None
+                    else:
+                        # 只在非模板时才构建正文
+                        current_body = random.choice(bodies) if bodies else ""
+                        greeting = random.choice(greetings)
+                        closing = random.choice(closings)
+                        tracking_html = f"<img src='{tracking_base}/track/{tracking_id}' width='1' height='1' style='display:none;'>" if tracking_base else ''
+                        final_body = f'<div style="font-family:Arial,sans-serif;font-size:14px;">{f"<p>{greeting}</p>" if greeting else ""}{current_body}{f"<p>{closing}</p>" if closing else ""}{tracking_html}</div>'
+                    
+                    # Lightweight JSON task - 只包含必要字段
+                    task = json.dumps({
+                        'r': rcpt, 's': final_subject, 'b': final_body,
+                        'n': node_name, 't': tracking_id,
+                        'tid': template_id
+                    }, ensure_ascii=False)
+                    pipe.lpush(REDIS_QUEUE_KEY, task)
+                
+                pipe.execute()
+                inserted += len(batch)
+                
+                with bulk_stats_lock:
+                    bulk_stats['inserted'] = inserted
+                    bulk_stats['total_expected'] = total_count
+                    now = time.time()
+                    elapsed = max(0.1, now - bulk_stats['start_time'])
+                    bulk_stats['last_rate'] = inserted / elapsed
+                    bulk_stats['last_update'] = now
+                
+                if batch_start % 50000 == 0 and batch_start > 0:
+                    logger.info(f"📊 已导入 {inserted}/{total_count} ({bulk_stats['last_rate']:.0f}/秒)")
+
+            logger.info(f"✅ Redis 导入完成: {inserted} 封, 速率: {bulk_stats['last_rate']:.0f}/秒")
+            
+            # Resume bulk sending BEFORE starting consumers
             try:
-                # === Anti-Spam Randomization ===
-                rand_sub = ''.join(random.choices(charset, k=random.randint(4, 8)))
-                # Select random sentences to simulate normal chat
-                rand_chat = ' '.join(random.choices(chat_corpus, k=random.randint(5, 12)))
-                
-                # Randomly select subject and body
-                current_subject = random.choice(subjects) if subjects else "(No Subject)"
-                current_body = random.choice(bodies) if bodies else ""
-
-                tracking_id = str(uuid.uuid4())
-                tracking_html = ""
-                if tracking_base:
-                    tracking_url = f"{tracking_base}/track/{tracking_id}"
-                    tracking_html = f"<img src='{tracking_url}' width='1' height='1' alt='' style='display:none;border:0;'>"
-
-                # === Enhanced Subject Randomization ===
-                # Randomly choose subject format
-                subject_formats = [
-                    f"{current_subject} {rand_sub}",
-                    f"{current_subject} - {rand_sub}",
-                    f"Re: {current_subject}",
-                    f"Fwd: {current_subject}",
-                    f"{current_subject}",
-                    f"{current_subject} #{rand_sub[:4]}",
-                ]
-                final_subject = random.choice(subject_formats)
-                
-                # === Build More Natural Email ===
-                # Extract recipient name from email for personalization
-                rcpt_name = rcpt.split('@')[0].replace('.', ' ').replace('_', ' ').replace('-', ' ').title()[:20]
-                
-                # Random greetings and closings
-                greetings = ['', f'Hi,', f'Hello,', f'Hey,', f'{rcpt_name},', f'Hi {rcpt_name},', f'Dear {rcpt_name},', '你好，', '您好，', '']
-                closings = ['', 'Best,', 'Thanks,', 'Cheers,', 'Regards,', '祝好', '谢谢', '']
-                
-                greeting = random.choice(greetings)
-                closing = random.choice(closings)
-                
-                # Build HTML with more natural structure
-                # Hidden content placed more naturally throughout
-                hidden_style = 'color:transparent;font-size:1px;line-height:1px;max-height:0;opacity:0;overflow:hidden;mso-hide:all;'
-                hidden_words = rand_chat.split()
-                hidden_chunks = [' '.join(hidden_words[i:i+3]) for i in range(0, len(hidden_words), 3)]
-                
-                # Interleave hidden content with visible content
-                body_parts = current_body.split('</p>')
-                enhanced_body = ""
-                for i, part in enumerate(body_parts):
-                    enhanced_body += part
-                    if part.strip() and i < len(hidden_chunks):
-                        enhanced_body += f'<span style="{hidden_style}">{hidden_chunks[i]}</span>'
-                    if part.strip() and '<p' in part.lower():
-                        enhanced_body += '</p>'
-                
-                # Build final body with natural wrapping
-                final_body = f'''<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.6;">
-{f"<p>{greeting}</p>" if greeting else ""}
-{enhanced_body if enhanced_body else current_body}
-<span style="{hidden_style}">{random.choice(hidden_chunks) if hidden_chunks else rand_chat[:50]}</span>
-{f"<p>{closing}</p>" if closing else ""}
-{tracking_html}
-</div>'''
-
-                # === Create Multipart Email (HTML + Plain Text) ===
-                # Plain text version makes it look more like a normal email
-                plain_text = f"{greeting}\n\n{current_body.replace('<br>', chr(10)).replace('<br/>', chr(10)).replace('</p>', chr(10))}\n\n{closing}".strip()
-                # Remove HTML tags from plain text
-                import re
-                plain_text = re.sub(r'<[^>]+>', '', plain_text)
-                
-                msg = MIMEMultipart('alternative')
-                msg['Subject'] = final_subject
-                msg['From'] = '' # Placeholder, worker will fill
-                msg['To'] = rcpt
-                
-                # Randomize date slightly (within last few minutes)
-                date_offset = random.randint(0, 180)  # 0-3 minutes ago
-                msg['Date'] = formatdate(localtime=True, timeval=time.time() - date_offset)
-                
-                # More natural Message-ID format
-                msg_domain = rcpt.split('@')[-1] if '@' in rcpt else 'mail.local'
-                msg['Message-ID'] = f"<{uuid.uuid4().hex[:16]}.{int(time.time())}.{random.randint(1000,9999)}@{msg_domain}>"
-                
-                # Add common headers that normal emails have
-                msg['MIME-Version'] = '1.0'
-                user_agents = [
-                    'Mozilla/5.0', 
-                    'Microsoft Outlook 16.0', 
-                    'Apple Mail (2.3654)',
-                    'Thunderbird/102.0',
-                    None  # Sometimes no User-Agent
-                ]
-                ua = random.choice(user_agents)
-                if ua:
-                    msg['X-Mailer'] = ua
-                
-                # Attach plain text first, then HTML (standard order)
-                part1 = MIMEText(plain_text, 'plain', 'utf-8')
-                part2 = MIMEText(final_body, 'html', 'utf-8')
-                msg.attach(part1)
-                msg.attach(part2)
-
-                node = select_node_for_recipient(pool, rcpt, limit_cfg, source='bulk')
-                if not node:
-                    # No node available for this domain (all nodes exclude it)
-                    logger.warning(f"⚠️ Skipping {rcpt}: No node available for this domain")
-                    continue
-                node_name = node.get('name', 'Unknown')
-                
-                # Determine status based on scheduling
-                initial_status = 'scheduled' if schedule_time and schedule_time > datetime.now() else 'pending'
-                scheduled_at_str = schedule_time.strftime('%Y-%m-%d %H:%M:%S') if schedule_time else None
-                
-                # If we have pre-generated templates, only write recipient + template_id to DB
-                if template_ids:
-                    chosen_tid = random.choice(template_ids)
-                    # smtp_user unknown for bulk imports initiated by UI; leave as NULL
-                    record = ('', json.dumps([rcpt]), None, node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, chosen_tid)
-                else:
-                    # smtp_user unknown for bulk imports initiated by UI; leave as NULL
-                    record = ('', json.dumps([rcpt]), msg.as_bytes(), node_name, initial_status, 'bulk', tracking_id, datetime.utcnow() + timedelta(hours=8), datetime.utcnow() + timedelta(hours=8), scheduled_at_str, final_subject, None, None)
-                count += 1
-                # increment expected total and set start_time if first
-                try:
-                    with bulk_stats_lock:
-                        bulk_stats['total_expected'] += 1
-                        if not bulk_stats['start_time']:
-                            bulk_stats['start_time'] = time.time()
-                except Exception:
-                    pass
-                # Push to bulk writer queue. If queue is full, fallback to direct DB write to avoid blocking forever.
-                try:
-                    bulk_write_queue.put(record, block=False)
-                except Exception:
-                    # fallback: write immediately in small transaction
-                    try:
-                        with get_db() as conn:
-                            conn.execute(
-                                "INSERT INTO queue (mail_from, rcpt_tos, content, assigned_node, status, source, tracking_id, created_at, updated_at, scheduled_at, subject, smtp_user, template_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                    record
-                            )
-                        with bulk_stats_lock:
-                            bulk_stats['inserted'] += 1
-                    except Exception as e:
-                        logger.error(f"Direct write fallback failed for {rcpt}: {e}")
+                cfg = load_config()
+                if 'bulk_control' not in cfg: cfg['bulk_control'] = {}
+                cfg['bulk_control']['status'] = 'running'
+                save_config(cfg)
+                logger.info("✅ 群发状态已设为 running")
             except Exception as e:
-                logger.error(f"准备邮件失败 {rcpt}: {e}")
-                continue
+                logger.error(f"设置群发状态失败: {e}")
+            
+            # Start Redis consumer thread AFTER setting status to running
+            start_redis_consumer()
+            
+            # 验证消费者状态
+            time.sleep(0.5)
+            queue_len = r.llen(REDIS_QUEUE_KEY) or 0
+            logger.info(f"✅ Redis 消费者已启动，开始发送... (队列长度: {queue_len})")
+            
+            # 检查配置状态
+            cfg_check = load_config(use_cache=False)
+            bulk_status = cfg_check.get('bulk_control', {}).get('status', 'unknown')
+            logger.info(f"📊 当前群发状态: {bulk_status}")
 
-        # No local DB writes here; remaining records (if any) already pushed to bulk_write_queue.
-        logger.info(f"群发导入完成: 共 {count} 封邮件, 等待后台写入完成...")
+        else:
+            # === SQLite Fallback (original logic, optimized) ===
+            logger.info("📝 使用 SQLite 导入模式")
+            random.shuffle(recipients)
+            
+            with bulk_stats_lock:
+                bulk_stats['total_expected'] = total_count
+            
+            records = []
+            now_ts = datetime.utcnow() + timedelta(hours=8)
+            
+            for idx, rcpt in enumerate(recipients):
+                try:
+                    node_name = node_names[idx % len(node_names)]
+                    tracking_id = str(uuid.uuid4())
+                    rand_sub = ''.join(random.choices(charset, k=5))
+                    
+                    current_subject = random.choice(subjects) if subjects else "(No Subject)"
+                    current_body = random.choice(bodies) if bodies else ""
+                    
+                    fmt = random.choice(subject_formats)
+                    final_subject = fmt.format(subj=current_subject, rand=rand_sub, rand4=rand_sub[:4])
+                    
+                    greeting = random.choice(greetings)
+                    closing = random.choice(closings)
+                    tracking_html = f"<img src='{tracking_base}/track/{tracking_id}' width='1' height='1' style='display:none;'>" if tracking_base else ''
+                    
+                    final_body = f'<div style="font-family:Arial,sans-serif;font-size:14px;">{f"<p>{greeting}</p>" if greeting else ""}{current_body}{f"<p>{closing}</p>" if closing else ""}{tracking_html}</div>'
+                    
+                    template_id = random.choice(template_ids) if template_ids else None
+                    
+                    record = ('', json.dumps([rcpt]), None, node_name, initial_status, 'bulk', tracking_id, now_ts, now_ts, scheduled_at_str, final_subject, None, template_id, final_body if not template_id else None)
+                    records.append(record)
+                    
+                    # Batch insert every 5000 records
+                    if len(records) >= 5000:
+                        bulk_write_queue.put(records[:], block=False)
+                        with bulk_stats_lock:
+                            bulk_stats['total_expected'] = total_count
+                        records = []
+                        
+                except Exception as e:
+                    logger.error(f"准备邮件失败 {rcpt}: {e}")
+                    continue
+            
+            # Insert remaining records
+            if records:
+                for rec in records:
+                    bulk_write_queue.put(rec, block=False)
+            
+            logger.info(f"群发导入完成: 共 {total_count} 封邮件, 等待后台写入...")
         # Wait for background writer to finish inserting expected records (with timeout)
         wait_start = time.time()
         timeout = 60 * 30  # 30 minutes max wait
@@ -2508,15 +3008,31 @@ def api_smtp_users_batch():
 @login_required
 def api_contacts_import():
     emails = request.json.get('emails', [])
-    emails = [e.strip() for e in emails if e.strip()]
+    emails = list(set(e.strip() for e in emails if e.strip()))  # 去重
     added = 0
+    
     with get_db() as conn:
-        for e in emails:
-            try:
-                conn.execute("INSERT INTO contacts (email, created_at) VALUES (?, datetime('now', '+08:00'))", (e,))
-                added += 1
-            except sqlite3.IntegrityError:
-                pass
+        # 获取已存在的邮箱
+        existing = set()
+        if len(emails) <= 100000:
+            # 对于较小数量，查询已存在的
+            placeholders = ','.join('?' * min(len(emails), 999))
+            for i in range(0, len(emails), 999):
+                batch = emails[i:i+999]
+                ph = ','.join('?' * len(batch))
+                rows = conn.execute(f"SELECT email FROM contacts WHERE email IN ({ph})", batch).fetchall()
+                existing.update(r['email'] for r in rows)
+        
+        # 批量插入新邮箱
+        new_emails = [(e,) for e in emails if e not in existing]
+        if new_emails:
+            # 分批插入，每批5000条
+            batch_size = 5000
+            for i in range(0, len(new_emails), batch_size):
+                batch = new_emails[i:i+batch_size]
+                conn.executemany("INSERT OR IGNORE INTO contacts (email, created_at) VALUES (?, datetime('now', '+08:00'))", batch)
+            added = len(new_emails)
+    
     return jsonify({"added": added})
 
 @app.route('/api/contacts/list')
@@ -2524,13 +3040,27 @@ def api_contacts_import():
 def api_contacts_list():
     limit = request.args.get('limit', -1, type=int)
     offset = request.args.get('offset', 0, type=int)
-    query = "SELECT email FROM contacts ORDER BY id DESC"
+    fmt = request.args.get('format', 'json')
+    
+    # 使用 id ASC 确保分组顺序一致（分组1=最早的，分组N=最新的）
+    query = "SELECT email FROM contacts ORDER BY id ASC"
     params = ()
     if limit > 0:
         query += " LIMIT ? OFFSET ?"
         params = (limit, offset)
+        logger.info(f"加载联系人: limit={limit}, offset={offset}")
+    
     with get_db() as conn:
         rows = conn.execute(query, params).fetchall()
+    
+    logger.info(f"返回联系人数量: {len(rows)}")
+    
+    # 纯文本格式更快
+    if fmt == 'text':
+        from flask import Response
+        text = '\n'.join(r['email'] for r in rows)
+        return Response(text, mimetype='text/plain')
+    
     return jsonify([r['email'] for r in rows])
 
 @app.route('/api/contacts/count')
@@ -2727,15 +3257,17 @@ def api_database_cleanup():
             if request.json and request.json.get('clear_templates'):
                 conn.execute("DELETE FROM bulk_templates")
         
-        # 回收数据库空间
-        import subprocess
-        db_path = DB_FILE
+        # 回收数据库空间 - 使用独立连接执行VACUUM
+        vacuumed = False
         try:
-            # 执行VACUUM回收空间
-            subprocess.run(['sqlite3', db_path, 'VACUUM'], timeout=60, check=True)
+            vac_conn = sqlite3.connect(DB_FILE, timeout=120)
+            vac_conn.execute("PRAGMA busy_timeout = 60000")
+            vac_conn.execute("VACUUM")
+            vac_conn.close()
             vacuumed = True
-        except:
-            vacuumed = False
+            logger.info("数据库VACUUM完成")
+        except Exception as ve:
+            logger.error(f"VACUUM失败: {ve}")
         
         return jsonify({
             "status": "ok",
@@ -2770,17 +3302,19 @@ def api_database_reset():
             conn.execute("DELETE FROM contacts")
             conn.execute("DELETE FROM drafts")
             conn.execute("DELETE FROM bulk_templates")
-            
-            # 保留smtp_users表不动
         
-        # 回收数据库空间
-        import subprocess
-        db_path = DB_FILE
+        # 回收数据库空间 - 使用独立连接执行VACUUM
+        vacuumed = False
         try:
-            subprocess.run(['sqlite3', db_path, 'VACUUM'], timeout=60, check=True)
+            # VACUUM不能在事务中执行，需要独立连接
+            vac_conn = sqlite3.connect(DB_FILE, timeout=120)
+            vac_conn.execute("PRAGMA busy_timeout = 60000")
+            vac_conn.execute("VACUUM")
+            vac_conn.close()
             vacuumed = True
-        except:
-            vacuumed = False
+            logger.info("数据库VACUUM完成")
+        except Exception as ve:
+            logger.error(f"VACUUM失败: {ve}")
         
         return jsonify({
             "status": "ok",
@@ -3103,11 +3637,42 @@ def api_bulk_control():
         cfg['bulk_control']['status'] = 'running'
         save_config(cfg)
         logger.info("▶️ 群发已恢复")
+        # 确保 Redis 消费者在运行
+        if is_redis_enabled():
+            start_redis_consumer()
     elif action == 'stop':
-        # Stop means clear pending bulk
+        # 设置状态为 stopped
+        cfg['bulk_control']['status'] = 'stopped'
+        save_config(cfg)
+        
+        # Stop means clear pending bulk from SQLite
         with get_db() as conn:
             deleted = conn.execute("DELETE FROM queue WHERE (status='pending' OR status='processing') AND source='bulk'").rowcount
-        logger.info(f"⏹️ 群发已停止，清理了 {deleted} 封待发邮件")
+        
+        # Also clear Redis queue
+        redis_deleted = 0
+        try:
+            r = get_redis()
+            if r and is_redis_enabled():
+                redis_deleted = r.llen(REDIS_QUEUE_KEY) or 0
+                r.delete(REDIS_QUEUE_KEY)
+        except Exception as e:
+            logger.error(f"清理 Redis 队列失败: {e}")
+        
+        # 清空所有节点的内存队列
+        mem_cleared = 0
+        try:
+            for node_name, q in list(_redis_node_queues.items()):
+                while True:
+                    try:
+                        q.get_nowait()
+                        mem_cleared += 1
+                    except:
+                        break
+        except Exception as e:
+            logger.error(f"清理内存队列失败: {e}")
+        
+        logger.info(f"⏹️ 群发已停止，清理了 SQLite: {deleted} 封, Redis: {redis_deleted} 封, 内存: {mem_cleared} 封")
         
     return jsonify({"status": "ok", "current": cfg['bulk_control']['status']})
 
@@ -3133,7 +3698,21 @@ def track_email(tid):
                         rcpt = rcpt_list[0] if rcpt_list else '未知'
                     except:
                         pass
-                conn.execute("UPDATE queue SET opened_at=datetime('now', '+08:00'), open_count=open_count+1 WHERE tracking_id=?", (tid,))
+                    conn.execute("UPDATE queue SET opened_at=datetime('now', '+08:00'), open_count=open_count+1 WHERE tracking_id=?", (tid,))
+                else:
+                    # 记录不存在，可能还没发送完成或已被清理，创建一个占位记录
+                    try:
+                        conn.execute("""
+                            INSERT INTO queue (uuid, tracking_id, rcpt_tos, mail_from, status, source, open_count, opened_at, created_at)
+                            VALUES (?, ?, '["unknown"]', 'track@system', 'tracked', 'track', 1, datetime('now', '+08:00'), datetime('now', '+08:00'))
+                        """, (tid, tid))
+                        logger.info(f"📊 创建追踪记录: {tid[:8]}...")
+                    except Exception as insert_err:
+                        # 可能已存在，尝试更新
+                        try:
+                            conn.execute("UPDATE queue SET open_count = open_count + 1, opened_at = datetime('now', '+08:00') WHERE tracking_id = ?", (tid,))
+                        except:
+                            pass
                 logger.info(f"📖 邮件被打开 | 收件人: {rcpt} | 追踪ID: {tid[:8]}...")
             break
         except Exception as e:
@@ -3177,6 +3756,21 @@ def start_services():
         user_count = conn.execute("SELECT COUNT(*) FROM smtp_users WHERE enabled=1").fetchone()[0]
     require_auth = user_count > 0
     print(f"SMTP Port: {port}, Auth Required: {require_auth}")
+    
+    # Check Redis queue and auto-start consumers if there are pending tasks
+    try:
+        r = get_redis()
+        if r and is_redis_enabled():
+            queue_len = r.llen(REDIS_QUEUE_KEY) or 0
+            if queue_len > 0:
+                logger.info(f"📬 发现 Redis 队列中有 {queue_len} 封待发邮件，启动消费者...")
+                # 确保群发状态为 running
+                bulk_status = cfg.get('bulk_control', {}).get('status', 'running')
+                if bulk_status != 'running':
+                    logger.info(f"📬 群发状态为 {bulk_status}，消费者将等待恢复")
+                start_redis_consumer()
+    except Exception as e:
+        logger.error(f"检查 Redis 队列失败: {e}")
     
     # Start SMTP Server
     # On Windows using '0.0.0.0' as the controller hostname causes a connect() check to fail.
@@ -3492,7 +4086,7 @@ EOF
                 </div>
 
                 <!-- Bulk Control Panel -->
-                <div class="card mb-4 border-0 shadow-sm" v-if="totalMails > 0 || bulkStatus == 'paused'">
+                <div class="card mb-4 border-0 shadow-sm" v-if="totalMails > 0 || bulkStatus == 'paused' || qStats.total.redis_queue > 0">
                     <div class="card-body">
                         <div class="d-flex justify-content-between align-items-center">
                             <div class="d-flex align-items-center gap-3">
@@ -3502,7 +4096,11 @@ EOF
                                 <div>
                                     <h6 class="fw-bold mb-0">群发任务 [[ statusText ]]</h6>
                                     <div class="small text-muted">
-                                        剩余: [[ totalMails ]] 封 | 当前速度: [[ qStats.total.speed_ph || 0 ]] 封/小时
+                                        剩余: [[ totalMails ]] 封
+                                        <span v-if="qStats.total.redis_queue > 0" class="badge bg-success ms-1">Redis: [[ qStats.total.redis_queue ]]</span>
+                                        <span v-if="qStats.total.redis_success > 0" class="badge bg-primary ms-1">已发: [[ qStats.total.redis_success ]]</span>
+                                        <span v-if="qStats.total.redis_fail > 0" class="badge bg-danger ms-1">失败: [[ qStats.total.redis_fail ]]</span>
+                                        | 当前速度: [[ qStats.total.speed_ph || 0 ]] 封/小时
                                         <span class="ms-2 badge bg-info-subtle text-info">成功后自动删除，不占空间</span>
                                     </div>
                                 </div>
@@ -3536,7 +4134,45 @@ EOF
                             </div>
                         </div>
                     </div>
-                    <!-- System summary card removed (moved to top charts) -->
+                    <!-- Redis Mode Stats -->
+                    <div class="col-md-2 col-6" v-if="qStats.total.redis_mode && qStats.total.redis_queue > 0">
+                        <div class="card stat-card h-100">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-start mb-2">
+                                    <div class="p-2 rounded bg-warning-subtle text-warning"><i class="bi bi-inbox-fill"></i></div>
+                                    <span class="badge rounded-pill bg-success">Redis</span>
+                                </div>
+                                <h2 class="fw-bold mb-0">[[ qStats.total.redis_queue || 0 ]]</h2>
+                                <div class="small text-muted">待发送</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-2 col-6" v-if="qStats.total.redis_mode && qStats.total.redis_success > 0">
+                        <div class="card stat-card h-100">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-start mb-2">
+                                    <div class="p-2 rounded bg-success-subtle text-success"><i class="bi bi-check-circle-fill"></i></div>
+                                    <span class="badge rounded-pill bg-success">Redis</span>
+                                </div>
+                                <h2 class="fw-bold mb-0">[[ qStats.total.redis_success || 0 ]]</h2>
+                                <div class="small text-muted">已发送</div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="col-md-2 col-6" v-if="qStats.total.redis_mode && qStats.total.redis_fail > 0">
+                        <div class="card stat-card h-100">
+                            <div class="card-body">
+                                <div class="d-flex justify-content-between align-items-start mb-2">
+                                    <div class="p-2 rounded bg-danger-subtle text-danger"><i class="bi bi-x-circle-fill"></i></div>
+                                    <span class="badge rounded-pill bg-danger">Redis</span>
+                                </div>
+                                <h2 class="fw-bold mb-0">[[ qStats.total.redis_fail || 0 ]]</h2>
+                                <div class="small text-muted">失败</div>
+                            </div>
+                        </div>
+                    </div>
+                    <!-- SQLite Mode Stats (show when not in Redis mode or when have SQLite data) -->
+                    <template v-if="!qStats.total.redis_mode || qStats.total.redis_queue === 0">
                     <div class="col-md-2 col-6" v-for="(label, key) in {'pending': '待发送', 'processing': '发送中', 'scheduled': '定时发送', 'failed': '已失败'}" :key="key">
                         <div class="card stat-card h-100">
                             <div class="card-body">
@@ -3551,6 +4187,7 @@ EOF
                             </div>
                         </div>
                     </div>
+                    </template>
                     <div class="col-md-2 col-6">
                         <div class="card stat-card h-100 bg-success-subtle">
                             <div class="card-body">
@@ -3584,8 +4221,11 @@ EOF
                             <thead><tr><th>节点名称</th><th class="text-center">堆积</th><th class="text-center">变化</th><th class="text-center">成功</th><th class="text-center">失败</th><th>预计时长</th><th>预计结束</th></tr></thead>
                             <tbody>
                                 <template v-for="(s, name) in qStats.nodes" :key="name">
-                                <tr v-if="(s.pending || 0) > 0 || nodeChanges[name]">
-                                    <td class="fw-medium">[[ name ]]</td>
+                                <tr v-if="(s.pending || 0) > 0 || nodeChanges[name] || s.redis">
+                                    <td class="fw-medium">
+                                        [[ name ]]
+                                        <span v-if="s.redis" class="badge bg-success ms-1">Redis</span>
+                                    </td>
                                     <td class="text-center"><span class="badge bg-warning text-dark">[[ s.pending || 0 ]]</span></td>
                                     <td class="text-center">
                                         <span v-if="nodeChanges[name] > 0" class="badge bg-success">+[[ nodeChanges[name] ]]</span>
@@ -3598,7 +4238,19 @@ EOF
                                     <td class="text-muted small">[[ getEstFinishTime(name, s.pending) ]]</td>
                                 </tr>
                                 </template>
-                                <tr v-if="!hasPendingNodes && Object.keys(nodeChanges).length === 0"><td colspan="7" class="text-center text-muted py-4">暂无待发任务节点</td></tr>
+                                <!-- Redis 模式汇总 -->
+                                <tr v-if="qStats.total.redis_mode && qStats.total.redis_queue > 0 && Object.keys(qStats.nodes).length === 0">
+                                    <td class="fw-medium">
+                                        <i class="bi bi-lightning-charge text-success"></i> Redis 并行发送
+                                    </td>
+                                    <td class="text-center"><span class="badge bg-warning text-dark">[[ qStats.total.redis_queue ]]</span></td>
+                                    <td class="text-center text-muted">-</td>
+                                    <td class="text-center text-success">[[ qStats.total.redis_success || 0 ]]</td>
+                                    <td class="text-center text-danger">[[ qStats.total.redis_fail || 0 ]]</td>
+                                    <td class="text-muted small">-</td>
+                                    <td class="text-muted small">-</td>
+                                </tr>
+                                <tr v-if="!hasPendingNodes && Object.keys(nodeChanges).length === 0 && (!qStats.total.redis_mode || qStats.total.redis_queue === 0)"><td colspan="7" class="text-center text-muted py-4">暂无待发任务节点</td></tr>
                             </tbody>
                         </table>
                     </div>
@@ -3692,8 +4344,16 @@ EOF
                     </div>
                     <div class="col-lg-4">
                         <div class="card h-100">
-                            <div class="card-header">收件人列表</div>
+                            <div class="card-header d-flex justify-content-between align-items-center">
+                                <span>收件人列表</span>
+                                <span v-if="qStats.total.redis_mode" class="badge bg-success">Redis 模式</span>
+                                <span v-else class="badge bg-secondary">SQLite 模式</span>
+                            </div>
                             <div class="card-body d-flex flex-column">
+                                <!-- Redis queue info -->
+                                <div v-if="qStats.total.redis_queue > 0" class="alert alert-info py-1 mb-2">
+                                    <i class="bi bi-lightning-charge"></i> Redis 队列: [[ qStats.total.redis_queue ]] 封待发送
+                                </div>
                                 <!-- Bulk import progress -->
                                 <div v-if="bulkStats.total_expected > 0" class="mb-2">
                                     <div class="d-flex justify-content-between small text-muted">
@@ -4575,92 +5235,6 @@ EOF
                     </div>
                 </div>
             </div>
-
-            <!-- Settings Tab -->
-            <div v-if="tab=='settings'" class="fade-in">
-                <div class="d-flex justify-content-between align-items-center mb-4">
-                    <h4 class="fw-bold mb-0">系统设置</h4>
-                    <button class="btn btn-primary" @click="save" :disabled="saving">
-                        <span v-if="saving" class="spinner-border spinner-border-sm me-2"></span>
-                        保存配置
-                    </button>
-                </div>
-
-                <div class="row g-4">
-                    <div class="col-md-6">
-                        <div class="card h-100">
-                            <div class="card-header">数据与日志 (Storage)</div>
-                            <div class="card-body">
-                                <div class="mb-3">
-                                    <label class="form-label">历史记录保留天数</label>
-                                    <div class="input-group">
-                                        <input type="number" v-model.number="config.log_config.retention_days" class="form-control" placeholder="7">
-                                        <span class="input-group-text">天</span>
-                                    </div>
-                                    <div class="form-text">超过此时间的成功/失败记录将被自动删除 (0=不删除)</div>
-                                </div>
-                                <div class="row g-3">
-                                    <div class="col-6">
-                                        <label class="form-label">日志文件大小</label>
-                                        <div class="input-group">
-                                            <input type="number" v-model.number="config.log_config.max_mb" class="form-control" placeholder="50">
-                                            <span class="input-group-text">MB</span>
-                                        </div>
-                                    </div>
-                                    <div class="col-6">
-                                        <label class="form-label">日志备份数</label>
-                                        <input type="number" v-model.number="config.log_config.backups" class="form-control" placeholder="3">
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="col-md-6">
-                        <div class="card h-100">
-                            <div class="card-header">基础配置</div>
-                            <div class="card-body">
-                                <div class="mb-3">
-                                    <label class="form-label">监听端口</label>
-                                    <input type="number" v-model.number="config.server_config.port" class="form-control">
-                                </div>
-                                <div class="mb-3">
-                                    <label class="form-label">追踪域名 (Tracking URL)</label>
-                                    <input type="text" v-model="config.web_config.public_domain" class="form-control" placeholder="http://YOUR_IP:8080">
-                                    <div class="form-text">用于生成邮件打开追踪链接，请填写公网可访问地址。</div>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="col-12">
-                        <div class="card">
-                            <div class="card-header">用户套餐限额配置</div>
-                            <div class="card-body">
-                                <div class="row g-3">
-                                    <div class="col-md-3 col-6">
-                                        <label class="form-label">免费用户 (封/小时)</label>
-                                        <input type="number" v-model.number="config.user_limits.free" class="form-control" placeholder="10">
-                                    </div>
-                                    <div class="col-md-3 col-6">
-                                        <label class="form-label">月度用户 (封/小时)</label>
-                                        <input type="number" v-model.number="config.user_limits.monthly" class="form-control" placeholder="100">
-                                    </div>
-                                    <div class="col-md-3 col-6">
-                                        <label class="form-label">季度用户 (封/小时)</label>
-                                        <input type="number" v-model.number="config.user_limits.quarterly" class="form-control" placeholder="500">
-                                    </div>
-                                    <div class="col-md-3 col-6">
-                                        <label class="form-label">年度用户 (封/小时)</label>
-                                        <input type="number" v-model.number="config.user_limits.yearly" class="form-control" placeholder="1000">
-                                    </div>
-                                </div>
-                                <div class="form-text mt-2">批量生成用户时将使用这些每小时发送限额</div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
         </div>
     </div>
 
@@ -4668,7 +5242,7 @@ EOF
         const { createApp } = Vue;
         const app = createApp({
             delimiters: ['[[', ']]'],
-                    data() {
+            data() {
                 return {
                     tab: 'queue',
                     mobileMenu: false,
@@ -4734,7 +5308,7 @@ EOF
                         net_tx: []
                     },
                     charts: { cpu: null, mem: null, swap: null, net: null }
-                    }
+                }
             },
             computed: {
                 filteredQList() {
@@ -4775,8 +5349,10 @@ EOF
                 },
                 totalMails() {
                     const t = this.qStats.total;
-                    // sent会被直接删除，所以总数只计算剩余的
-                    return (t.pending||0) + (t.processing||0) + (t.failed||0) + (t.scheduled||0);
+                    // 包含 SQLite 队列和 Redis 队列
+                    const sqliteMails = (t.pending||0) + (t.processing||0) + (t.failed||0) + (t.scheduled||0);
+                    const redisMails = t.redis_queue || 0;
+                    return sqliteMails + redisMails;
                 },
                 progressPercent() {
                     // 由于sent被删除，无法计算真实进度，只显示当前小时发送速度
@@ -4787,7 +5363,10 @@ EOF
                 },
                 isFinished() {
                     const t = this.qStats.total;
-                    return this.totalMails > 0 && (t.pending||0) === 0 && (t.processing||0) === 0 && (t.scheduled||0) === 0;
+                    // 只有当 SQLite 和 Redis 队列都为空时才算完成
+                    const sqliteEmpty = (t.pending||0) === 0 && (t.processing||0) === 0 && (t.scheduled||0) === 0;
+                    const redisEmpty = (t.redis_queue||0) === 0;
+                    return sqliteEmpty && redisEmpty && (t.failed||0) === 0;
                 },
                 statusText() {
                     if(this.bulkStatus === 'paused') return '已暂停';
@@ -5066,11 +5645,10 @@ EOF
                             msg += `- 草稿: ${c.drafts || 0} 条\n`;
                             msg += `- 批量模板: ${c.bulk_templates || 0} 条\n\n`;
                             msg += `保留了 ${c.smtp_users || 0} 个SMTP用户账号\n\n`;
-                            msg += `数据库已优化完成`;
+                            msg += data.vacuumed ? `数据库已优化完成` : `数据库优化失败，请手动执行VACUUM`;
                             alert(msg);
-                            // 刷新页面数据
-                            await this.load();
                             this.dbAnalysis = null;
+                            this.contactCount = 0;
                         } else {
                             alert('重置失败: ' + (data.error || '未知错误'));
                         }
@@ -5442,7 +6020,9 @@ EOF
                 async saveContacts() {
                     const emails = this.bulk.recipients.split('\n').filter(r => r.trim());
                     if(emails.length === 0) return alert('输入框为空');
-                    if(!confirm(`确定保存 ${emails.length} 个邮箱? (自动去重)`)) return;
+                    if(!confirm(`确定保存 ${emails.length} 个邮箱? (自动去重)\n\n大量数据可能需要几秒钟，请耐心等待...`)) return;
+                    
+                    this.sending = true;  // 使用sending状态显示加载
                     try {
                         const res = await fetch('/api/contacts/import', {
                             method: 'POST',
@@ -5461,7 +6041,9 @@ EOF
                         const data = await res.json();
                         alert(`成功新增 ${data.added} 个`);
                         this.fetchContactCount();
-                    } catch(e) { alert('失败: ' + e); }
+                    } catch(e) { alert('失败: ' + e); } finally {
+                        this.sending = false;
+                    }
                 },
                 getGroupRange(i) {
                      const start = (i-1)*50000 + 1;
@@ -5470,17 +6052,30 @@ EOF
                 },
                 async loadContacts(groupIndex) {
                     if(this.bulk.recipients && !confirm('覆盖当前输入框?')) return;
+                    this.sending = true;  // 显示加载状态
                     try {
-                        let url = '/api/contacts/list';
+                        // 先刷新联系人数量确保准确
+                        await this.fetchContactCount();
+                        
+                        let url = '/api/contacts/list?format=text';
                         if (this.contactCount > 50000) {
                             const limit = 50000;
                             const offset = groupIndex * limit;
-                            url += `?limit=${limit}&offset=${offset}`;
+                            url += `&limit=${limit}&offset=${offset}`;
+                            console.log(`加载分组 ${groupIndex + 1}: offset=${offset}, limit=${limit}, total=${this.contactCount}`);
                         }
                         const res = await fetch(url);
-                        const emails = await res.json();
-                        this.bulk.recipients = emails.join('\n');
-                    } catch(e) { alert('失败: ' + e); }
+                        const text = await res.text();
+                        this.bulk.recipients = text;
+                        
+                        // 显示加载结果
+                        const loadedCount = text ? text.split('\n').filter(l => l.trim()).length : 0;
+                        if (loadedCount === 0) {
+                            alert('该分组没有联系人，可能联系人数量已变化，请刷新页面');
+                        }
+                    } catch(e) { alert('加载失败: ' + e); } finally {
+                        this.sending = false;
+                    }
                 },
                 async clearContacts() {
                     if(!confirm('⚠️ 确定清空通讯录?')) return;
