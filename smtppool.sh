@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260110150033"
+SCRIPT_VERSION="20260110195936"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -2082,16 +2082,38 @@ def api_queue_stats():
             total['opened'] = opened or 0
         except: total['opened'] = 0
 
-        # Speed stats - 使用 worker_stats 获取实时速度
+        # Speed stats - 计算实时每小时速率
         try:
             with worker_stats['lock']:
-                total['speed_ph'] = worker_stats.get('success', 0)
-                total['redis_success'] = worker_stats.get('success', 0)
-                total['redis_fail'] = worker_stats.get('fail', 0)
+                now = time.time()
+                elapsed = now - worker_stats.get('minute_start', now)
+                minute_count = worker_stats.get('minute_count', 0)
+                
+                # 每分钟重置计数器
+                if elapsed >= 60:
+                    worker_stats['minute_start'] = now
+                    worker_stats['minute_count'] = 0
+                    elapsed = 0
+                    minute_count = 0
+                
+                # 计算每小时速率: (当前分钟内发送数 / 经过秒数) * 3600
+                if elapsed > 0 and minute_count > 0:
+                    speed_per_second = minute_count / elapsed
+                    speed_ph = int(speed_per_second * 3600)
+                else:
+                    speed_ph = 0
+                
+                total['speed_ph'] = speed_ph
+                total['redis_success'] = worker_stats.get('redis_success', 0)
+                total['redis_fail'] = worker_stats.get('redis_fail', 0)
+                total['total_success'] = worker_stats.get('success', 0)
+                total['total_fail'] = worker_stats.get('fail', 0)
         except: 
             total['speed_ph'] = 0
             total['redis_success'] = 0
             total['redis_fail'] = 0
+            total['total_success'] = 0
+            total['total_fail'] = 0
 
         # Node stats (只统计未完成的任务)
         rows = conn.execute("SELECT assigned_node, status, COUNT(*) as c FROM queue WHERE status NOT IN ('sent', 'failed') GROUP BY assigned_node, status").fetchall()
@@ -4098,8 +4120,8 @@ EOF
                                     <div class="small text-muted">
                                         剩余: [[ totalMails ]] 封
                                         <span v-if="qStats.total.redis_queue > 0" class="badge bg-success ms-1">Redis: [[ qStats.total.redis_queue ]]</span>
-                                        <span v-if="qStats.total.redis_success > 0" class="badge bg-primary ms-1">已发: [[ qStats.total.redis_success ]]</span>
-                                        <span v-if="qStats.total.redis_fail > 0" class="badge bg-danger ms-1">失败: [[ qStats.total.redis_fail ]]</span>
+                                        <span v-if="qStats.total.total_success > 0" class="badge bg-primary ms-1">已发: [[ qStats.total.total_success ]]</span>
+                                        <span v-if="qStats.total.total_fail > 0" class="badge bg-danger ms-1">失败: [[ qStats.total.total_fail ]]</span>
                                         | 当前速度: [[ qStats.total.speed_ph || 0 ]] 封/小时
                                         <span class="ms-2 badge bg-info-subtle text-info">成功后自动删除，不占空间</span>
                                     </div>
