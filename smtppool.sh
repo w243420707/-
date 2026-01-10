@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260110145158"
+SCRIPT_VERSION="20260110145504"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -4086,23 +4086,23 @@ EOF
                                     <div v-if="dbAnalysis" class="alert alert-info mt-3">
                                         <h6 class="mb-2"><i class="bi bi-bar-chart me-1"></i>数据库分析结果</h6>
                                         <div class="small">
-                                            <div><strong>文件大小：</strong>{{ bytesToHuman(dbAnalysis.db_file_size) }}</div>
-                                            <div v-if="dbAnalysis.wal_file_size"><strong>WAL文件：</strong>{{ bytesToHuman(dbAnalysis.wal_file_size) }}</div>
+                                            <div><strong>文件大小：</strong>[[ bytesToHuman(dbAnalysis.db_file_size) ]]</div>
+                                            <div v-if="dbAnalysis.wal_file_size"><strong>WAL文件：</strong>[[ bytesToHuman(dbAnalysis.wal_file_size) ]]</div>
                                             <hr class="my-2">
-                                            <div><strong>队列表 (queue)：</strong>{{ dbAnalysis.tables.queue.total }} 条记录</div>
+                                            <div><strong>队列表 (queue)：</strong>[[ dbAnalysis.tables.queue.total ]] 条记录</div>
                                             <div class="ms-3">
                                                 <div v-for="(count, status) in dbAnalysis.tables.queue.by_status" :key="status">
-                                                    - {{ status }}: {{ count }} 条
+                                                    - [[ status ]]: [[ count ]] 条
                                                 </div>
-                                                <div><strong>邮件内容占用：</strong>{{ bytesToHuman(dbAnalysis.tables.queue.content_size_bytes) }}</div>
+                                                <div><strong>邮件内容占用：</strong>[[ bytesToHuman(dbAnalysis.tables.queue.content_size_bytes) ]]</div>
                                             </div>
-                                            <div><strong>批量模板 (bulk_templates)：</strong>{{ dbAnalysis.tables.bulk_templates.total }} 条</div>
+                                            <div><strong>批量模板 (bulk_templates)：</strong>[[ dbAnalysis.tables.bulk_templates.total ]] 条</div>
                                             <div class="ms-3">
-                                                <strong>模板内容占用：</strong>{{ bytesToHuman(dbAnalysis.tables.bulk_templates.body_size_bytes) }}
+                                                <strong>模板内容占用：</strong>[[ bytesToHuman(dbAnalysis.tables.bulk_templates.body_size_bytes) ]]
                                             </div>
-                                            <div><strong>联系人 (contacts)：</strong>{{ dbAnalysis.tables.contacts.total }} 条</div>
-                                            <div><strong>草稿 (drafts)：</strong>{{ dbAnalysis.tables.drafts.total }} 条 ({{ bytesToHuman(dbAnalysis.tables.drafts.content_size_bytes) }})</div>
-                                            <div><strong>SMTP用户 (smtp_users)：</strong>{{ dbAnalysis.tables.smtp_users.total }} 个</div>
+                                            <div><strong>联系人 (contacts)：</strong>[[ dbAnalysis.tables.contacts.total ]] 条</div>
+                                            <div><strong>草稿 (drafts)：</strong>[[ dbAnalysis.tables.drafts.total ]] 条 ([[ bytesToHuman(dbAnalysis.tables.drafts.content_size_bytes) ]])</div>
+                                            <div><strong>SMTP用户 (smtp_users)：</strong>[[ dbAnalysis.tables.smtp_users.total ]] 个</div>
                                         </div>
                                     </div>
                                 </div>
