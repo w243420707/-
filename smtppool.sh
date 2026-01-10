@@ -4721,8 +4721,7 @@ EOF
                     newGroupName: '',
                     editingGroupIndex: null,
                     nodeSearch: '',
-                    nodeViewMode: 'card'
-                        ,
+                    nodeViewMode: 'card',
                     system: { cpu_percent: 0, mem_total: 0, mem_used: 0, mem_percent: 0, swap_total: 0, swap_used: 0, swap_percent: 0, disk_percent: 0, net_sent: 0, net_recv: 0 },
                     bulkStats: { total_expected: 0, inserted: 0, last_rate: 0.0, percent: 0.0 },
                     templateCount: 0,
