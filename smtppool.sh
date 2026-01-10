@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260108123535.3"
+SCRIPT_VERSION="20260110133808"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -2750,6 +2750,122 @@ def api_database_cleanup():
         logger.error(f"数据库清理失败: {e}")
         return jsonify({"status": "error", "error": str(e)}), 500
 
+@app.route('/api/database/reset', methods=['POST'])
+@login_required
+def api_database_reset():
+    """完全重置数据库，仅保留SMTP用户账号"""
+    try:
+        with get_db() as conn:
+            # 统计清理前的数据
+            stats = {
+                'queue': conn.execute("SELECT COUNT(*) FROM queue").fetchone()[0],
+                'contacts': conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0],
+                'drafts': conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0],
+                'bulk_templates': conn.execute("SELECT COUNT(*) FROM bulk_templates").fetchone()[0],
+                'smtp_users': conn.execute("SELECT COUNT(*) FROM smtp_users").fetchone()[0]
+            }
+            
+            # 清空所有非用户数据表
+            conn.execute("DELETE FROM queue")
+            conn.execute("DELETE FROM contacts")
+            conn.execute("DELETE FROM drafts")
+            conn.execute("DELETE FROM bulk_templates")
+            
+            # 保留smtp_users表不动
+        
+        # 回收数据库空间
+        import subprocess
+        db_path = DB_FILE
+        try:
+            subprocess.run(['sqlite3', db_path, 'VACUUM'], timeout=60, check=True)
+            vacuumed = True
+        except:
+            vacuumed = False
+        
+        return jsonify({
+            "status": "ok",
+            "cleared": stats,
+            "vacuumed": vacuumed
+        })
+    except Exception as e:
+        logger.error(f"数据库重置失败: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+@app.route('/api/database/analyze', methods=['GET'])
+@login_required
+def api_database_analyze():
+    """分析数据库各表大小和记录数"""
+    try:
+        import os
+        results = {}
+        
+        # 获取数据库文件大小
+        db_path = DB_FILE
+        if os.path.exists(db_path):
+            results['db_file_size'] = os.path.getsize(db_path)
+        if os.path.exists(db_path + '-wal'):
+            results['wal_file_size'] = os.path.getsize(db_path + '-wal')
+        if os.path.exists(db_path + '-shm'):
+            results['shm_file_size'] = os.path.getsize(db_path + '-shm')
+        
+        with get_db() as conn:
+            # 各表记录数和状态分布
+            tables_info = {}
+            
+            # queue表详细信息
+            queue_counts = {}
+            for row in conn.execute("SELECT status, COUNT(*) as cnt FROM queue GROUP BY status").fetchall():
+                queue_counts[row[0]] = row[1]
+            
+            # queue表按source统计
+            source_counts = {}
+            for row in conn.execute("SELECT source, COUNT(*) as cnt FROM queue GROUP BY source").fetchall():
+                source_counts[row[0] or 'null'] = row[1]
+            
+            # 计算content字段总大小
+            content_size = conn.execute("SELECT SUM(LENGTH(content)) FROM queue").fetchone()[0] or 0
+            
+            tables_info['queue'] = {
+                'total': conn.execute("SELECT COUNT(*) FROM queue").fetchone()[0],
+                'by_status': queue_counts,
+                'by_source': source_counts,
+                'content_size_bytes': content_size
+            }
+            
+            # contacts表
+            tables_info['contacts'] = {
+                'total': conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+            }
+            
+            # drafts表
+            drafts_count = conn.execute("SELECT COUNT(*) FROM drafts").fetchone()[0]
+            drafts_size = conn.execute("SELECT SUM(LENGTH(content)) FROM drafts").fetchone()[0] or 0
+            tables_info['drafts'] = {
+                'total': drafts_count,
+                'content_size_bytes': drafts_size
+            }
+            
+            # smtp_users表
+            tables_info['smtp_users'] = {
+                'total': conn.execute("SELECT COUNT(*) FROM smtp_users").fetchone()[0],
+                'enabled': conn.execute("SELECT COUNT(*) FROM smtp_users WHERE enabled=1").fetchone()[0]
+            }
+            
+            # bulk_templates表
+            templates_count = conn.execute("SELECT COUNT(*) FROM bulk_templates").fetchone()[0]
+            templates_body_size = conn.execute("SELECT SUM(LENGTH(body)) FROM bulk_templates").fetchone()[0] or 0
+            tables_info['bulk_templates'] = {
+                'total': templates_count,
+                'body_size_bytes': templates_body_size
+            }
+            
+            results['tables'] = tables_info
+        
+        return jsonify({"status": "ok", "data": results})
+    except Exception as e:
+        logger.error(f"数据库分析失败: {e}")
+        return jsonify({"status": "error", "error": str(e)}), 500
+
 def rebalance_queue_internal():
     cfg = load_config(use_cache=False)  # Force fresh config
     pool = [n for n in cfg.get('downstream_pool', []) if n.get('enabled', True)]
@@ -3937,7 +4053,7 @@ EOF
                                         <i class="bi bi-exclamation-triangle me-2"></i>
                                         <strong>首次更新脚本后，</strong>如果有旧版本遗留的已发送/失败记录，可以点击下方按钮一键清理并回收空间。
                                     </div>
-                                    <div class="d-flex gap-2">
+                                    <div class="d-flex gap-2 mb-2">
                                         <button class="btn btn-outline-danger" @click="cleanupDatabase(false)" :disabled="cleaningDb">
                                             <span v-if="cleaningDb" class="spinner-border spinner-border-sm me-1"></span>
                                             <i v-else class="bi bi-trash me-1"></i>
@@ -3948,10 +4064,46 @@ EOF
                                             <i v-else class="bi bi-trash3 me-1"></i>
                                             深度清理（含模板）
                                         </button>
+                                        <button class="btn btn-outline-primary" @click="analyzeDatabase" :disabled="analyzingDb">
+                                            <span v-if="analyzingDb" class="spinner-border spinner-border-sm me-1"></span>
+                                            <i v-else class="bi bi-search me-1"></i>
+                                            分析数据库
+                                        </button>
+                                    </div>
+                                    <div class="d-flex gap-2">
+                                        <button class="btn btn-warning" @click="resetDatabase" :disabled="resettingDb">
+                                            <span v-if="resettingDb" class="spinner-border spinner-border-sm me-1"></span>
+                                            <i v-else class="bi bi-arrow-clockwise me-1"></i>
+                                            完全重置数据库
+                                        </button>
+                                        <span class="badge bg-info text-dark align-self-center">仅保留SMTP用户</span>
                                     </div>
                                     <div class="form-text mt-2">
-                                        清理内容：sent状态记录 + failed状态记录 + VACUUM回收空间<br>
-                                        深度清理：额外清理所有预生成的邮件模板
+                                        <strong>清理旧记录：</strong>sent状态 + failed状态 + VACUUM回收<br>
+                                        <strong>深度清理：</strong>额外清理所有批量邮件模板<br>
+                                        <strong>完全重置：</strong>清空所有数据（队列/联系人/草稿/模板），仅保留SMTP用户账号
+                                    </div>
+                                    <div v-if="dbAnalysis" class="alert alert-info mt-3">
+                                        <h6 class="mb-2"><i class="bi bi-bar-chart me-1"></i>数据库分析结果</h6>
+                                        <div class="small">
+                                            <div><strong>文件大小：</strong>{{ bytesToHuman(dbAnalysis.db_file_size) }}</div>
+                                            <div v-if="dbAnalysis.wal_file_size"><strong>WAL文件：</strong>{{ bytesToHuman(dbAnalysis.wal_file_size) }}</div>
+                                            <hr class="my-2">
+                                            <div><strong>队列表 (queue)：</strong>{{ dbAnalysis.tables.queue.total }} 条记录</div>
+                                            <div class="ms-3">
+                                                <div v-for="(count, status) in dbAnalysis.tables.queue.by_status" :key="status">
+                                                    - {{ status }}: {{ count }} 条
+                                                </div>
+                                                <div><strong>邮件内容占用：</strong>{{ bytesToHuman(dbAnalysis.tables.queue.content_size_bytes) }}</div>
+                                            </div>
+                                            <div><strong>批量模板 (bulk_templates)：</strong>{{ dbAnalysis.tables.bulk_templates.total }} 条</div>
+                                            <div class="ms-3">
+                                                <strong>模板内容占用：</strong>{{ bytesToHuman(dbAnalysis.tables.bulk_templates.body_size_bytes) }}
+                                            </div>
+                                            <div><strong>联系人 (contacts)：</strong>{{ dbAnalysis.tables.contacts.total }} 条</div>
+                                            <div><strong>草稿 (drafts)：</strong>{{ dbAnalysis.tables.drafts.total }} 条 ({{ bytesToHuman(dbAnalysis.tables.drafts.content_size_bytes) }})</div>
+                                            <div><strong>SMTP用户 (smtp_users)：</strong>{{ dbAnalysis.tables.smtp_users.total }} 个</div>
+                                        </div>
                                     </div>
                                 </div>
                                 <div class="row g-3">
@@ -4561,6 +4713,9 @@ EOF
                     batchUserForm: { type: 'monthly', count: 10, prefix: '' },
                     batchGenerating: false,
                     cleaningDb: false,
+                    analyzingDb: false,
+                    resettingDb: false,
+                    dbAnalysis: null,
                     nodeGroupFilter: '',
                     showGroupModal: false,
                     newGroupName: '',
@@ -4874,6 +5029,56 @@ EOF
                         alert('清理失败: ' + err.message);
                     } finally {
                         this.cleaningDb = false;
+                    }
+                },
+                async analyzeDatabase() {
+                    this.analyzingDb = true;
+                    this.dbAnalysis = null;
+                    try {
+                        const res = await fetch('/api/database/analyze');
+                        const result = await res.json();
+                        if (res.ok && result.status === 'ok') {
+                            this.dbAnalysis = result.data;
+                        } else {
+                            alert('分析失败: ' + (result.error || '未知错误'));
+                        }
+                    } catch (err) {
+                        alert('分析失败: ' + err.message);
+                    } finally {
+                        this.analyzingDb = false;
+                    }
+                },
+                async resetDatabase() {
+                    if (!confirm('⚠️ 警告：此操作将清空数据库中的所有数据！\n\n将被删除：\n✓ 所有邮件队列记录\n✓ 所有联系人\n✓ 所有草稿\n✓ 所有批量模板\n\n保留内容：\n✓ SMTP用户账号\n\n此操作不可撤销，确定继续？')) return;
+                    if (!confirm('再次确认：您真的要完全重置数据库吗？')) return;
+                    
+                    this.resettingDb = true;
+                    try {
+                        const res = await fetch('/api/database/reset', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                        const data = await res.json();
+                        if (res.ok) {
+                            const c = data.cleared || {};
+                            let msg = `数据库已重置！\n\n已清理：\n`;
+                            msg += `- 邮件队列: ${c.queue || 0} 条\n`;
+                            msg += `- 联系人: ${c.contacts || 0} 条\n`;
+                            msg += `- 草稿: ${c.drafts || 0} 条\n`;
+                            msg += `- 批量模板: ${c.bulk_templates || 0} 条\n\n`;
+                            msg += `保留了 ${c.smtp_users || 0} 个SMTP用户账号\n\n`;
+                            msg += `数据库已优化完成`;
+                            alert(msg);
+                            // 刷新页面数据
+                            await this.load();
+                            this.dbAnalysis = null;
+                        } else {
+                            alert('重置失败: ' + (data.error || '未知错误'));
+                        }
+                    } catch (err) {
+                        alert('重置失败: ' + err.message);
+                    } finally {
+                        this.resettingDb = false;
                     }
                 },
                 nodeExists(name) {
