@@ -1382,27 +1382,65 @@ def node_sender(node_name, task_queue):
     
     while not worker_stop_event.is_set():
         try:
+            cfg = get_cached_config()
+            bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
+            
+            # 停止状态：清空队列中的所有 bulk 任务
+            if bulk_ctrl == 'stopped':
+                cleared = 0
+                while True:
+                    try:
+                        t = task_queue.get_nowait()
+                        # 只丢弃 bulk 任务，relay 任务放回
+                        if t.get('source') != 'bulk':
+                            task_queue.put(t)
+                        else:
+                            cleared += 1
+                        task_queue.task_done()
+                    except Empty:
+                        break
+                if cleared > 0:
+                    logger.info(f"🗑️ [{node_name}] 已清除 {cleared} 个 bulk 任务")
+                time.sleep(1)
+                continue
+            
             # 从内存队列获取任务（阻塞等待最多1秒）
             try:
                 task = task_queue.get(timeout=1)
             except Empty:
                 continue
             
+            # 取到任务后再次检查状态
             cfg = get_cached_config()
+            bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
+            source = task.get('source', '')
+            is_bulk = (source == 'bulk')
+            
+            # 如果是 bulk 任务且已停止，丢弃
+            if is_bulk and bulk_ctrl == 'stopped':
+                task_queue.task_done()
+                continue
+            
+            # 如果是 bulk 任务且已暂停，放回队列
+            if is_bulk and bulk_ctrl == 'paused':
+                task_queue.put(task)
+                task_queue.task_done()
+                time.sleep(1)
+                continue
+            
             pool_cfg = {n['name']: n for n in cfg.get('downstream_pool', [])}
             node = pool_cfg.get(node_name)
             
             if not node or not node.get('enabled', True):
                 # 节点已禁用，任务放回队列等待重分配
                 task_queue.put(task)
+                task_queue.task_done()
                 time.sleep(1)
                 continue
             
             row_id = task['id']
             rcpt_tos = task['rcpt_tos']
             msg_content = task['content']
-            source = task['source']
-            is_bulk = (source == 'bulk')
             smtp_user = task.get('smtp_user') if isinstance(task, dict) else None
             
             error_msg = ""
@@ -1769,6 +1807,30 @@ def dispatcher_thread():
         try:
             cfg = get_cached_config()
             bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
+            
+            # 停止状态：清空所有节点队列中的 bulk 任务
+            if bulk_ctrl == 'stopped':
+                with node_queue_lock:
+                    for nname, q in list(node_queues.items()):
+                        cleared = 0
+                        temp_tasks = []
+                        while True:
+                            try:
+                                t = q.get_nowait()
+                                if t.get('source') != 'bulk':
+                                    temp_tasks.append(t)
+                                else:
+                                    cleared += 1
+                            except Empty:
+                                break
+                        # 把非 bulk 任务放回
+                        for t in temp_tasks:
+                            try:
+                                q.put_nowait(t)
+                            except:
+                                pass
+                time.sleep(1)
+                continue
             
             # 获取所有启用的节点
             enabled_nodes = {n['name'] for n in cfg.get('downstream_pool', []) if n.get('enabled', True)}
@@ -3808,7 +3870,7 @@ def api_bulk_control():
         except Exception as e:
             logger.error(f"清理 Redis 队列失败: {e}")
         
-        # 清空所有节点的内存队列
+        # 清空所有节点的内存队列 (Redis 系统)
         mem_cleared = 0
         try:
             for node_name, q in list(_redis_node_queues.items()):
@@ -3819,9 +3881,27 @@ def api_bulk_control():
                     except:
                         break
         except Exception as e:
-            logger.error(f"清理内存队列失败: {e}")
+            logger.error(f"清理 Redis 内存队列失败: {e}")
         
-        logger.info(f"⏹️ 群发已停止，清理了 SQLite: {deleted} 封, Redis: {redis_deleted} 封, 内存: {mem_cleared} 封")
+        # 清空所有节点的内存队列 (SQLite 系统)
+        sqlite_mem_cleared = 0
+        try:
+            with node_queue_lock:
+                for node_name, q in list(node_queues.items()):
+                    while True:
+                        try:
+                            task = q.get_nowait()
+                            # 只清除 bulk 任务，relay 任务放回
+                            if task.get('source') != 'bulk':
+                                q.put(task)
+                            else:
+                                sqlite_mem_cleared += 1
+                        except:
+                            break
+        except Exception as e:
+            logger.error(f"清理 SQLite 内存队列失败: {e}")
+        
+        logger.info(f"⏹️ 群发已停止，清理了 SQLite: {deleted} 封, Redis: {redis_deleted} 封, Redis内存: {mem_cleared} 封, SQLite内存: {sqlite_mem_cleared} 封")
         
     return jsonify({"status": "ok", "current": cfg['bulk_control']['status']})
 
@@ -6917,6 +6997,7 @@ show_menu() {
     echo -e "${GREEN}4.${PLAIN} 重启服务"
     echo -e "${GREEN}5.${PLAIN} 查看日志"
     echo -e "${GREEN}6.${PLAIN} 命令行强制重置密码"
+    echo -e "${YELLOW}7.${PLAIN} 停止并清空全部群发任务"
     echo -e "${RED}0.${PLAIN} 卸载"
     echo -e "============================================"
     read -p "选择: " num
@@ -6932,6 +7013,71 @@ show_menu() {
            cd $APP_DIR
            $VENV_DIR/bin/python3 -c "import json; f='config.json'; d=json.load(open(f)); d['web_config']['admin_password']='$new_pass'; json.dump(d, open(f,'w'), indent=4)"
            echo -e "${GREEN}✅ 密码已重置${PLAIN}"
+           ;;
+        7)
+           echo -e "${YELLOW}正在停止并清空全部群发任务...${PLAIN}"
+           cd $APP_DIR
+           $VENV_DIR/bin/python3 << 'PYEOF'
+import json
+import sqlite3
+import os
+
+# 1. 设置状态为 stopped
+try:
+    with open('config.json', 'r') as f:
+        cfg = json.load(f)
+    if 'bulk_control' not in cfg:
+        cfg['bulk_control'] = {}
+    cfg['bulk_control']['status'] = 'stopped'
+    with open('config.json', 'w') as f:
+        json.dump(cfg, f, indent=4)
+    print("✅ 已设置群发状态为 stopped")
+except Exception as e:
+    print(f"❌ 设置状态失败: {e}")
+
+# 2. 清空 SQLite 中的 bulk 任务
+try:
+    conn = sqlite3.connect('smtp_queue.db')
+    cur = conn.cursor()
+    cur.execute("DELETE FROM queue WHERE source='bulk' AND (status='pending' OR status='processing')")
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+    print(f"✅ 已从 SQLite 删除 {deleted} 个 bulk 任务")
+except Exception as e:
+    print(f"❌ 清空 SQLite 失败: {e}")
+
+# 3. 清空 Redis 队列
+try:
+    import redis
+    with open('config.json', 'r') as f:
+        cfg = json.load(f)
+    redis_cfg = cfg.get('redis_config', {})
+    if redis_cfg.get('enabled'):
+        r = redis.Redis(
+            host=redis_cfg.get('host', 'localhost'),
+            port=int(redis_cfg.get('port', 6379)),
+            password=redis_cfg.get('password') or None,
+            db=int(redis_cfg.get('db', 0))
+        )
+        redis_deleted = r.llen('smtp:bulk:queue') or 0
+        r.delete('smtp:bulk:queue')
+        print(f"✅ 已从 Redis 删除 {redis_deleted} 个任务")
+    else:
+        print("ℹ️ Redis 未启用，跳过")
+except ImportError:
+    print("ℹ️ Redis 模块未安装，跳过")
+except Exception as e:
+    print(f"❌ 清空 Redis 失败: {e}")
+
+print("\n🎉 完成！建议重启服务以确保所有线程立即停止。")
+PYEOF
+           echo ""
+           read -p "是否重启服务? (y/n): " restart_choice
+           if [ "$restart_choice" = "y" ] || [ "$restart_choice" = "Y" ]; then
+               supervisorctl restart smtp-web
+               echo -e "${GREEN}✅ 服务已重启${PLAIN}"
+           fi
            ;;
         0) uninstall_smtp ;;
         *) echo -e "${RED}无效${PLAIN}" ;;
