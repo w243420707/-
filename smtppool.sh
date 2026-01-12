@@ -15,7 +15,7 @@ VENV_DIR="$APP_DIR/venv"
 CONFIG_FILE="$APP_DIR/config.json"
 # 发行/脚本版本号（每次修改一键安装脚本时务必更新此处）
 # 格式建议：YYYYMMDD.N (例如 20260108.1)
-SCRIPT_VERSION="20260110195936"
+SCRIPT_VERSION="20260110150033"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -942,6 +942,29 @@ def redis_dispatcher_thread():
                 cached_cfg = load_config(use_cache=False)
                 last_config_check = now
                 
+                # 构建当前启用的节点集合
+                current_enabled = set()
+                for n in cached_cfg.get('downstream_pool', []):
+                    if n.get('enabled', True) and n.get('allow_bulk', True):
+                        current_enabled.add(n.get('name'))
+                
+                # 清理被禁用节点的内存队列，将任务重新放回 Redis
+                for node_name in list(_redis_node_queues.keys()):
+                    if node_name not in current_enabled:
+                        q = _redis_node_queues.get(node_name)
+                        if q:
+                            drained = 0
+                            while True:
+                                try:
+                                    task = q.get_nowait()
+                                    # 重新放回 Redis 队列，下次会分配到其他节点
+                                    r.lpush(REDIS_QUEUE_KEY, json.dumps(task))
+                                    drained += 1
+                                except:
+                                    break
+                            if drained > 0:
+                                logger.info(f"♻️ 节点 {node_name} 已禁用，回收 {drained} 个任务到 Redis 队列")
+                
                 # 确保每个启用的节点都有队列和工作线程
                 enabled_nodes = [n for n in cached_cfg.get('downstream_pool', []) if n.get('enabled', True)]
                 for node in enabled_nodes:
@@ -1034,7 +1057,7 @@ def redis_node_sender(node_name, task_queue):
     logger.info(f"🚀 Redis 节点发送线程启动: {node_name}")
     
     last_config_check = 0
-    config_check_interval = 5
+    config_check_interval = 2  # 每2秒检查一次配置变化
     cached_cfg = None
     local_success = 0
     local_fail = 0
@@ -1099,6 +1122,41 @@ def redis_node_sender(node_name, task_queue):
                     task_queue.put(task)
                     time.sleep(1)
                 continue
+            
+            # 检查分流规则：如果收件人域名在此节点的排除列表中，重新分配
+            rcpt_domain = rcpt.split('@')[-1].lower() if '@' in rcpt else ''
+            routing_rules = node.get('routing_rules', '')
+            if routing_rules and rcpt_domain:
+                excluded_domains = set(d.strip().lower() for d in routing_rules.split(',') if d.strip())
+                if rcpt_domain in excluded_domains:
+                    # 此域名被当前节点排除，找一个不排除此域名的节点
+                    suitable_nodes = []
+                    for n in cfg.get('downstream_pool', []):
+                        if not n.get('enabled', True) or not n.get('allow_bulk', True):
+                            continue
+                        if n.get('name') == node_name:
+                            continue
+                        if n.get('name') not in _redis_node_queues:
+                            continue
+                        n_rules = n.get('routing_rules', '')
+                        if n_rules:
+                            n_excluded = set(d.strip().lower() for d in n_rules.split(',') if d.strip())
+                            if rcpt_domain in n_excluded:
+                                continue  # 这个节点也排除此域名
+                        suitable_nodes.append(n)
+                    
+                    if suitable_nodes:
+                        alt_node = suitable_nodes[hash(rcpt) % len(suitable_nodes)]
+                        alt_name = alt_node.get('name')
+                        try:
+                            _redis_node_queues[alt_name].put_nowait(task)
+                        except:
+                            task_queue.put(task)
+                            time.sleep(0.5)
+                        continue
+                    else:
+                        # 所有节点都排除此域名，记录警告但仍发送
+                        logger.warning(f"⚠️ [{node_name}] 域名 {rcpt_domain} 被所有节点排除，强制发送")
             
             # 构建发件人
             sender = None
