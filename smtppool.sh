@@ -792,6 +792,19 @@ worker_stats = {
 }
 worker_stop_event = threading.Event()
 
+# 群发立即停止标志 - 全局变量，检查时无需读取文件
+bulk_stop_flag = {'stopped': False, 'lock': threading.Lock()}
+
+def is_bulk_stopped():
+    """快速检查群发是否已停止（不读取文件）"""
+    with bulk_stop_flag['lock']:
+        return bulk_stop_flag['stopped']
+
+def set_bulk_stopped(stopped=True):
+    """设置群发停止标志"""
+    with bulk_stop_flag['lock']:
+        bulk_stop_flag['stopped'] = stopped
+
 # 节点健康统计 (用于显示每个节点的成功/失败数)
 node_health_stats = {'lock': threading.Lock()}
 
@@ -931,6 +944,18 @@ def redis_dispatcher_thread():
     
     while True:
         try:
+            # 快速检查内存停止标志（最快路径）
+            if is_bulk_stopped():
+                # 停止状态下，清空所有节点的内存队列
+                for nname, q in list(_redis_node_queues.items()):
+                    while True:
+                        try:
+                            q.get_nowait()
+                        except:
+                            break
+                time.sleep(0.5)
+                continue
+            
             r = get_redis()
             if not r:
                 logger.warning("⚠️ Redis 调度器: 无法连接 Redis，等待重试...")
@@ -939,9 +964,10 @@ def redis_dispatcher_thread():
             
             now = time.time()
             
-            # 每次循环都检查 bulk_control 状态（不使用缓存）
+            # 检查配置文件状态
             bulk_ctrl = load_config(use_cache=False).get('bulk_control', {}).get('status', 'running')
             if bulk_ctrl == 'stopped':
+                set_bulk_stopped(True)  # 同步内存标志
                 if now - last_status_log > 30:
                     logger.info(f"⏹️ [Redis调度器] 群发已停止")
                     last_status_log = now
@@ -952,7 +978,7 @@ def redis_dispatcher_thread():
                             q.get_nowait()
                         except:
                             break
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
             elif bulk_ctrl == 'paused':
                 if now - last_status_log > 30:
@@ -1079,7 +1105,18 @@ def redis_node_sender(node_name, task_queue):
     
     while True:
         try:
-            # 先检查状态，避免在停止状态下取任务
+            # 快速检查内存停止标志（最快路径）
+            if is_bulk_stopped():
+                # 已停止，清空队列中的所有任务
+                while True:
+                    try:
+                        task_queue.get_nowait()
+                    except:
+                        break
+                time.sleep(0.5)
+                continue
+            
+            # 检查配置文件状态
             now = time.time()
             if cached_cfg is None or (now - last_config_check) > config_check_interval:
                 cached_cfg = load_config(use_cache=False)
@@ -1087,13 +1124,14 @@ def redis_node_sender(node_name, task_queue):
             
             bulk_ctrl = cached_cfg.get('bulk_control', {}).get('status', 'running')
             if bulk_ctrl == 'stopped':
+                set_bulk_stopped(True)  # 同步内存标志
                 # 已停止，清空队列中的所有任务
                 while True:
                     try:
                         task_queue.get_nowait()
                     except:
                         break
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
             elif bulk_ctrl == 'paused':
                 time.sleep(1)
@@ -1101,10 +1139,13 @@ def redis_node_sender(node_name, task_queue):
             
             # 获取任务
             try:
-                task = task_queue.get(timeout=2)
+                task = task_queue.get(timeout=1)
             except:
                 continue
             
+            # 取到任务后再次检查停止标志
+            if is_bulk_stopped():
+                continue
             # 取到任务后再次检查状态（双重检查）
             cached_cfg = load_config(use_cache=False)
             last_config_check = time.time()
@@ -1248,9 +1289,8 @@ def redis_node_sender(node_name, task_queue):
                     m.attach(MIMEText(body or '', 'html', 'utf-8'))
                     msg_content = m.as_bytes()
                 
-                # 发送前最后一次检查状态
-                final_check = load_config(use_cache=False).get('bulk_control', {}).get('status', 'running')
-                if final_check == 'stopped':
+                # 发送前最后一次检查停止标志（内存检查，最快）
+                if is_bulk_stopped():
                     continue
                 
                 # 发送邮件
@@ -1389,12 +1429,31 @@ def node_sender(node_name, task_queue):
     
     while not worker_stop_event.is_set():
         try:
-            # 状态检查不使用缓存，确保立即响应停止命令
+            # 快速检查内存停止标志（最快路径）
+            if is_bulk_stopped():
+                cleared = 0
+                while True:
+                    try:
+                        t = task_queue.get_nowait()
+                        if t.get('source') != 'bulk':
+                            task_queue.put(t)
+                        else:
+                            cleared += 1
+                        task_queue.task_done()
+                    except Empty:
+                        break
+                if cleared > 0:
+                    logger.info(f"🗑️ [{node_name}] 已清除 {cleared} 个 bulk 任务")
+                time.sleep(0.5)
+                continue
+            
+            # 检查配置文件状态
             cfg = load_config(use_cache=False)
             bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
             
             # 停止状态：清空队列中的所有 bulk 任务
             if bulk_ctrl == 'stopped':
+                set_bulk_stopped(True)  # 同步内存标志
                 cleared = 0
                 while True:
                     try:
@@ -1409,7 +1468,7 @@ def node_sender(node_name, task_queue):
                         break
                 if cleared > 0:
                     logger.info(f"🗑️ [{node_name}] 已清除 {cleared} 个 bulk 任务")
-                time.sleep(1)
+                time.sleep(0.5)
                 continue
             
             # 从内存队列获取任务（阻塞等待最多1秒）
@@ -1418,7 +1477,12 @@ def node_sender(node_name, task_queue):
             except Empty:
                 continue
             
-            # 取到任务后再次检查状态（不使用缓存）
+            # 取到任务后再次检查停止标志
+            if is_bulk_stopped():
+                if task.get('source') == 'bulk':
+                    task_queue.task_done()
+                    continue
+            
             cfg = load_config(use_cache=False)
             bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
             source = task.get('source', '')
@@ -1451,12 +1515,10 @@ def node_sender(node_name, task_queue):
             msg_content = task['content']
             smtp_user = task.get('smtp_user') if isinstance(task, dict) else None
             
-            # 发送前最后一次检查状态
-            if is_bulk:
-                final_check = load_config(use_cache=False).get('bulk_control', {}).get('status', 'running')
-                if final_check == 'stopped':
-                    task_queue.task_done()
-                    continue
+            # 发送前最后一次检查停止标志（内存检查，最快）
+            if is_bulk and is_bulk_stopped():
+                task_queue.task_done()
+                continue
             
             error_msg = ""
             success = False
@@ -1820,12 +1882,33 @@ def dispatcher_thread():
     
     while not worker_stop_event.is_set():
         try:
-            # 状态检查不使用缓存，确保立即响应停止命令
+            # 快速检查内存停止标志（最快路径）
+            if is_bulk_stopped():
+                with node_queue_lock:
+                    for nname, q in list(node_queues.items()):
+                        temp_tasks = []
+                        while True:
+                            try:
+                                t = q.get_nowait()
+                                if t.get('source') != 'bulk':
+                                    temp_tasks.append(t)
+                            except Empty:
+                                break
+                        for t in temp_tasks:
+                            try:
+                                q.put_nowait(t)
+                            except:
+                                pass
+                time.sleep(0.5)
+                continue
+            
+            # 检查配置文件状态
             cfg = load_config(use_cache=False)
             bulk_ctrl = cfg.get('bulk_control', {}).get('status', 'running')
             
             # 停止状态：清空所有节点队列中的 bulk 任务
             if bulk_ctrl == 'stopped':
+                set_bulk_stopped(True)  # 同步内存标志
                 with node_queue_lock:
                     for nname, q in list(node_queues.items()):
                         cleared = 0
@@ -3846,14 +3929,22 @@ def api_bulk_control():
     elif action == 'resume':
         cfg['bulk_control']['status'] = 'running'
         save_config(cfg)
+        # 清除停止标志
+        set_bulk_stopped(False)
         logger.info("▶️ 群发已恢复")
         # 确保 Redis 消费者在运行
         if is_redis_enabled():
             start_redis_consumer()
     elif action == 'stop':
-        # 设置状态为 stopped
+        # 立即设置全局停止标志（内存中，所有线程立即看到）
+        set_bulk_stopped(True)
+        
+        # 设置状态为 stopped（持久化到文件）
         cfg['bulk_control']['status'] = 'stopped'
         save_config(cfg)
+        
+        # 清除配置缓存，确保所有线程立即读取新状态
+        invalidate_config_cache()
         
         # 重置统计计数器
         try:
