@@ -2460,6 +2460,22 @@ def bulk_import_task(raw_recipients, subjects, bodies, pool, scheduled_at=None):
         except Exception:
             pass
 
+        # 重置统计计数器（新任务开始）
+        try:
+            with worker_stats['lock']:
+                worker_stats['success'] = 0
+                worker_stats['fail'] = 0
+                worker_stats['minute_count'] = 0
+                worker_stats['minute_start'] = time.time()
+                worker_stats['redis_success'] = 0
+                worker_stats['redis_fail'] = 0
+            with node_health_stats['lock']:
+                for key in list(node_health_stats.keys()):
+                    if key != 'lock':
+                        node_health_stats[key] = {'success': 0, 'fail': 0}
+        except Exception:
+            pass
+
         # Initialize bulk stats
         with bulk_stats_lock:
             bulk_stats['total_expected'] = 0
@@ -3724,6 +3740,23 @@ def api_bulk_control():
         # 设置状态为 stopped
         cfg['bulk_control']['status'] = 'stopped'
         save_config(cfg)
+        
+        # 重置统计计数器
+        try:
+            with worker_stats['lock']:
+                worker_stats['success'] = 0
+                worker_stats['fail'] = 0
+                worker_stats['minute_count'] = 0
+                worker_stats['minute_start'] = time.time()
+                worker_stats['redis_success'] = 0
+                worker_stats['redis_fail'] = 0
+            with node_health_stats['lock']:
+                for key in list(node_health_stats.keys()):
+                    if key != 'lock':
+                        node_health_stats[key] = {'success': 0, 'fail': 0}
+            logger.info("📊 已重置统计计数器")
+        except Exception as e:
+            logger.error(f"重置统计计数器失败: {e}")
         
         # Stop means clear pending bulk from SQLite
         with get_db() as conn:
