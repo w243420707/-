@@ -993,7 +993,14 @@ def redis_dispatcher_thread():
                 if now - last_status_log > 30:
                     logger.info(f"⏹️ [Redis调度器] 群发已停止")
                     last_status_log = now
-                time.sleep(2)
+                # 停止状态下，清空所有节点的内存队列
+                for nname, q in list(_redis_node_queues.items()):
+                    while True:
+                        try:
+                            q.get_nowait()
+                        except:
+                            break
+                time.sleep(1)
                 continue
             
             # 每 60 秒打印一次状态信息
@@ -1001,6 +1008,12 @@ def redis_dispatcher_thread():
                 queue_len = r.llen(REDIS_QUEUE_KEY) or 0
                 logger.info(f"📊 [Redis调度器] 状态: 已分发 {dispatched_count}, 队列剩余 {queue_len}, 节点数 {len(_redis_node_queues)}")
                 last_status_log = now
+            
+            # 从 Redis 获取任务前再次检查状态
+            bulk_ctrl = load_config(use_cache=False).get('bulk_control', {}).get('status', 'running')
+            if bulk_ctrl != 'running':
+                time.sleep(0.5)
+                continue
             
             # 从 Redis 获取任务
             result = r.brpop(REDIS_QUEUE_KEY, timeout=1)
@@ -1064,10 +1077,43 @@ def redis_node_sender(node_name, task_queue):
     
     while True:
         try:
+            # 先检查状态，避免在停止状态下取任务
+            now = time.time()
+            if cached_cfg is None or (now - last_config_check) > config_check_interval:
+                cached_cfg = load_config(use_cache=False)
+                last_config_check = now
+            
+            bulk_ctrl = cached_cfg.get('bulk_control', {}).get('status', 'running')
+            if bulk_ctrl == 'stopped':
+                # 已停止，清空队列中的所有任务
+                while True:
+                    try:
+                        task_queue.get_nowait()
+                    except:
+                        break
+                time.sleep(1)
+                continue
+            elif bulk_ctrl == 'paused':
+                time.sleep(1)
+                continue
+            
             # 获取任务
             try:
                 task = task_queue.get(timeout=2)
             except:
+                continue
+            
+            # 取到任务后再次检查状态（双重检查）
+            cached_cfg = load_config(use_cache=False)
+            last_config_check = time.time()
+            bulk_ctrl = cached_cfg.get('bulk_control', {}).get('status', 'running')
+            if bulk_ctrl == 'stopped':
+                # 已停止，丢弃任务
+                continue
+            elif bulk_ctrl == 'paused':
+                # 暂停，放回队列
+                task_queue.put(task)
+                time.sleep(1)
                 continue
             
             # 检查配置
@@ -1077,16 +1123,6 @@ def redis_node_sender(node_name, task_queue):
                 last_config_check = now
             
             # 检查暂停或停止状态
-            bulk_ctrl = cached_cfg.get('bulk_control', {}).get('status', 'running')
-            if bulk_ctrl == 'paused':
-                # 放回队列
-                task_queue.put(task)
-                time.sleep(1)
-                continue
-            elif bulk_ctrl == 'stopped':
-                # 已停止，丢弃任务
-                continue
-            
             # 解析任务
             rcpt = task.get('r')
             subject = task.get('s')
