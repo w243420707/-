@@ -27,11 +27,18 @@ log_error() { printf "${RED}[ERROR]${NC} %s\n" "$1"; }
 # cf-ddns.sh -k cloudflare-api-key \
 #            -u user@example.com \
 #            -h host.example.com \     # fqdn of the record you want to update
-#            -z example.com \          # will show you all zones if forgot, but you need this
 #            -t A|AAAA                 # specify ipv4/ipv6, default: ipv4
+#
+# The zone (main domain) is detected automatically from -h, so -z is no longer
+# required. It is still accepted as an explicit override.
 
 # Optional flags:
+#            -z example.com \          # zone override, auto-detected when omitted
 #            -f false|true \           # force dns update, disregard local stored ip
+
+# Changelog:
+#   v2.3 - Zone auto-detection: only the full DDNS hostname is asked, -z optional.
+#   v2.2 - Telegram notifications, IPv6 support, install mode.
 
 # ==============================================================================
 # INSTALLATION MODE
@@ -68,9 +75,10 @@ if [ "${1:-}" = "install" ]; then
       esac
     done
 
-    clear
+    # 非交互环境（无 TERM）下 clear 会返回非零，别让 errexit 把脚本干掉
+    clear 2>/dev/null || true
     echo -e "${CYAN}============================================================${NC}"
-    echo -e "${CYAN}       Cloudflare DDNS 一键安装脚本 (v2.2)                  ${NC}"
+    echo -e "${CYAN}       Cloudflare DDNS 一键安装脚本 (v2.3)                  ${NC}"
     echo -e "${CYAN}============================================================${NC}"
     echo ""
 
@@ -145,24 +153,28 @@ if [ "${1:-}" = "install" ]; then
         log_info "邮箱已提供: $CFUSER"
     fi
 
-    if [[ -z "$CFZONE_NAME" ]]; then
-        read -p "主域名 (Zone Name, 例如 example.com): " CFZONE_NAME
-        while [[ -z "$CFZONE_NAME" ]]; do
-            log_error "主域名不能为空。"
-            read -p "主域名: " CFZONE_NAME
-        done
-    else
-        log_info "主域名已提供: $CFZONE_NAME"
-    fi
-
     if [[ -z "$CFRECORD_NAME" ]]; then
-        read -p "DDNS 域名 (Hostname, 例如 ddns.example.com): " CFRECORD_NAME
+        read -p "DDNS 域名 (完整域名, 例如 ddns.example.com): " CFRECORD_NAME
         while [[ -z "$CFRECORD_NAME" ]]; do
             log_error "DDNS 域名不能为空。"
             read -p "DDNS 域名: " CFRECORD_NAME
         done
     else
         log_info "DDNS 域名已提供: $CFRECORD_NAME"
+    fi
+
+    # FQDN 校验：主域名将从这里自动推导，只输入主机名无法识别
+    CFRECORD_NAME="${CFRECORD_NAME%.}"
+    while [[ "$CFRECORD_NAME" != *.* ]]; do
+        log_error "请输入完整域名，例如 ddns.example.com（主域名将自动识别）。"
+        read -p "DDNS 域名 (完整域名): " CFRECORD_NAME
+        CFRECORD_NAME="${CFRECORD_NAME%.}"
+    done
+
+    if [[ -n "$CFZONE_NAME" ]]; then
+        log_info "主域名已手动指定: $CFZONE_NAME"
+    else
+        log_info "主域名无需输入，将从 $CFRECORD_NAME 自动识别。"
     fi
 
     if [[ -z "$CFRECORD_TYPE" ]]; then
@@ -192,11 +204,6 @@ if [ "${1:-}" = "install" ]; then
     elif [[ -n "$TG_CHAT_ID" ]]; then
         log_info "Telegram Chat ID 已提供: $TG_CHAT_ID"
     fi
-    # Normalize CFRECORD_NAME to FQDN if needed (ensure we clean the right cache file)
-    if [[ "$CFRECORD_NAME" != "$CFZONE_NAME" ]] && [[ "${CFRECORD_NAME##*$CFZONE_NAME}" != "" ]]; then
-        CFRECORD_NAME="$CFRECORD_NAME.$CFZONE_NAME"
-        log_warn "主机名自动修正为 FQDN: $CFRECORD_NAME"
-    fi
     # Cleanup Old Config/Cache
     log_info "正在清理旧配置和缓存..."
     # Remove cache files for the specific host being configured
@@ -223,7 +230,11 @@ if [ "${1:-}" = "install" ]; then
 
     # Configure Cron
     log_info "正在配置定时任务 (Crontab)..."
-    CRON_CMD="$TARGET_PATH -k $CFKEY -u $CFUSER -h $CFRECORD_NAME -z $CFZONE_NAME -t $CFRECORD_TYPE"
+    CRON_CMD="$TARGET_PATH -k $CFKEY -u $CFUSER -h $CFRECORD_NAME -t $CFRECORD_TYPE"
+    # 仅在手动指定主域名时才写入 -z，其余交给脚本自动识别
+    if [ -n "$CFZONE_NAME" ]; then
+        CRON_CMD="$CRON_CMD -z $CFZONE_NAME"
+    fi
     if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
         CRON_CMD="$CRON_CMD -T $TG_BOT_TOKEN -I $TG_CHAT_ID"
     fi
@@ -258,16 +269,19 @@ if [ "${1:-}" = "install" ]; then
     log_info "正在运行第一次更新..."
 
     # Run immediately
-    RUN_CMD="$TARGET_PATH -k $CFKEY -u $CFUSER -h $CFRECORD_NAME -z $CFZONE_NAME -t $CFRECORD_TYPE -f true"
+    RUN_CMD="$TARGET_PATH -k $CFKEY -u $CFUSER -h $CFRECORD_NAME -t $CFRECORD_TYPE -f true"
+    if [ -n "$CFZONE_NAME" ]; then
+        RUN_CMD="$RUN_CMD -z $CFZONE_NAME"
+    fi
     if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
         RUN_CMD="$RUN_CMD -T $TG_BOT_TOKEN -I $TG_CHAT_ID"
     fi
-    $RUN_CMD
-
-    if [ $? -eq 0 ]; then
+    # errexit 下必须用 if 包住，否则失败会直接中断而看不到提示
+    if $RUN_CMD; then
         log_success "首次更新成功！"
     else
-        log_error "首次更新失败。"
+        log_error "首次更新失败。请检查上方日志，或手动执行: $RUN_CMD"
+        exit 1
     fi
     
     exit 0
@@ -287,10 +301,15 @@ CFKEY=
 CFUSER=
 
 # Zone name, eg: example.com
+# Leave empty to auto-detect it from CFRECORD_NAME
 CFZONE_NAME=
 
 # Hostname to update, eg: homeserver.example.com
 CFRECORD_NAME=
+
+# Resolved identifiers (filled in by the cache or the API)
+CFZONE_ID=""
+CFRECORD_ID=""
 
 # Record type, A(IPv4)|AAAA(IPv6), default IPv4
 CFRECORD_TYPE=A
@@ -313,6 +332,61 @@ send_telegram() {
         -d text="$message" \
         -d parse_mode="HTML" > /dev/null
   fi
+}
+
+# Cloudflare API GET helper, keeps auth headers in one place
+cf_api_get() {
+  curl -s --max-time 20 -X GET "https://api.cloudflare.com/client/v4/$1" \
+    -H "X-Auth-Email: $CFUSER" \
+    -H "X-Auth-Key: $CFKEY" \
+    -H "Content-Type: application/json" || true
+}
+
+# First "id" value found in a Cloudflare JSON response
+json_first_id() {
+  printf '%s' "$1" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true
+}
+
+# First "message" value found in a Cloudflare JSON response
+json_first_message() {
+  printf '%s' "$1" | grep -o '"message":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true
+}
+
+# Derive the zone that owns a FQDN. Candidates are probed from the most
+# specific name down to the TLD, so zones like example.co.uk work too.
+# Sets CFZONE_NAME / CFZONE_ID on success, returns 1 when nothing matches.
+resolve_zone_from_hostname() {
+  local host="$1"
+  local candidate="$host"
+  local response zone_id
+
+  while [[ "$candidate" == *.* ]]; do
+    response=$(cf_api_get "zones?name=$candidate&per_page=1")
+    zone_id=$(json_first_id "$response")
+
+    if [ -n "$zone_id" ]; then
+      CFZONE_NAME="$candidate"
+      CFZONE_ID="$zone_id"
+      return 0
+    fi
+
+    if [ -z "$response" ]; then
+      log_error "无法连接 Cloudflare API，请检查服务器网络。"
+      send_telegram "Cloudflare DDNS 配置失败！无法连接 Cloudflare API。"
+      exit 1
+    fi
+
+    if printf '%s' "$response" | grep -q '"success":false'; then
+      log_error "Cloudflare API 返回错误: $(json_first_message "$response")"
+      log_error "响应内容: $response"
+      log_error "常见原因: 1. 使用了 API Token 而不是 Global Key; 2. 邮箱与 Key 不匹配"
+      send_telegram "Cloudflare DDNS 配置失败！API 报错: <pre>$response</pre>"
+      exit 1
+    fi
+
+    candidate="${candidate#*.}"
+  done
+  return 1
 }
 
 WANIPSITE="http://ipv4.icanhazip.com"
@@ -355,10 +429,12 @@ if [ "$CFRECORD_NAME" = "" ]; then
   exit 2
 fi
 
-# If the hostname is not a FQDN
-if [ "$CFRECORD_NAME" != "$CFZONE_NAME" ] && ! [ -z "${CFRECORD_NAME##*$CFZONE_NAME}" ]; then
-  CFRECORD_NAME="$CFRECORD_NAME.$CFZONE_NAME"
-  log_warn "主机名不是 FQDN，假设为 $CFRECORD_NAME"
+# The hostname must be a FQDN: the zone is derived from it, so a bare label
+# such as "homeserver" can no longer be expanded
+CFRECORD_NAME="${CFRECORD_NAME%.}"
+if [[ "$CFRECORD_NAME" != *.* ]]; then
+  log_error "主机名必须是完整域名 (例如 ddns.example.com)，无法从 '$CFRECORD_NAME' 识别主域名"
+  exit 2
 fi
 
 # Determine WAN IP Site based on record type
@@ -372,7 +448,14 @@ else
 fi
 
 # Get current and old WAN ip
-WAN_IP=`curl -s ${WANIPSITE}`
+WAN_IP=`curl -s --max-time 20 "${WANIPSITE}"`
+
+# Never push an empty record to Cloudflare
+if [ -z "$WAN_IP" ]; then
+  log_error "获取公网 IP 失败，请检查 ${WANIPSITE} 是否可访问"
+  exit 1
+fi
+
 WAN_IP_FILE=$HOME/.cf-wan_ip_$CFRECORD_NAME.txt
 if [ -f $WAN_IP_FILE ]; then
   OLD_WAN_IP=`cat $WAN_IP_FILE`
@@ -389,42 +472,53 @@ fi
 
 # Get zone_identifier & record_identifier
 ID_FILE=$HOME/.cf-id_$CFRECORD_NAME.txt
-if [ -f $ID_FILE ] && [ $(wc -l $ID_FILE | cut -d " " -f 1) == 4 ] \
-  && [ "$(sed -n '3p' "$ID_FILE")" == "$CFZONE_NAME" ] \
-  && [ "$(sed -n '4p' "$ID_FILE")" == "$CFRECORD_NAME" ] \
-  && [ -n "$(sed -n '1p' "$ID_FILE")" ] \
-  && [ -n "$(sed -n '2p' "$ID_FILE")" ]; then
-    CFZONE_ID=$(sed -n '1p' "$ID_FILE")
-    CFRECORD_ID=$(sed -n '2p' "$ID_FILE")
-else
-    log_info "正在更新 zone_identifier 和 record_identifier"
-    
-    # Debug: Capture full response to diagnose issues
-    ZONE_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones?name=$CFZONE_NAME" \
-        -H "X-Auth-Email: $CFUSER" \
-        -H "X-Auth-Key: $CFKEY" \
-        -H "Content-Type: application/json")
-    
-    # Extract Zone ID
-    CFZONE_ID=$(echo "$ZONE_RESPONSE" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
-    
-    if [ -z "$CFZONE_ID" ]; then
-        log_error "获取 Zone ID 失败！"
-        log_error "Cloudflare API 响应内容: $ZONE_RESPONSE"
-        log_error "请根据上方响应内容检查原因 (如 6003=Headers无效, 9103=未知错误等)"
-        log_error "常见原因: 1. 使用了 API Token 而不是 Global Key; 2. 邮箱与 Key 不匹配; 3. 域名未在账号下激活"
-        send_telegram "Cloudflare DDNS 配置失败！无法获取 Zone ID。响应: <pre>$ZONE_RESPONSE</pre>"
-        exit 1
+
+# Reuse cached IDs. The zone is read back from the cache as well, so the
+# auto-detection below only runs once per hostname.
+if [ -f "$ID_FILE" ] && [ "$(wc -l < "$ID_FILE" | tr -d '[:space:]')" = "4" ]; then
+  CACHED_ZONE=$(sed -n '3p' "$ID_FILE")
+  CACHED_HOST=$(sed -n '4p' "$ID_FILE")
+  if [ "$CACHED_HOST" = "$CFRECORD_NAME" ] \
+    && [ -n "$CACHED_ZONE" ] \
+    && { [ -z "$CFZONE_NAME" ] || [ "$CFZONE_NAME" = "$CACHED_ZONE" ]; } \
+    && [ -n "$(sed -n '1p' "$ID_FILE")" ] \
+    && [ -n "$(sed -n '2p' "$ID_FILE")" ]; then
+      CFZONE_ID=$(sed -n '1p' "$ID_FILE")
+      CFRECORD_ID=$(sed -n '2p' "$ID_FILE")
+      CFZONE_NAME="$CACHED_ZONE"
+  fi
+fi
+
+if [ -z "$CFZONE_ID" ]; then
+    log_info "正在解析主域名与记录 ID..."
+
+    if [ -z "$CFZONE_NAME" ]; then
+        log_info "正在从 $CFRECORD_NAME 自动识别主域名..."
+        if ! resolve_zone_from_hostname "$CFRECORD_NAME"; then
+            log_error "在您的 Cloudflare 账号中找不到 $CFRECORD_NAME 对应的主域名。"
+            log_error "请确认该域名已添加到当前账号，或使用 -z 参数手动指定主域名。"
+            send_telegram "Cloudflare DDNS 配置失败！无法从 $CFRECORD_NAME 识别主域名。"
+            exit 1
+        fi
+        log_success "已识别主域名: $CFZONE_NAME"
+    else
+        log_info "使用指定的主域名: $CFZONE_NAME"
+        ZONE_RESPONSE=$(cf_api_get "zones?name=$CFZONE_NAME&per_page=1")
+        CFZONE_ID=$(json_first_id "$ZONE_RESPONSE")
+
+        if [ -z "$CFZONE_ID" ]; then
+            log_error "获取 Zone ID 失败！"
+            log_error "Cloudflare API 响应内容: $ZONE_RESPONSE"
+            log_error "请根据上方响应内容检查原因 (如 6003=Headers无效, 9103=未知错误等)"
+            log_error "常见原因: 1. 使用了 API Token 而不是 Global Key; 2. 邮箱与 Key 不匹配; 3. 域名未在账号下激活"
+            send_telegram "Cloudflare DDNS 配置失败！无法获取 Zone ID。响应: <pre>$ZONE_RESPONSE</pre>"
+            exit 1
+        fi
     fi
 
-    # Get Record ID
-    # 增加 &type=$CFRECORD_TYPE 以精确匹配记录类型
-    RECORD_RESPONSE=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/$CFZONE_ID/dns_records?name=$CFRECORD_NAME&type=$CFRECORD_TYPE" \
-        -H "X-Auth-Email: $CFUSER" \
-        -H "X-Auth-Key: $CFKEY" \
-        -H "Content-Type: application/json")
-    
-    CFRECORD_ID=$(echo "$RECORD_RESPONSE" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4 || true)
+    # Get Record ID, &type=$CFRECORD_TYPE keeps the match on the right record type
+    RECORD_RESPONSE=$(cf_api_get "zones/$CFZONE_ID/dns_records?name=$CFRECORD_NAME&type=$CFRECORD_TYPE")
+    CFRECORD_ID=$(json_first_id "$RECORD_RESPONSE")
 
     if [ -z "$CFRECORD_ID" ]; then
         log_warn "未找到现有的 $CFRECORD_TYPE 记录，准备创建新记录。"
@@ -434,10 +528,10 @@ else
         log_info "找到现有记录 ID: $CFRECORD_ID"
     fi
 
-    echo "$CFZONE_ID" > $ID_FILE
-    echo "$CFRECORD_ID" >> $ID_FILE
-    echo "$CFZONE_NAME" >> $ID_FILE
-    echo "$CFRECORD_NAME" >> $ID_FILE
+    echo "$CFZONE_ID" > "$ID_FILE"
+    echo "$CFRECORD_ID" >> "$ID_FILE"
+    echo "$CFZONE_NAME" >> "$ID_FILE"
+    echo "$CFRECORD_NAME" >> "$ID_FILE"
 fi
 
 # If WAN is changed, update cloudflare
